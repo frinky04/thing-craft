@@ -12,6 +12,7 @@ anyhow = "1.0"
 bevy_ecs = "0.15"
 bytemuck = { version = "1.25", features = ["derive"] }
 glam = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.3"
 noise = "0.9"
 thiserror = "2.0"

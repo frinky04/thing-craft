@@ -7,7 +7,7 @@
 - M2 in progress: fly camera and interpolation complete; voxel rendering still pending.
 - M3 started: block registry and chunk core data model implemented.
 - M4 started: deterministic biome/climate and startup overworld generation scaffold implemented.
-- M5 started: chunk face-culling mesh extraction and first GPU draw path implemented.
+- M5 started: chunk face-culling mesh extraction, GPU draw path, and terrain-atlas sampling implemented.
 
 ## M0 - Repository Foundation
 

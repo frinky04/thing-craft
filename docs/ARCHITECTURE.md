@@ -30,7 +30,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - Block and sky light channels use nibble storage (`4-bit` packed values).
 - A deterministic Overworld generator uses biome climate sampling + terrain noise to create startup chunks.
 - A CPU chunk mesher generates indexed triangle geometry with face-culling and atlas UVs.
-- The renderer owns GPU buffers/pipeline and draws chunk mesh indices each frame using camera view-projection uniforms.
+- The renderer owns GPU buffers/pipeline and draws chunk mesh indices each frame using camera view-projection uniforms and the Alpha terrain atlas texture.
 
 ## Networking-Ready Input Pattern
 

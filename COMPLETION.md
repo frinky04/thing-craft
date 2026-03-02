@@ -11,6 +11,7 @@
 - [x] Deterministic biome climate sampler and overworld startup chunk generator scaffold added.
 - [x] CPU chunk meshing scaffold added (face culling + atlas UV generation).
 - [x] `wgpu` scene pipeline now draws generated chunk geometry with camera uniforms.
+- [x] Alpha `terrain.png` texture atlas is loaded and sampled by the chunk render pipeline.
 - [x] Reference tracking doc added (`docs/REFERENCES.md`) for copied constants/behaviors.
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
