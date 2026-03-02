@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::mem;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
+use std::time::Duration;
 
 use crate::lighting::{relight_chunk, CardinalChunkNeighborsOwned, LightingOutput};
 use crate::mesh::{
@@ -152,13 +153,18 @@ pub struct ChunkStreamer {
     meshing_in_flight: HashSet<ChunkPos>,
     urgent_lighting: HashSet<ChunkPos>,
     urgent_meshing: HashSet<ChunkPos>,
+    fast_feedback_meshing: HashSet<ChunkPos>,
+    fast_feedback_upload_allow: HashSet<ChunkPos>,
+    stale_lighting_upload_pending: HashSet<ChunkPos>,
     pending_render_upload: HashSet<ChunkPos>,
     coherence_pending: HashSet<ChunkPos>,
     generation_tx: Option<Sender<GenerationJob>>,
     generation_rx: Receiver<GenerationResult>,
-    lighting_tx: Option<Sender<LightingJob>>,
+    lighting_regular_tx: Option<Sender<LightingJob>>,
+    lighting_urgent_tx: Option<Sender<LightingJob>>,
     lighting_rx: Receiver<LightingResult>,
-    meshing_tx: Option<Sender<MeshingJob>>,
+    meshing_regular_tx: Option<Sender<MeshingJob>>,
+    meshing_urgent_tx: Option<Sender<MeshingJob>>,
     meshing_rx: Receiver<MeshingResult>,
     generation_thread: Option<thread::JoinHandle<()>>,
     lighting_thread: Option<thread::JoinHandle<()>>,
@@ -175,9 +181,11 @@ impl ChunkStreamer {
     pub fn new(seed: u64, registry: BlockRegistry, config: ResidencyConfig) -> Self {
         let (generation_tx, generation_job_rx) = mpsc::channel::<GenerationJob>();
         let (generation_result_tx, generation_rx) = mpsc::channel::<GenerationResult>();
-        let (lighting_tx, lighting_job_rx) = mpsc::channel::<LightingJob>();
+        let (lighting_regular_tx, lighting_regular_rx) = mpsc::channel::<LightingJob>();
+        let (lighting_urgent_tx, lighting_urgent_rx) = mpsc::channel::<LightingJob>();
         let (lighting_result_tx, lighting_rx) = mpsc::channel::<LightingResult>();
-        let (meshing_tx, meshing_job_rx) = mpsc::channel::<MeshingJob>();
+        let (meshing_regular_tx, meshing_regular_rx) = mpsc::channel::<MeshingJob>();
+        let (meshing_urgent_tx, meshing_urgent_rx) = mpsc::channel::<MeshingJob>();
         let (meshing_result_tx, meshing_rx) = mpsc::channel::<MeshingResult>();
 
         let generation_registry = registry.clone();
@@ -201,7 +209,61 @@ impl ChunkStreamer {
         let lighting_thread = thread::Builder::new()
             .name("thingcraft-lighting-worker".to_owned())
             .spawn(move || {
-                while let Ok(job) = lighting_job_rx.recv() {
+                let mut urgent_closed = false;
+                let mut regular_closed = false;
+                loop {
+                    if !urgent_closed {
+                        match lighting_urgent_rx.try_recv() {
+                            Ok(job) => {
+                                let lighting =
+                                    relight_chunk(&job.chunk, &job.neighbors, &lighting_registry);
+                                if lighting_result_tx
+                                    .send(LightingResult {
+                                        pos: job.pos,
+                                        revision: job.revision,
+                                        lighting,
+                                        priority: job.priority,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(TryRecvError::Empty) => {}
+                            Err(TryRecvError::Disconnected) => urgent_closed = true,
+                        }
+                    }
+
+                    if urgent_closed && regular_closed {
+                        break;
+                    }
+
+                    let job = if !regular_closed {
+                        match lighting_regular_rx.recv_timeout(Duration::from_millis(1)) {
+                            Ok(job) => Some(job),
+                            Err(RecvTimeoutError::Timeout) => None,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                regular_closed = true;
+                                None
+                            }
+                        }
+                    } else if !urgent_closed {
+                        match lighting_urgent_rx.recv_timeout(Duration::from_millis(1)) {
+                            Ok(job) => Some(job),
+                            Err(RecvTimeoutError::Timeout) => None,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                urgent_closed = true;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let Some(job) = job else {
+                        continue;
+                    };
                     let lighting = relight_chunk(&job.chunk, &job.neighbors, &lighting_registry);
                     if lighting_result_tx
                         .send(LightingResult {
@@ -222,7 +284,63 @@ impl ChunkStreamer {
         let meshing_thread = thread::Builder::new()
             .name("thingcraft-meshing-worker".to_owned())
             .spawn(move || {
-                while let Ok(job) = meshing_job_rx.recv() {
+                let mut urgent_closed = false;
+                let mut regular_closed = false;
+                loop {
+                    if !urgent_closed {
+                        match meshing_urgent_rx.try_recv() {
+                            Ok(job) => {
+                                let pos = job.chunk.pos;
+                                let neighbors = CardinalChunkNeighbors {
+                                    neg_x: job.neg_x.as_ref(),
+                                    pos_x: job.pos_x.as_ref(),
+                                    neg_z: job.neg_z.as_ref(),
+                                    pos_z: job.pos_z.as_ref(),
+                                };
+                                let mesh = build_chunk_mesh_with_neighbors(
+                                    &job.chunk,
+                                    &meshing_registry,
+                                    &neighbors,
+                                );
+                                if meshing_result_tx.send(MeshingResult { pos, mesh }).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(TryRecvError::Empty) => {}
+                            Err(TryRecvError::Disconnected) => urgent_closed = true,
+                        }
+                    }
+
+                    if urgent_closed && regular_closed {
+                        break;
+                    }
+
+                    let job = if !regular_closed {
+                        match meshing_regular_rx.recv_timeout(Duration::from_millis(1)) {
+                            Ok(job) => Some(job),
+                            Err(RecvTimeoutError::Timeout) => None,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                regular_closed = true;
+                                None
+                            }
+                        }
+                    } else if !urgent_closed {
+                        match meshing_urgent_rx.recv_timeout(Duration::from_millis(1)) {
+                            Ok(job) => Some(job),
+                            Err(RecvTimeoutError::Timeout) => None,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                urgent_closed = true;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let Some(job) = job else {
+                        continue;
+                    };
                     let pos = job.chunk.pos;
                     let neighbors = CardinalChunkNeighbors {
                         neg_x: job.neg_x.as_ref(),
@@ -249,13 +367,18 @@ impl ChunkStreamer {
             meshing_in_flight: HashSet::new(),
             urgent_lighting: HashSet::new(),
             urgent_meshing: HashSet::new(),
+            fast_feedback_meshing: HashSet::new(),
+            fast_feedback_upload_allow: HashSet::new(),
+            stale_lighting_upload_pending: HashSet::new(),
             pending_render_upload: HashSet::new(),
             coherence_pending: HashSet::new(),
             generation_tx: Some(generation_tx),
             generation_rx,
-            lighting_tx: Some(lighting_tx),
+            lighting_regular_tx: Some(lighting_regular_tx),
+            lighting_urgent_tx: Some(lighting_urgent_tx),
             lighting_rx,
-            meshing_tx: Some(meshing_tx),
+            meshing_regular_tx: Some(meshing_regular_tx),
+            meshing_urgent_tx: Some(meshing_urgent_tx),
             meshing_rx,
             generation_thread: Some(generation_thread),
             lighting_thread: Some(lighting_thread),
@@ -348,7 +471,10 @@ impl ChunkStreamer {
         if edge_coherence_targets.len() > 1 {
             for chunk in edge_coherence_targets {
                 self.coherence_pending.insert(chunk);
+                self.fast_feedback_meshing.insert(chunk);
             }
+        } else {
+            self.fast_feedback_meshing.insert(pos);
         }
     }
 
@@ -585,16 +711,17 @@ impl ChunkStreamer {
     }
 
     fn dispatch_lighting(&mut self, center_chunk: ChunkPos) {
-        let Some(tx) = &self.lighting_tx else {
+        let Some(regular_tx) = &self.lighting_regular_tx else {
             return;
         };
-        let dispatch_budget = lane_dispatch_budget(
+        let Some(urgent_tx) = &self.lighting_urgent_tx else {
+            return;
+        };
+        let dispatch_budget = lane_dispatch_budget_with_reserve(
             self.config.max_lighting_dispatch,
             self.lighting_in_flight.len(),
+            self.config.max_lighting_dispatch,
         );
-        if dispatch_budget == 0 {
-            return;
-        }
 
         self.urgent_lighting.retain(|pos| {
             self.slots.get(pos).is_some_and(|entry| {
@@ -623,11 +750,15 @@ impl ChunkStreamer {
 
         sort_candidates_by_distance(&mut urgent_candidates, center_chunk);
         sort_candidates_by_distance(&mut regular_candidates, center_chunk);
-        let total_dispatch_budget = boosted_dispatch_budget(
-            self.config.max_lighting_dispatch,
-            self.lighting_in_flight.len(),
-            urgent_candidates.len(),
-        );
+        let total_dispatch_budget = if urgent_candidates.is_empty() {
+            dispatch_budget
+        } else {
+            boosted_dispatch_budget(
+                self.config.max_lighting_dispatch,
+                self.lighting_in_flight.len(),
+                urgent_candidates.len(),
+            )
+        };
         if total_dispatch_budget == 0 {
             return;
         }
@@ -669,7 +800,12 @@ impl ChunkStreamer {
                 }),
             };
 
-            if tx
+            let sender = if priority == WorkPriority::Urgent {
+                urgent_tx
+            } else {
+                regular_tx
+            };
+            if sender
                 .send(LightingJob {
                     pos,
                     revision,
@@ -692,16 +828,17 @@ impl ChunkStreamer {
     }
 
     fn dispatch_meshing(&mut self, center_chunk: ChunkPos) {
-        let Some(tx) = &self.meshing_tx else {
+        let Some(regular_tx) = &self.meshing_regular_tx else {
             return;
         };
-        let dispatch_budget = lane_dispatch_budget(
+        let Some(urgent_tx) = &self.meshing_urgent_tx else {
+            return;
+        };
+        let dispatch_budget = lane_dispatch_budget_with_reserve(
             self.config.max_meshing_dispatch,
             self.meshing_in_flight.len(),
+            self.config.max_meshing_dispatch,
         );
-        if dispatch_budget == 0 {
-            return;
-        }
 
         self.urgent_meshing.retain(|pos| {
             self.slots.get(pos).is_some_and(|entry| {
@@ -718,14 +855,15 @@ impl ChunkStreamer {
         let mut urgent_candidates = Vec::new();
         let mut regular_candidates = Vec::new();
         for (pos, entry) in &self.slots {
+            let fast_feedback = self.fast_feedback_meshing.contains(pos);
             if entry.state == ChunkResidencyState::Meshing
                 && entry.chunk.is_some()
                 && entry.dirty.geometry
-                && !entry.dirty.lighting
-                && !self.lighting_in_flight.contains(pos)
+                && (fast_feedback
+                    || (!entry.dirty.lighting && !self.lighting_in_flight.contains(pos)))
                 && !self.meshing_in_flight.contains(pos)
                 && self.required.contains(pos)
-                && self.neighbor_lighting_ready(*pos)
+                && (fast_feedback || self.neighbor_lighting_ready(*pos))
             {
                 if self.urgent_meshing.contains(pos) {
                     urgent_candidates.push(*pos);
@@ -737,11 +875,15 @@ impl ChunkStreamer {
 
         sort_candidates_by_distance(&mut urgent_candidates, center_chunk);
         sort_candidates_by_distance(&mut regular_candidates, center_chunk);
-        let total_dispatch_budget = boosted_dispatch_budget(
-            self.config.max_meshing_dispatch,
-            self.meshing_in_flight.len(),
-            urgent_candidates.len(),
-        );
+        let total_dispatch_budget = if urgent_candidates.is_empty() {
+            dispatch_budget
+        } else {
+            boosted_dispatch_budget(
+                self.config.max_meshing_dispatch,
+                self.meshing_in_flight.len(),
+                urgent_candidates.len(),
+            )
+        };
         if total_dispatch_budget == 0 {
             return;
         }
@@ -775,7 +917,12 @@ impl ChunkStreamer {
                 z: pos.z + 1,
             });
 
-            if tx
+            let sender = if self.urgent_meshing.contains(&pos) {
+                urgent_tx
+            } else {
+                regular_tx
+            };
+            if sender
                 .send(MeshingJob {
                     chunk,
                     neg_x,
@@ -792,6 +939,9 @@ impl ChunkStreamer {
             }
             self.meshing_in_flight.insert(pos);
             self.urgent_meshing.remove(&pos);
+            if self.fast_feedback_meshing.remove(&pos) {
+                self.fast_feedback_upload_allow.insert(pos);
+            }
         }
     }
 
@@ -885,14 +1035,23 @@ impl ChunkStreamer {
                         continue;
                     }
 
+                    let allow_stale_lighting_upload =
+                        self.fast_feedback_upload_allow.remove(&result.pos);
                     if let Some(slot) = self.slots.get_mut(&result.pos) {
-                        if slot.dirty.geometry || slot.dirty.lighting {
+                        if slot.dirty.geometry
+                            || (slot.dirty.lighting && !allow_stale_lighting_upload)
+                        {
                             slot.state = ChunkResidencyState::Meshing;
                             continue;
                         }
 
                         slot.mesh = Some(result.mesh);
-                        slot.state = ChunkResidencyState::Ready;
+                        if slot.dirty.lighting {
+                            slot.state = ChunkResidencyState::Meshing;
+                            self.stale_lighting_upload_pending.insert(result.pos);
+                        } else {
+                            slot.state = ChunkResidencyState::Ready;
+                        }
                         self.mesh_dirty = true;
                         self.pending_render_upload.insert(result.pos);
                     }
@@ -918,12 +1077,17 @@ impl ChunkStreamer {
             let Some(slot) = self.slots.get(&pos) else {
                 self.pending_render_upload.remove(&pos);
                 self.coherence_pending.remove(&pos);
+                self.fast_feedback_upload_allow.remove(&pos);
+                self.stale_lighting_upload_pending.remove(&pos);
                 continue;
             };
 
-            if slot.state != ChunkResidencyState::Ready
-                || slot.dirty.geometry
-                || slot.dirty.lighting
+            let allow_stale_lighting =
+                self.stale_lighting_upload_pending.contains(&pos) && !slot.dirty.geometry;
+            if !allow_stale_lighting
+                && (slot.state != ChunkResidencyState::Ready
+                    || slot.dirty.geometry
+                    || slot.dirty.lighting)
             {
                 continue;
             }
@@ -942,6 +1106,8 @@ impl ChunkStreamer {
             });
             self.pending_render_upload.remove(&pos);
             self.coherence_pending.remove(&pos);
+            self.fast_feedback_upload_allow.remove(&pos);
+            self.stale_lighting_upload_pending.remove(&pos);
         }
     }
 
@@ -973,6 +1139,9 @@ impl ChunkStreamer {
             self.meshing_in_flight.remove(&pos);
             self.urgent_lighting.remove(&pos);
             self.urgent_meshing.remove(&pos);
+            self.fast_feedback_meshing.remove(&pos);
+            self.fast_feedback_upload_allow.remove(&pos);
+            self.stale_lighting_upload_pending.remove(&pos);
             self.pending_render_upload.remove(&pos);
             self.coherence_pending.remove(&pos);
         }
@@ -1173,8 +1342,10 @@ impl ChunkStreamer {
 impl Drop for ChunkStreamer {
     fn drop(&mut self) {
         self.generation_tx.take();
-        self.lighting_tx.take();
-        self.meshing_tx.take();
+        self.lighting_regular_tx.take();
+        self.lighting_urgent_tx.take();
+        self.meshing_regular_tx.take();
+        self.meshing_urgent_tx.take();
 
         if let Some(handle) = self.generation_thread.take() {
             let _ = handle.join();
@@ -1234,6 +1405,20 @@ fn lane_dispatch_budget(max_dispatch: usize, in_flight: usize) -> usize {
     }
     let max_in_flight = max_dispatch.saturating_mul(MAX_IN_FLIGHT_MULTIPLIER);
     max_dispatch.min(max_in_flight.saturating_sub(in_flight))
+}
+
+fn lane_dispatch_budget_with_reserve(
+    max_dispatch: usize,
+    in_flight: usize,
+    reserved_slots: usize,
+) -> usize {
+    if max_dispatch == 0 {
+        return 0;
+    }
+    let max_in_flight = max_dispatch.saturating_mul(MAX_IN_FLIGHT_MULTIPLIER);
+    let reserved = reserved_slots.min(max_in_flight);
+    let usable_in_flight = max_in_flight.saturating_sub(reserved);
+    max_dispatch.min(usable_in_flight.saturating_sub(in_flight))
 }
 
 fn boosted_dispatch_budget(
@@ -1449,6 +1634,15 @@ mod tests {
         assert_eq!(lane_dispatch_budget(4, 10), 4);
         assert_eq!(lane_dispatch_budget(4, 16), 0);
         assert_eq!(lane_dispatch_budget(4, 32), 0);
+    }
+
+    #[test]
+    fn reserved_budget_preserves_urgent_headroom() {
+        assert_eq!(lane_dispatch_budget_with_reserve(4, 0, 4), 4);
+        assert_eq!(lane_dispatch_budget_with_reserve(4, 8, 4), 4);
+        assert_eq!(lane_dispatch_budget_with_reserve(4, 12, 4), 0);
+        assert_eq!(lane_dispatch_budget_with_reserve(4, 13, 4), 0);
+        assert_eq!(lane_dispatch_budget_with_reserve(4, 28, 4), 0);
     }
 
     #[test]
@@ -2224,6 +2418,64 @@ mod tests {
             |update| matches!(update, RenderMeshUpdate::Upsert { pos, .. } if *pos == center)
         ));
         assert!(!streamer.pending_render_upload.contains(&center));
+    }
+
+    #[test]
+    fn urgent_edit_mesh_uploads_before_lighting_finishes() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 2,
+                max_lighting_dispatch: 2,
+                max_meshing_dispatch: 2,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready == 1
+                && streamer.metrics().in_flight_lighting == 0
+                && streamer.metrics().in_flight_meshing == 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(streamer.metrics().ready, 1);
+        streamer.config.max_lighting_dispatch = 0;
+
+        let mut target = None;
+        for y in (1..CHUNK_HEIGHT as i32 - 1).rev() {
+            if streamer.block_at_world(8, y, 8).is_some_and(|id| id != 0) {
+                target = Some((8, y, 8));
+                break;
+            }
+        }
+        let (x, y, z) = target.expect("expected a solid block to break");
+        assert!(streamer.set_block_at_world(x, y, z, 0));
+
+        let mut saw_upsert_while_lighting_dirty = false;
+        for _ in 0..500 {
+            streamer.tick(center);
+            let center_dirty_lighting = streamer
+                .slots
+                .get(&center)
+                .is_some_and(|slot| slot.dirty.lighting);
+            let had_upsert = streamer.drain_render_updates().iter().any(
+                |update| matches!(update, RenderMeshUpdate::Upsert { pos, .. } if *pos == center),
+            );
+            if center_dirty_lighting && had_upsert {
+                saw_upsert_while_lighting_dirty = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(saw_upsert_while_lighting_dirty);
     }
 
     #[test]
