@@ -30,6 +30,12 @@ For debug runtime stats without `wgpu` internals flooding output:
 RUST_LOG=debug cargo run -p thingcraft-client
 ```
 
+Streaming tuning (useful to push boundary walls farther out while exploring underground):
+
+```bash
+THINGCRAFT_VIEW_RADIUS=5 THINGCRAFT_GEN_BUDGET=12 THINGCRAFT_MESH_BUDGET=12 cargo run -p thingcraft-client
+```
+
 ## Controls
 
 - `W/A/S/D`: Move horizontally

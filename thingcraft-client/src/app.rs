@@ -106,7 +106,7 @@ pub fn run() -> Result<()> {
     renderer.set_scene_mesh(&bootstrap_mesh);
     let mut bootstrap_mesh_active = true;
 
-    let residency_config = ResidencyConfig::default();
+    let residency_config = resolve_residency_config();
     let mut chunk_streamer = ChunkStreamer::new(
         0xA126_0001,
         bootstrap_world.registry.clone(),
@@ -363,9 +363,34 @@ fn has_target_directive(env_filter: &str, target: &str) -> bool {
     })
 }
 
+fn resolve_residency_config() -> ResidencyConfig {
+    let mut config = ResidencyConfig::default();
+    if let Some(parsed) = parse_env_u32("THINGCRAFT_VIEW_RADIUS") {
+        config.view_radius = parsed as i32;
+    }
+    if let Some(parsed) = parse_env_u32("THINGCRAFT_GEN_BUDGET") {
+        config.max_generation_dispatch = parsed as usize;
+    }
+    if let Some(parsed) = parse_env_u32("THINGCRAFT_MESH_BUDGET") {
+        config.max_meshing_dispatch = parsed as usize;
+    }
+    config
+}
+
+fn parse_env_u32(key: &str) -> Option<u32> {
+    let raw = std::env::var(key).ok()?;
+    match raw.parse::<u32>() {
+        Ok(value) => Some(value),
+        Err(err) => {
+            warn!(env = key, value = %raw, ?err, "invalid env override; using default");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::has_target_directive;
+    use super::{has_target_directive, parse_env_u32};
 
     #[test]
     fn detects_target_directives_exactly() {
@@ -378,5 +403,10 @@ mod tests {
             "thingcraft_client=debug,wgpu=info",
             "wgpu_core"
         ));
+    }
+
+    #[test]
+    fn env_u32_parser_handles_valid_and_invalid_values() {
+        assert_eq!(parse_env_u32("THINGCRAFT_TEST_MISSING"), None);
     }
 }
