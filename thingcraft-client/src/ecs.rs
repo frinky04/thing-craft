@@ -1,0 +1,387 @@
+use std::collections::{HashSet, VecDeque};
+use std::f64::consts::FRAC_PI_2;
+
+use bevy_ecs::prelude::*;
+use glam::{DVec2, DVec3, Vec2, Vec3};
+use winit::keyboard::KeyCode;
+
+#[derive(Component, Debug)]
+pub struct Player;
+
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct Transform64 {
+    pub position: DVec3,
+    pub prev_position: DVec3,
+    pub yaw: f64,
+    pub prev_yaw: f64,
+    pub pitch: f64,
+    pub prev_pitch: f64,
+}
+
+impl Transform64 {
+    pub fn new(position: DVec3) -> Self {
+        Self {
+            position,
+            prev_position: position,
+            yaw: 0.0,
+            prev_yaw: 0.0,
+            pitch: 0.0,
+            prev_pitch: 0.0,
+        }
+    }
+}
+
+#[derive(Component, Clone, Copy, Debug)]
+pub struct FlyCamera {
+    pub speed: f64,
+    pub sensitivity: f64,
+    pub fly_mode: bool,
+}
+
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct RenderTransform {
+    pub position: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SimCommandEvent {
+    MoveIntent { x: f32, y: f32, z: f32 },
+    LookDelta { yaw: f32, pitch: f32 },
+    ToggleFly,
+}
+
+#[derive(Resource, Debug, Default)]
+pub struct SimCommandQueue(pub VecDeque<SimCommandEvent>);
+
+#[derive(Resource, Debug, Default)]
+pub struct RawInputState {
+    pub pressed: HashSet<KeyCode>,
+    pub just_pressed: HashSet<KeyCode>,
+    pub mouse_delta: DVec2,
+}
+
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct FixedTickConfig {
+    pub tick_hz: u32,
+    pub max_catchup_steps: u32,
+}
+
+impl Default for FixedTickConfig {
+    fn default() -> Self {
+        Self {
+            tick_hz: 20,
+            max_catchup_steps: 5,
+        }
+    }
+}
+
+#[derive(Resource, Debug, Default)]
+pub struct PlayerIntentState {
+    movement: Vec3,
+    look_delta: Vec2,
+}
+
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct RenderAlpha(pub f32);
+
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct FixedDeltaSeconds(pub f64);
+
+impl Default for FixedDeltaSeconds {
+    fn default() -> Self {
+        Self(1.0 / 20.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CameraSnapshot {
+    pub authoritative: Transform64,
+    pub interpolated: RenderTransform,
+    pub fly_mode: bool,
+}
+
+pub struct EcsRuntime {
+    world: World,
+    input_schedule: Schedule,
+    fixed_schedule: Schedule,
+    render_schedule: Schedule,
+}
+
+impl EcsRuntime {
+    pub fn new() -> Self {
+        let mut world = World::new();
+        world.insert_resource(RawInputState::default());
+        world.insert_resource(SimCommandQueue::default());
+        world.insert_resource(PlayerIntentState::default());
+        world.insert_resource(RenderAlpha::default());
+        world.insert_resource(FixedTickConfig::default());
+        world.insert_resource(FixedDeltaSeconds::default());
+
+        world.spawn((
+            Player,
+            Transform64::new(DVec3::new(0.0, 72.0, 0.0)),
+            FlyCamera {
+                speed: 18.0,
+                sensitivity: 0.0025,
+                fly_mode: true,
+            },
+            RenderTransform::default(),
+        ));
+
+        let mut input_schedule = Schedule::default();
+        input_schedule.add_systems(capture_input_system);
+
+        let mut fixed_schedule = Schedule::default();
+        fixed_schedule.add_systems((consume_commands_system, apply_player_motion_system).chain());
+
+        let mut render_schedule = Schedule::default();
+        render_schedule.add_systems(interpolate_render_transform_system);
+
+        Self {
+            world,
+            input_schedule,
+            fixed_schedule,
+            render_schedule,
+        }
+    }
+
+    pub fn fixed_tick_config(&self) -> FixedTickConfig {
+        *self.world.resource::<FixedTickConfig>()
+    }
+
+    pub fn handle_key(&mut self, key_code: KeyCode, is_pressed: bool) {
+        let mut input = self.world.resource_mut::<RawInputState>();
+        if is_pressed {
+            if input.pressed.insert(key_code) {
+                input.just_pressed.insert(key_code);
+            }
+        } else {
+            input.pressed.remove(&key_code);
+        }
+    }
+
+    pub fn add_mouse_delta(&mut self, dx: f64, dy: f64) {
+        let mut input = self.world.resource_mut::<RawInputState>();
+        input.mouse_delta += DVec2::new(dx, dy);
+    }
+
+    pub fn run_input(&mut self) {
+        self.input_schedule.run(&mut self.world);
+    }
+
+    pub fn run_fixed(&mut self, fixed_dt_seconds: f64) {
+        self.world.resource_mut::<FixedDeltaSeconds>().0 = fixed_dt_seconds;
+        self.fixed_schedule.run(&mut self.world);
+    }
+
+    pub fn run_render_prep(&mut self, alpha: f32) {
+        self.world.resource_mut::<RenderAlpha>().0 = alpha.clamp(0.0, 1.0);
+        self.render_schedule.run(&mut self.world);
+    }
+
+    pub fn camera_snapshot(&mut self) -> Option<CameraSnapshot> {
+        let mut query = self
+            .world
+            .query_filtered::<(&Transform64, &RenderTransform, &FlyCamera), With<Player>>();
+        let (transform, render_transform, fly_camera) = query.iter(&self.world).next()?;
+
+        Some(CameraSnapshot {
+            authoritative: *transform,
+            interpolated: *render_transform,
+            fly_mode: fly_camera.fly_mode,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn queued_commands_len(&self) -> usize {
+        self.world.resource::<SimCommandQueue>().0.len()
+    }
+}
+
+fn capture_input_system(
+    mut raw_input: ResMut<'_, RawInputState>,
+    mut queue: ResMut<'_, SimCommandQueue>,
+) {
+    let movement = movement_from_pressed(&raw_input.pressed);
+    queue.0.push_back(SimCommandEvent::MoveIntent {
+        x: movement.x,
+        y: movement.y,
+        z: movement.z,
+    });
+
+    if raw_input.mouse_delta.length_squared() > 0.0 {
+        queue.0.push_back(SimCommandEvent::LookDelta {
+            yaw: raw_input.mouse_delta.x as f32,
+            pitch: raw_input.mouse_delta.y as f32,
+        });
+        raw_input.mouse_delta = DVec2::ZERO;
+    }
+
+    if raw_input.just_pressed.contains(&KeyCode::KeyF) {
+        queue.0.push_back(SimCommandEvent::ToggleFly);
+    }
+
+    raw_input.just_pressed.clear();
+}
+
+fn consume_commands_system(
+    mut queue: ResMut<'_, SimCommandQueue>,
+    mut intent: ResMut<'_, PlayerIntentState>,
+    mut cameras: Query<'_, '_, &mut FlyCamera, With<Player>>,
+) {
+    while let Some(command) = queue.0.pop_front() {
+        match command {
+            SimCommandEvent::MoveIntent { x, y, z } => {
+                intent.movement = Vec3::new(x, y, z);
+            }
+            SimCommandEvent::LookDelta { yaw, pitch } => {
+                intent.look_delta += Vec2::new(yaw, pitch);
+            }
+            SimCommandEvent::ToggleFly => {
+                for mut camera in &mut cameras {
+                    camera.fly_mode = !camera.fly_mode;
+                }
+            }
+        }
+    }
+}
+
+fn apply_player_motion_system(
+    fixed_dt: Res<'_, FixedDeltaSeconds>,
+    mut intent: ResMut<'_, PlayerIntentState>,
+    mut players: Query<'_, '_, (&mut Transform64, &FlyCamera), With<Player>>,
+) {
+    for (mut transform, camera) in &mut players {
+        transform.prev_position = transform.position;
+        transform.prev_yaw = transform.yaw;
+        transform.prev_pitch = transform.pitch;
+
+        transform.yaw -= f64::from(intent.look_delta.x) * camera.sensitivity;
+        transform.pitch = (transform.pitch - f64::from(intent.look_delta.y) * camera.sensitivity)
+            .clamp(-FRAC_PI_2 + 0.01, FRAC_PI_2 - 0.01);
+
+        let yaw_sin = transform.yaw.sin();
+        let yaw_cos = transform.yaw.cos();
+        let pitch_cos = transform.pitch.cos();
+        let pitch_sin = transform.pitch.sin();
+
+        let forward =
+            DVec3::new(yaw_sin * pitch_cos, pitch_sin, yaw_cos * pitch_cos).normalize_or_zero();
+        let flat_forward = DVec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+        let right = DVec3::new(flat_forward.z, 0.0, -flat_forward.x).normalize_or_zero();
+
+        let mut desired_direction =
+            right * f64::from(intent.movement.x) + flat_forward * f64::from(intent.movement.z);
+        if camera.fly_mode {
+            desired_direction += DVec3::Y * f64::from(intent.movement.y);
+        }
+
+        if desired_direction.length_squared() > 0.0 {
+            desired_direction = desired_direction.normalize();
+        }
+
+        transform.position += desired_direction * camera.speed * fixed_dt.0;
+    }
+
+    intent.look_delta = Vec2::ZERO;
+}
+
+fn interpolate_render_transform_system(
+    alpha: Res<'_, RenderAlpha>,
+    mut players: Query<'_, '_, (&Transform64, &mut RenderTransform), With<Player>>,
+) {
+    for (transform, mut render_transform) in &mut players {
+        let blend = f64::from(alpha.0);
+        render_transform.position = transform
+            .prev_position
+            .lerp(transform.position, blend)
+            .as_vec3();
+        render_transform.yaw =
+            (transform.prev_yaw + (transform.yaw - transform.prev_yaw) * blend) as f32;
+        render_transform.pitch =
+            (transform.prev_pitch + (transform.pitch - transform.prev_pitch) * blend) as f32;
+    }
+}
+
+fn movement_from_pressed(keys: &HashSet<KeyCode>) -> Vec3 {
+    let mut movement = Vec3::ZERO;
+
+    if keys.contains(&KeyCode::KeyA) {
+        movement.x -= 1.0;
+    }
+    if keys.contains(&KeyCode::KeyD) {
+        movement.x += 1.0;
+    }
+    if keys.contains(&KeyCode::Space) {
+        movement.y += 1.0;
+    }
+    if keys.contains(&KeyCode::ShiftLeft) || keys.contains(&KeyCode::ShiftRight) {
+        movement.y -= 1.0;
+    }
+    if keys.contains(&KeyCode::KeyW) {
+        movement.z += 1.0;
+    }
+    if keys.contains(&KeyCode::KeyS) {
+        movement.z -= 1.0;
+    }
+
+    movement
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_schedule_does_not_mutate_authoritative_transform() {
+        let mut runtime = EcsRuntime::new();
+        let before = runtime
+            .camera_snapshot()
+            .expect("expected a player entity")
+            .authoritative;
+
+        runtime.handle_key(KeyCode::KeyW, true);
+        runtime.add_mouse_delta(10.0, 5.0);
+        runtime.run_input();
+
+        let after = runtime
+            .camera_snapshot()
+            .expect("expected a player entity")
+            .authoritative;
+
+        assert_eq!(before, after);
+        assert!(runtime.queued_commands_len() > 0);
+    }
+
+    #[test]
+    fn render_interpolation_blends_previous_and_current_transform() {
+        let mut runtime = EcsRuntime::new();
+
+        {
+            let mut query = runtime
+                .world
+                .query_filtered::<&mut Transform64, With<Player>>();
+            let mut transform = query
+                .iter_mut(&mut runtime.world)
+                .next()
+                .expect("expected player transform");
+            transform.prev_position = DVec3::ZERO;
+            transform.position = DVec3::new(10.0, 0.0, 0.0);
+            transform.prev_yaw = 0.0;
+            transform.yaw = 2.0;
+            transform.prev_pitch = 0.0;
+            transform.pitch = 1.0;
+        }
+
+        runtime.run_render_prep(0.25);
+
+        let snapshot = runtime
+            .camera_snapshot()
+            .expect("expected camera snapshot after interpolation");
+        assert!((snapshot.interpolated.position.x - 2.5).abs() < 1e-6);
+        assert!((snapshot.interpolated.yaw - 0.5).abs() < 1e-6);
+        assert!((snapshot.interpolated.pitch - 0.25).abs() < 1e-6);
+    }
+}

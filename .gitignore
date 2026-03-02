@@ -1,0 +1,15 @@
+/target
+.DS_Store
+.idea/
+.vscode/
+*.log
+CLAUDE.md
+
+# Decompiled Java source is our canonical code reference; ignore raw class blobs.
+resources/minecraft-a1.2.6-client/**/*.class
+resources/minecraft-a1.2.6-client/META-INF/
+
+# Large local reference/assets are kept out of git history by default.
+resources/decomp/
+resources/default_resource_pack/
+resources/minecraft-a1.2.6-client/
