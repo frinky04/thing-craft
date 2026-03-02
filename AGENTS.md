@@ -1,3 +1,5 @@
+# Rules
+
 - **High performance, within reason:** Keeping the code easy, minimal, and understandable is the highest priority. Take performance wins where we can get them.
 - **Modern architecture:** Use hindsight to inform our design decisions. Minecraft is one of the most "understood games", we can use that to our advantage.
 - **Progressive Rebuild:** Start with the most important elements, and progressively build up. Leave complicated thing like Networking till later. HOWEVER:
