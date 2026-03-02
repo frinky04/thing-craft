@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crate::lighting::{relight_chunk, CardinalChunkNeighborsOwned, LightEdgeSlice, LightingOutput};
 use crate::mesh::{
-    build_chunk_section_mesh_with_neighbor_slices, merge_meshes, CardinalNeighborSlicesOwned,
-    ChunkMesh, NeighborEdgeSliceOwned,
+    build_chunk_section_split_mesh_with_neighbor_slices, merge_meshes,
+    CardinalNeighborSlicesOwned, ChunkMesh, NeighborEdgeSliceOwned,
 };
 use crate::world::{
     BlockRegistry, ChunkData, ChunkPos, OverworldChunkGenerator, CHUNK_DEPTH, CHUNK_HEIGHT,
@@ -85,6 +85,7 @@ pub enum RenderMeshUpdate {
         pos: ChunkPos,
         section_y: u8,
         mesh: ChunkMesh,
+        transparent_mesh: ChunkMesh,
     },
     RemoveChunk {
         pos: ChunkPos,
@@ -108,8 +109,8 @@ struct ChunkResidencyEntry {
     dirty: ChunkDirtyFlags,
     lighting_revision: u64,
     chunk: Option<ChunkData>,
-    mesh: Option<ChunkMesh>,
     section_meshes: [Option<ChunkMesh>; CHUNK_SECTION_COUNT],
+    transparent_section_meshes: [Option<ChunkMesh>; CHUNK_SECTION_COUNT],
     meshed_section_mask: u8,
 }
 
@@ -159,7 +160,7 @@ struct MeshingJob {
 struct MeshingResult {
     pos: ChunkPos,
     section_mask: u8,
-    section_meshes: Vec<(u8, ChunkMesh)>,
+    section_meshes: Vec<(u8, ChunkMesh, ChunkMesh)>,
 }
 
 pub struct ChunkStreamer {
@@ -363,20 +364,12 @@ impl ChunkStreamer {
                             rx.try_recv()
                         };
                         if let Ok(job) = urgent_job {
-                            let mut section_meshes = Vec::new();
-                            for section_y in 0..CHUNK_SECTION_COUNT as u8 {
-                                let bit = 1_u8 << section_y;
-                                if job.section_mask & bit == 0 {
-                                    continue;
-                                }
-                                let mesh = build_chunk_section_mesh_with_neighbor_slices(
-                                    &job.chunk,
-                                    &meshing_registry,
-                                    &job.neighbors,
-                                    section_y,
-                                );
-                                section_meshes.push((section_y, mesh));
-                            }
+                            let section_meshes = build_split_section_meshes(
+                                &job.chunk,
+                                &meshing_registry,
+                                &job.neighbors,
+                                job.section_mask,
+                            );
                             if meshing_result_tx
                                 .send(MeshingResult {
                                     pos: job.pos,
@@ -439,20 +432,12 @@ impl ChunkStreamer {
                         let Some(job) = job else {
                             continue;
                         };
-                        let mut section_meshes = Vec::new();
-                        for section_y in 0..CHUNK_SECTION_COUNT as u8 {
-                            let bit = 1_u8 << section_y;
-                            if job.section_mask & bit == 0 {
-                                continue;
-                            }
-                            let mesh = build_chunk_section_mesh_with_neighbor_slices(
-                                &job.chunk,
-                                &meshing_registry,
-                                &job.neighbors,
-                                section_y,
-                            );
-                            section_meshes.push((section_y, mesh));
-                        }
+                        let section_meshes = build_split_section_meshes(
+                            &job.chunk,
+                            &meshing_registry,
+                            &job.neighbors,
+                            job.section_mask,
+                        );
                         if meshing_result_tx
                             .send(MeshingResult {
                                 pos: job.pos,
@@ -774,8 +759,9 @@ impl ChunkStreamer {
                     dirty: ChunkDirtyFlags::default(),
                     lighting_revision: 0,
                     chunk: None,
-                    mesh: None,
+
                     section_meshes: std::array::from_fn(|_| None),
+                    transparent_section_meshes: std::array::from_fn(|_| None),
                     meshed_section_mask: 0,
                 });
             }
@@ -787,8 +773,8 @@ impl ChunkStreamer {
                 slot.state = ChunkResidencyState::Evicting;
                 slot.dirty = ChunkDirtyFlags::default();
                 slot.chunk = None;
-                slot.mesh = None;
                 slot.section_meshes = std::array::from_fn(|_| None);
+                slot.transparent_section_meshes = std::array::from_fn(|_| None);
                 slot.meshed_section_mask = 0;
                 self.mesh_dirty = true;
                 self.render_updates
@@ -1124,8 +1110,8 @@ impl ChunkStreamer {
                         slot.chunk = Some(result.chunk);
                         slot.dirty = ChunkDirtyFlags::default();
                         slot.state = ChunkResidencyState::Meshing;
-                        slot.mesh = None;
                         slot.section_meshes = std::array::from_fn(|_| None);
+                        slot.transparent_section_meshes = std::array::from_fn(|_| None);
                         slot.meshed_section_mask = 0;
                     }
                     self.mark_chunk_lighting_dirty(pos);
@@ -1215,7 +1201,7 @@ impl ChunkStreamer {
                             continue;
                         }
 
-                        for (section_y, mesh) in result.section_meshes {
+                        for (section_y, mesh, transparent_mesh) in result.section_meshes {
                             let index = usize::from(section_y);
                             if index >= CHUNK_SECTION_COUNT {
                                 continue;
@@ -1226,15 +1212,17 @@ impl ChunkStreamer {
                                 } else {
                                     Some(mesh)
                                 };
+                            slot.transparent_section_meshes[index] = if transparent_mesh
+                                .vertices
+                                .is_empty()
+                                || transparent_mesh.indices.is_empty()
+                            {
+                                None
+                            } else {
+                                Some(transparent_mesh)
+                            };
                         }
                         slot.meshed_section_mask |= result.section_mask & full_section_mask();
-                        let merged_sections: Vec<_> =
-                            slot.section_meshes.iter().flatten().cloned().collect();
-                        slot.mesh = if merged_sections.is_empty() {
-                            None
-                        } else {
-                            Some(merge_meshes(&merged_sections))
-                        };
                         slot.state = ChunkResidencyState::Ready;
                         self.mesh_dirty = true;
                         self.pending_render_upload_masks
@@ -1311,10 +1299,14 @@ impl ChunkStreamer {
                 let mesh = slot.section_meshes[usize::from(section_y)]
                     .clone()
                     .unwrap_or_default();
+                let transparent_mesh = slot.transparent_section_meshes[usize::from(section_y)]
+                    .clone()
+                    .unwrap_or_default();
                 self.render_updates.push(RenderMeshUpdate::UpsertSection {
                     pos,
                     section_y,
                     mesh,
+                    transparent_mesh,
                 });
                 remaining_mask &= !bit;
                 uploaded_sections += 1;
@@ -1680,6 +1672,26 @@ fn section_mask_for_y(local_y: u8) -> u8 {
     1_u8 << section
 }
 
+fn build_split_section_meshes(
+    chunk: &ChunkData,
+    registry: &BlockRegistry,
+    neighbors: &CardinalNeighborSlicesOwned,
+    section_mask: u8,
+) -> Vec<(u8, ChunkMesh, ChunkMesh)> {
+    let mut section_meshes = Vec::new();
+    for section_y in 0..CHUNK_SECTION_COUNT as u8 {
+        let bit = 1_u8 << section_y;
+        if section_mask & bit == 0 {
+            continue;
+        }
+        let split = build_chunk_section_split_mesh_with_neighbor_slices(
+            chunk, registry, neighbors, section_y,
+        );
+        section_meshes.push((section_y, split.opaque, split.transparent));
+    }
+    section_meshes
+}
+
 fn missing_section_mask(entry: &ChunkResidencyEntry) -> u8 {
     full_section_mask() & !entry.meshed_section_mask
 }
@@ -1757,8 +1769,8 @@ mod tests {
             dirty: ChunkDirtyFlags::default(),
             lighting_revision: 0,
             chunk: None,
-            mesh: None,
             section_meshes: std::array::from_fn(|_| None),
+            transparent_section_meshes: std::array::from_fn(|_| None),
             meshed_section_mask: meshed_mask,
         };
 
@@ -2670,8 +2682,8 @@ mod tests {
                 dirty: ChunkDirtyFlags::default(),
                 lighting_revision: 0,
                 chunk: Some(center_chunk),
-                mesh: Some(ChunkMesh::default()),
                 section_meshes: std::array::from_fn(|_| None),
+                transparent_section_meshes: std::array::from_fn(|_| None),
                 meshed_section_mask: full_section_mask(),
             },
         );
@@ -2682,8 +2694,8 @@ mod tests {
                 dirty: ChunkDirtyFlags::default(),
                 lighting_revision: 0,
                 chunk: Some(east_chunk),
-                mesh: Some(ChunkMesh::default()),
                 section_meshes: std::array::from_fn(|_| None),
+                transparent_section_meshes: std::array::from_fn(|_| None),
                 meshed_section_mask: full_section_mask(),
             },
         );

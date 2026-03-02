@@ -906,8 +906,10 @@ fn apply_render_update(renderer: &mut Renderer<'_>, update: RenderMeshUpdate) ->
             pos,
             section_y,
             mesh,
+            transparent_mesh,
         } => {
             renderer.upsert_chunk_section_mesh(pos, section_y, &mesh);
+            renderer.upsert_chunk_section_transparent_mesh(pos, section_y, &transparent_mesh);
             true
         }
         RenderMeshUpdate::RemoveChunk { pos } => {

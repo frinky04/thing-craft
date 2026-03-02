@@ -36,7 +36,7 @@ const MOSSY_COBBLESTONE_ID: u8 = 48;
 const MOB_SPAWNER_ID: u8 = 52;
 const DIAMOND_ORE_ID: u8 = 56;
 const REDSTONE_ORE_ID: u8 = 73;
-const ICE_ID: u8 = 79;
+pub(crate) const ICE_ID: u8 = 79;
 
 const ALPHA_EXCLUDED_BLOCK_IDS: [u8; 15] = [
     21, // Lapis Ore
@@ -72,6 +72,13 @@ pub enum MaterialKind {
     Fire,
     Portal,
     Wool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BiomeTintKind {
+    None,
+    Grass,
+    Foliage,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -170,7 +177,7 @@ impl BlockRegistry {
             &mut by_id,
             FLOWING_WATER_ID,
             "flowing_water",
-            0,
+            205,
             MaterialKind::Liquid,
             false,
             3,
@@ -180,7 +187,7 @@ impl BlockRegistry {
             &mut by_id,
             WATER_ID,
             "water",
-            0,
+            205,
             MaterialKind::Liquid,
             false,
             3,
@@ -190,7 +197,7 @@ impl BlockRegistry {
             &mut by_id,
             FLOWING_LAVA_ID,
             "flowing_lava",
-            0,
+            237,
             MaterialKind::Liquid,
             false,
             255,
@@ -200,7 +207,7 @@ impl BlockRegistry {
             &mut by_id,
             LAVA_ID,
             "lava",
-            0,
+            237,
             MaterialKind::Liquid,
             false,
             255,
@@ -520,7 +527,15 @@ impl BlockRegistry {
             (GRASS_ID, 1) => 0,
             (GRASS_ID, -1) => self.sprite_index_of(DIRT_ID),
             (17, 1 | -1) => 21,
-            _ => self.sprite_index_of(block_id),
+            _ => {
+                let base = self.sprite_index_of(block_id);
+                // Liquid side faces use base+1 sprite (top/bottom use base)
+                if self.is_liquid(block_id) && face_offset[1] == 0 {
+                    base + 1
+                } else {
+                    base
+                }
+            }
         }
     }
 
@@ -535,8 +550,23 @@ impl BlockRegistry {
     }
 
     #[must_use]
-    pub fn face_uses_biome_tint(&self, block_id: u8, face_offset: [i32; 3]) -> bool {
-        matches!((block_id, face_offset[1]), (GRASS_ID, 1))
+    pub fn biome_tint_kind(&self, block_id: u8, face_offset: [i32; 3]) -> BiomeTintKind {
+        match (block_id, face_offset[1]) {
+            (GRASS_ID, 1) => BiomeTintKind::Grass,
+            (OAK_LEAVES_ID, _) => BiomeTintKind::Foliage,
+            _ => BiomeTintKind::None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_liquid(&self, block_id: u8) -> bool {
+        self.get(block_id)
+            .is_some_and(|block| block.material == MaterialKind::Liquid)
+    }
+
+    #[must_use]
+    pub fn is_water(&self, block_id: u8) -> bool {
+        matches!(block_id, FLOWING_WATER_ID | WATER_ID)
     }
 
     #[must_use]
@@ -725,6 +755,7 @@ pub struct OverworldChunkGenerator {
     biome_source: BiomeSource,
     terrain_noise: Fbm<OpenSimplex>,
     grass_color_map: GrassColorMap,
+    foliage_color_map: FoliageColorMap,
 }
 
 impl OverworldChunkGenerator {
@@ -734,13 +765,21 @@ impl OverworldChunkGenerator {
         let mut terrain_noise =
             Fbm::<OpenSimplex>::new((seed.wrapping_mul(341_873_128_712) & 0xFFFF_FFFF) as u32);
         terrain_noise = terrain_noise.set_octaves(8).set_frequency(1.0 / 684.412);
-        let grass_color_map = GrassColorMap::load();
+        let grass_color_map = GrassColorMap::load(
+            &["resources/minecraft-a1.2.6-client/misc/grasscolor.png"],
+            [126, 201, 86],
+        );
+        let foliage_color_map = FoliageColorMap::load(
+            &["resources/minecraft-a1.2.6-client/misc/foliagecolor.png"],
+            [87, 174, 47],
+        );
 
         Self {
             seed,
             biome_source,
             terrain_noise,
             grass_color_map,
+            foliage_color_map,
         }
     }
 
@@ -759,6 +798,10 @@ impl OverworldChunkGenerator {
                     .grass_color_map
                     .sample(biome_sample.temperature, biome_sample.downfall);
                 chunk.set_grass_tint(local_x, local_z, grass_tint);
+                let foliage_tint = self
+                    .foliage_color_map
+                    .sample(biome_sample.temperature, biome_sample.downfall);
+                chunk.set_foliage_tint(local_x, local_z, foliage_tint);
 
                 let terrain_base = self
                     .terrain_noise
@@ -1402,6 +1445,27 @@ fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
 // Oak tree placement  (translated from TreeFeature.java / BiomeDecorator.java)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TreeKind {
+    Oak,
+    Birch,
+    Pine,
+}
+
+fn tree_kind_for_biome(biome: BiomeKind, rng: &mut SmallRng) -> TreeKind {
+    match biome {
+        BiomeKind::Taiga => TreeKind::Pine,
+        BiomeKind::Forest | BiomeKind::SeasonalForest => {
+            if rng.gen_range(0..3_i32) == 0 {
+                TreeKind::Birch
+            } else {
+                TreeKind::Oak
+            }
+        }
+        _ => TreeKind::Oak,
+    }
+}
+
 /// Returns the number of trees to attempt for the given biome.
 /// Alpha's BiomeDecorator applies: `treesPerChunk` which defaults to 0, then
 /// Forest/Rainforest/Taiga add +5, SeasonalForest +2, and Desert/Tundra/Plains
@@ -1442,10 +1506,37 @@ fn place_trees(chunk: &mut ChunkData, world_seed: u64, biome_source: &BiomeSourc
     for _ in 0..attempt_count {
         let local_x = rng.gen_range(0..CHUNK_WIDTH as i32);
         let local_z = rng.gen_range(0..CHUNK_DEPTH as i32);
-        let trunk_height = rng.gen_range(0..3_i32) + 4; // 4-6 blocks
+        let kind = tree_kind_for_biome(biome_sample.biome, &mut rng);
 
         if let Some(surface_y) = find_surface_y(chunk, local_x as u8, local_z as u8) {
-            try_place_tree(chunk, &mut rng, local_x, surface_y, local_z, trunk_height);
+            match kind {
+                TreeKind::Oak => {
+                    let trunk_height = rng.gen_range(0..3_i32) + 4; // 4-6 blocks
+                    try_place_tree(chunk, &mut rng, local_x, surface_y, local_z, trunk_height);
+                }
+                TreeKind::Birch => {
+                    let trunk_height = rng.gen_range(0..2_i32) + 5; // 5-6 blocks
+                    try_place_birch_tree(
+                        chunk,
+                        &mut rng,
+                        local_x,
+                        surface_y,
+                        local_z,
+                        trunk_height,
+                    );
+                }
+                TreeKind::Pine => {
+                    let trunk_height = rng.gen_range(0..5_i32) + 6; // 6-10 blocks
+                    try_place_pine_tree(
+                        chunk,
+                        &mut rng,
+                        local_x,
+                        surface_y,
+                        local_z,
+                        trunk_height,
+                    );
+                }
+            }
         }
     }
 }
@@ -1569,6 +1660,211 @@ fn try_place_tree(
     }
 }
 
+/// Birch tree: slightly taller, thinner canopy (radius 1 throughout).
+/// Uses OAK_LOG_ID and OAK_LEAVES_ID (Alpha 1.2.6 has only one log/leaf type).
+fn try_place_birch_tree(
+    chunk: &mut ChunkData,
+    rng: &mut SmallRng,
+    local_x: i32,
+    surface_y: i32,
+    local_z: i32,
+    trunk_height: i32,
+) {
+    let ground_block = chunk.block(local_x as u8, surface_y as u8, local_z as u8);
+    if ground_block != GRASS_ID && ground_block != DIRT_ID {
+        return;
+    }
+
+    let trunk_base = surface_y + 1;
+    let trunk_top = trunk_base + trunk_height - 1;
+
+    if trunk_top + 1 >= CHUNK_HEIGHT as i32 {
+        return;
+    }
+
+    // Check clearance: radius 1 around trunk from (trunk_top - 2) to (trunk_top + 1).
+    let canopy_bottom = trunk_top - 2;
+    let canopy_top = trunk_top + 1;
+    for cy in canopy_bottom..=canopy_top {
+        if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
+            return;
+        }
+        for dx in -1..=1_i32 {
+            for dz in -1..=1_i32 {
+                let bx = local_x + dx;
+                let bz = local_z + dz;
+                if !(0..CHUNK_WIDTH as i32).contains(&bx)
+                    || !(0..CHUNK_DEPTH as i32).contains(&bz)
+                {
+                    continue;
+                }
+                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                if existing != AIR_ID && existing != OAK_LEAVES_ID {
+                    return;
+                }
+            }
+        }
+    }
+
+    chunk.set_block(local_x as u8, surface_y as u8, local_z as u8, DIRT_ID);
+
+    // Canopy: 3 layers of radius 1, with corner pruning.
+    for cy in (trunk_top - 2)..=(trunk_top) {
+        for dx in -1..=1_i32 {
+            for dz in -1..=1_i32 {
+                let bx = local_x + dx;
+                let bz = local_z + dz;
+                if !(0..CHUNK_WIDTH as i32).contains(&bx)
+                    || !(0..CHUNK_DEPTH as i32).contains(&bz)
+                {
+                    continue;
+                }
+                if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
+                    continue;
+                }
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                // Prune corners on all layers.
+                if dx.abs() == 1 && dz.abs() == 1 && rng.gen_range(0..2_i32) == 0 {
+                    continue;
+                }
+                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                if existing == AIR_ID {
+                    chunk.set_block(bx as u8, cy as u8, bz as u8, OAK_LEAVES_ID);
+                }
+            }
+        }
+    }
+
+    // Cap leaf.
+    let cap_y = trunk_top + 1;
+    if cap_y < CHUNK_HEIGHT as i32 {
+        let existing = chunk.block(local_x as u8, cap_y as u8, local_z as u8);
+        if existing == AIR_ID {
+            chunk.set_block(local_x as u8, cap_y as u8, local_z as u8, OAK_LEAVES_ID);
+        }
+    }
+
+    // Trunk.
+    for ty in trunk_base..=trunk_top {
+        if ty >= CHUNK_HEIGHT as i32 {
+            break;
+        }
+        chunk.set_block(local_x as u8, ty as u8, local_z as u8, OAK_LOG_ID);
+    }
+}
+
+/// Pine tree: tall trunk with triangular canopy that narrows from bottom to top.
+/// Uses OAK_LOG_ID and OAK_LEAVES_ID (Alpha 1.2.6 has only one log/leaf type).
+fn try_place_pine_tree(
+    chunk: &mut ChunkData,
+    _rng: &mut SmallRng,
+    local_x: i32,
+    surface_y: i32,
+    local_z: i32,
+    trunk_height: i32,
+) {
+    let ground_block = chunk.block(local_x as u8, surface_y as u8, local_z as u8);
+    if ground_block != GRASS_ID && ground_block != DIRT_ID {
+        return;
+    }
+
+    let trunk_base = surface_y + 1;
+    let trunk_top = trunk_base + trunk_height - 1;
+
+    if trunk_top + 1 >= CHUNK_HEIGHT as i32 {
+        return;
+    }
+
+    // Canopy starts at about 60% up the trunk.
+    let canopy_start = trunk_base + trunk_height / 3;
+    let canopy_layers = trunk_top - canopy_start + 2; // +1 for top leaf
+
+    // Check clearance around entire canopy area.
+    for cy in canopy_start..=(trunk_top + 1) {
+        if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
+            return;
+        }
+        let layer_from_bottom = cy - canopy_start;
+        let radius = pine_canopy_radius(layer_from_bottom, canopy_layers);
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                let bx = local_x + dx;
+                let bz = local_z + dz;
+                if !(0..CHUNK_WIDTH as i32).contains(&bx)
+                    || !(0..CHUNK_DEPTH as i32).contains(&bz)
+                {
+                    continue;
+                }
+                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                if existing != AIR_ID && existing != OAK_LEAVES_ID {
+                    return;
+                }
+            }
+        }
+    }
+
+    chunk.set_block(local_x as u8, surface_y as u8, local_z as u8, DIRT_ID);
+
+    // Place canopy layers.
+    for cy in canopy_start..=(trunk_top + 1) {
+        if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
+            continue;
+        }
+        let layer_from_bottom = cy - canopy_start;
+        let radius = pine_canopy_radius(layer_from_bottom, canopy_layers);
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                let bx = local_x + dx;
+                let bz = local_z + dz;
+                if !(0..CHUNK_WIDTH as i32).contains(&bx)
+                    || !(0..CHUNK_DEPTH as i32).contains(&bz)
+                {
+                    continue;
+                }
+                if dx == 0 && dz == 0 && cy <= trunk_top {
+                    continue; // Trunk column handled separately.
+                }
+                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                if existing == AIR_ID {
+                    chunk.set_block(bx as u8, cy as u8, bz as u8, OAK_LEAVES_ID);
+                }
+            }
+        }
+    }
+
+    // Trunk.
+    for ty in trunk_base..=trunk_top {
+        if ty >= CHUNK_HEIGHT as i32 {
+            break;
+        }
+        chunk.set_block(local_x as u8, ty as u8, local_z as u8, OAK_LOG_ID);
+    }
+
+    // Single leaf on very top (above trunk_top).
+    let top_y = trunk_top + 1;
+    if top_y < CHUNK_HEIGHT as i32 {
+        chunk.set_block(local_x as u8, top_y as u8, local_z as u8, OAK_LEAVES_ID);
+    }
+}
+
+/// Alternating radius pattern for pine canopy: wide at bottom, narrow at top.
+fn pine_canopy_radius(layer_from_bottom: i32, total_layers: i32) -> i32 {
+    if total_layers <= 0 {
+        return 0;
+    }
+    let layer_from_top = total_layers - 1 - layer_from_bottom;
+    // Alternating pattern: 2, 1, 2, 1, 0 from bottom to top
+    match layer_from_top {
+        0 => 0, // top: single leaf
+        1 => 1,
+        2 => 2,
+        3 => 1,
+        _ => 2, // bottom layers are wide
+    }
+}
+
 fn normalize_noise(value: f64) -> f64 {
     ((value + 1.0) * 0.5).clamp(0.0, 1.0)
 }
@@ -1587,6 +1883,7 @@ pub struct ChunkData {
     block_light: NibbleStorage,
     height_map: [u8; CHUNK_AREA],
     grass_tint: [u32; CHUNK_AREA],
+    foliage_tint: [u32; CHUNK_AREA],
 }
 
 impl ChunkData {
@@ -1599,6 +1896,7 @@ impl ChunkData {
             block_light: NibbleStorage::new(CHUNK_VOLUME),
             height_map: [0; CHUNK_AREA],
             grass_tint: [WHITE_RGB_PACKED; CHUNK_AREA],
+            foliage_tint: [WHITE_RGB_PACKED; CHUNK_AREA],
         }
     }
 
@@ -1673,7 +1971,7 @@ impl ChunkData {
                 break;
             }
         }
-        self.height_map[usize::from(local_z) * CHUNK_WIDTH + usize::from(local_x)] = height;
+        self.height_map[column_index(local_x, local_z)] = height;
 
         let mut sky_level = 15_u8;
         for y in (0..CHUNK_HEIGHT).rev() {
@@ -1722,18 +2020,25 @@ impl ChunkData {
 
     #[must_use]
     pub fn height_at(&self, local_x: u8, local_z: u8) -> u8 {
-        self.height_map[usize::from(local_z) * CHUNK_WIDTH + usize::from(local_x)]
+        self.height_map[column_index(local_x, local_z)]
     }
 
     #[must_use]
     pub fn grass_tint_at(&self, local_x: u8, local_z: u8) -> [u8; 3] {
-        let packed = self.grass_tint[usize::from(local_z) * CHUNK_WIDTH + usize::from(local_x)];
-        unpack_rgb(packed)
+        unpack_rgb(self.grass_tint[column_index(local_x, local_z)])
     }
 
     fn set_grass_tint(&mut self, local_x: u8, local_z: u8, tint: [u8; 3]) {
-        let index = usize::from(local_z) * CHUNK_WIDTH + usize::from(local_x);
-        self.grass_tint[index] = pack_rgb(tint);
+        self.grass_tint[column_index(local_x, local_z)] = pack_rgb(tint);
+    }
+
+    #[must_use]
+    pub fn foliage_tint_at(&self, local_x: u8, local_z: u8) -> [u8; 3] {
+        unpack_rgb(self.foliage_tint[column_index(local_x, local_z)])
+    }
+
+    fn set_foliage_tint(&mut self, local_x: u8, local_z: u8, tint: [u8; 3]) {
+        self.foliage_tint[column_index(local_x, local_z)] = pack_rgb(tint);
     }
 
     #[must_use]
@@ -1745,48 +2050,53 @@ impl ChunkData {
     }
 }
 
+fn column_index(local_x: u8, local_z: u8) -> usize {
+    usize::from(local_z) * CHUNK_WIDTH + usize::from(local_x)
+}
+
 #[derive(Debug, Clone)]
-struct GrassColorMap {
+struct BiomeColorMap {
     rgb: Box<[u32; 256 * 256]>,
 }
 
-impl GrassColorMap {
-    fn load() -> Self {
+impl BiomeColorMap {
+    fn load(path_candidates: &[&str], fallback_rgb: [u8; 3]) -> Self {
         let fallback = || Self {
-            rgb: Box::new([pack_rgb([126, 201, 86]); 256 * 256]),
+            rgb: Box::new([pack_rgb(fallback_rgb); 256 * 256]),
         };
 
-        let candidates = [
-            Path::new("resources/minecraft-a1.2.6-client/misc/grasscolor.png").to_path_buf(),
-            Path::new("../resources/minecraft-a1.2.6-client/misc/grasscolor.png").to_path_buf(),
-        ];
+        for &candidate in path_candidates {
+            let candidates = [
+                Path::new(candidate).to_path_buf(),
+                Path::new("..").join(candidate),
+            ];
+            for path in candidates {
+                let bytes = match std::fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                let image =
+                    match image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) {
+                        Ok(image) => image.to_rgba8(),
+                        Err(_) => continue,
+                    };
+                let (width, height) = image.dimensions();
+                if width != 256 || height != 256 {
+                    continue;
+                }
 
-        for candidate in candidates {
-            let bytes = match std::fs::read(candidate) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
-            let image = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) {
-                Ok(image) => image.to_rgba8(),
-                Err(_) => continue,
-            };
-            let (width, height) = image.dimensions();
-            if width != 256 || height != 256 {
-                continue;
+                let mut rgb = [0_u32; 256 * 256];
+                for (index, pixel) in image.pixels().enumerate() {
+                    rgb[index] = pack_rgb([pixel[0], pixel[1], pixel[2]]);
+                }
+                return Self { rgb: Box::new(rgb) };
             }
-
-            let mut rgb = [0_u32; 256 * 256];
-            for (index, pixel) in image.pixels().enumerate() {
-                rgb[index] = pack_rgb([pixel[0], pixel[1], pixel[2]]);
-            }
-            return Self { rgb: Box::new(rgb) };
         }
 
         fallback()
     }
 
     fn sample(&self, temperature: f64, downfall: f64) -> [u8; 3] {
-        // Alpha uses temperature plus humidity*temperature to index misc/grasscolor.png.
         let temp = temperature.clamp(0.0, 1.0);
         let humid = (downfall * temp).clamp(0.0, 1.0);
         let x = ((1.0 - temp) * 255.0).round() as usize;
@@ -1794,6 +2104,9 @@ impl GrassColorMap {
         unpack_rgb(self.rgb[(y << 8) | x])
     }
 }
+
+type GrassColorMap = BiomeColorMap;
+type FoliageColorMap = BiomeColorMap;
 
 const fn pack_rgb(rgb: [u8; 3]) -> u32 {
     ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
@@ -1921,12 +2234,18 @@ mod tests {
     fn grass_top_face_marks_biome_tint_usage() {
         let registry = BlockRegistry::alpha_1_2_6();
         assert_eq!(registry.face_tint_rgb(GRASS_ID, [0, 1, 0]), [0, 0, 0]);
-        assert!(registry.face_uses_biome_tint(GRASS_ID, [0, 1, 0]));
+        assert_eq!(
+            registry.biome_tint_kind(GRASS_ID, [0, 1, 0]),
+            BiomeTintKind::Grass
+        );
         assert_eq!(
             registry.face_tint_rgb(STONE_ID, [0, 1, 0]),
             [u8::MAX, u8::MAX, u8::MAX]
         );
-        assert!(!registry.face_uses_biome_tint(STONE_ID, [0, 1, 0]));
+        assert_eq!(
+            registry.biome_tint_kind(STONE_ID, [0, 1, 0]),
+            BiomeTintKind::None
+        );
     }
 
     #[test]

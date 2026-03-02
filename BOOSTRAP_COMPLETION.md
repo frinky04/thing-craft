@@ -48,3 +48,6 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Streaming lane workers now run as per-lane configurable worker pools (`THINGCRAFT_GEN_WORKERS`, `THINGCRAFT_LIGHT_WORKERS`, `THINGCRAFT_MESH_WORKERS`).
 - [x] Lighting/meshing neighbor payloads now use boundary edge snapshots instead of full cardinal `ChunkData` clones.
 - [x] Renderer mesh uploads now use a reusable GPU buffer pool for section vertex/index buffers (bounded byte budget).
+- [x] Transparent render pipeline added: split opaque/transparent chunk meshing, alpha-blended water pass (no depth write, double-sided), shader `vec4` light channel with vertex alpha passthrough.
+- [x] Foliage biome tinting added: generic `BiomeColorMap` loader used for both grass and foliage color maps, leaf blocks tinted per-column from Alpha `foliagecolor.png`.
+- [x] Birch and pine tree shape variants added: biome-driven tree kind selection (Taiga→pine, Forest/SeasonalForest→1-in-3 birch, others→oak) with distinct canopy geometries.

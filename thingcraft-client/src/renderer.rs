@@ -25,6 +25,7 @@ pub struct Renderer<'w> {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
+    transparent_pipeline: wgpu::RenderPipeline,
     debug_line_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -33,6 +34,7 @@ pub struct Renderer<'w> {
     depth_view: wgpu::TextureView,
     scene_mesh: Option<SceneMeshGpu>,
     chunk_meshes: HashMap<ChunkPos, [Option<SceneMeshGpu>; CHUNK_SECTION_COUNT]>,
+    chunk_transparent_meshes: HashMap<ChunkPos, [Option<SceneMeshGpu>; CHUNK_SECTION_COUNT]>,
     chunk_debug_states: HashMap<ChunkPos, ChunkDebugState>,
     chunk_border_mesh: Option<DebugLineMeshGpu>,
     chunk_border_mesh_dirty: bool,
@@ -395,6 +397,50 @@ impl<'w> Renderer<'w> {
             multiview: None,
         });
 
+        let transparent_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("thingcraft-transparent-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[MeshVertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None, // Water visible from both sides when underwater
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false, // Reads depth but doesn't write
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview: None,
+            });
+
         let debug_line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("thingcraft-debug-line-shader"),
             source: wgpu::ShaderSource::Wgsl(DEBUG_LINE_SHADER.into()),
@@ -541,6 +587,7 @@ impl<'w> Renderer<'w> {
             config,
             size,
             render_pipeline,
+            transparent_pipeline,
             debug_line_pipeline,
             camera_buffer,
             camera_bind_group,
@@ -549,6 +596,7 @@ impl<'w> Renderer<'w> {
             depth_view,
             scene_mesh: None,
             chunk_meshes: HashMap::new(),
+            chunk_transparent_meshes: HashMap::new(),
             chunk_debug_states: HashMap::new(),
             chunk_border_mesh: None,
             chunk_border_mesh_dirty: true,
@@ -625,15 +673,60 @@ impl<'w> Renderer<'w> {
     }
 
     pub fn upsert_chunk_section_mesh(&mut self, pos: ChunkPos, section_y: u8, mesh: &ChunkMesh) {
+        self.upsert_section_mesh_into(
+            pos,
+            section_y,
+            mesh,
+            false,
+            "thingcraft-chunk-section-vertex-buffer",
+            "thingcraft-chunk-section-index-buffer",
+        );
+        self.chunk_border_mesh_dirty = true;
+    }
+
+    pub fn upsert_chunk_section_transparent_mesh(
+        &mut self,
+        pos: ChunkPos,
+        section_y: u8,
+        mesh: &ChunkMesh,
+    ) {
+        // Early return: skip HashMap insert/remove churn for empty meshes with no entry.
+        if (mesh.vertices.is_empty() || mesh.indices.is_empty())
+            && !self.chunk_transparent_meshes.contains_key(&pos)
+        {
+            return;
+        }
+        self.upsert_section_mesh_into(
+            pos,
+            section_y,
+            mesh,
+            true,
+            "thingcraft-chunk-section-transparent-vertex-buffer",
+            "thingcraft-chunk-section-transparent-index-buffer",
+        );
+    }
+
+    fn upsert_section_mesh_into(
+        &mut self,
+        pos: ChunkPos,
+        section_y: u8,
+        mesh: &ChunkMesh,
+        transparent: bool,
+        vb_label: &'static str,
+        ib_label: &'static str,
+    ) {
         let index = usize::from(section_y);
         if index >= CHUNK_SECTION_COUNT {
             return;
         }
 
-        let sections = self
-            .chunk_meshes
-            .entry(pos)
-            .or_insert_with(|| std::array::from_fn(|_| None));
+        let map = if transparent {
+            &mut self.chunk_transparent_meshes
+        } else {
+            &mut self.chunk_meshes
+        };
+
+        let sections = map.entry(pos).or_insert_with(|| std::array::from_fn(|_| None));
 
         if let Some(old_mesh) = sections[index].take() {
             self.mesh_buffer_pool
@@ -644,26 +737,21 @@ impl<'w> Renderer<'w> {
 
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
             if sections.iter().all(Option::is_none) {
-                self.chunk_meshes.remove(&pos);
+                map.remove(&pos);
             }
-            self.chunk_border_mesh_dirty = true;
             return;
         }
 
         let vertex_bytes = std::mem::size_of_val(mesh.vertices.as_slice()) as u64;
         let index_bytes = std::mem::size_of_val(mesh.indices.as_slice()) as u64;
-        let vertex_buffer = self.mesh_buffer_pool.acquire_vertex_buffer(
-            &self.device,
-            vertex_bytes,
-            "thingcraft-chunk-section-vertex-buffer",
-        );
+        let vertex_buffer =
+            self.mesh_buffer_pool
+                .acquire_vertex_buffer(&self.device, vertex_bytes, vb_label);
         self.queue
             .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&mesh.vertices));
-        let index_buffer = self.mesh_buffer_pool.acquire_index_buffer(
-            &self.device,
-            index_bytes,
-            "thingcraft-chunk-section-index-buffer",
-        );
+        let index_buffer =
+            self.mesh_buffer_pool
+                .acquire_index_buffer(&self.device, index_bytes, ib_label);
         self.queue
             .write_buffer(&index_buffer, 0, bytemuck::cast_slice(&mesh.indices));
 
@@ -674,18 +762,13 @@ impl<'w> Renderer<'w> {
             vertex_bytes,
             index_bytes,
         });
-        self.chunk_border_mesh_dirty = true;
     }
 
     pub fn remove_chunk_mesh(&mut self, pos: ChunkPos) {
-        if let Some(sections) = self.chunk_meshes.remove(&pos) {
-            for mesh in sections.into_iter().flatten() {
-                self.mesh_buffer_pool
-                    .recycle_vertex_buffer(mesh.vertex_buffer, mesh.vertex_bytes);
-                self.mesh_buffer_pool
-                    .recycle_index_buffer(mesh.index_buffer, mesh.index_bytes);
-            }
-        }
+        let opaque = self.chunk_meshes.remove(&pos);
+        let transparent = self.chunk_transparent_meshes.remove(&pos);
+        recycle_chunk_sections(&mut self.mesh_buffer_pool, opaque);
+        recycle_chunk_sections(&mut self.mesh_buffer_pool, transparent);
         self.chunk_border_mesh_dirty = true;
     }
 
@@ -874,6 +957,33 @@ impl<'w> Renderer<'w> {
                 self.visible_chunk_meshes = visible;
             } else {
                 self.visible_chunk_meshes = 0;
+            }
+
+            // Transparent pass: water and other translucent blocks (after opaque, before debug).
+            if !self.chunk_transparent_meshes.is_empty() {
+                render_pass.set_pipeline(&self.transparent_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.terrain_bind_group, &[]);
+                let frustum = self.camera_frustum.as_ref();
+                for (pos, sections) in &self.chunk_transparent_meshes {
+                    for (section_y, chunk_mesh) in sections.iter().enumerate() {
+                        let Some(chunk_mesh) = chunk_mesh else {
+                            continue;
+                        };
+                        if frustum.is_some_and(|view| {
+                            !view.intersects_chunk_section(*pos, section_y as u8)
+                        }) {
+                            continue;
+                        }
+
+                        render_pass.set_vertex_buffer(0, chunk_mesh.vertex_buffer.slice(..));
+                        render_pass.set_index_buffer(
+                            chunk_mesh.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
+                    }
+                }
             }
 
             if self.chunk_border_debug_enabled {
@@ -1154,6 +1264,18 @@ fn normalize_plane(plane: &mut [f32; 4]) {
     }
 }
 
+fn recycle_chunk_sections(
+    pool: &mut MeshBufferPool,
+    sections: Option<[Option<SceneMeshGpu>; CHUNK_SECTION_COUNT]>,
+) {
+    if let Some(sections) = sections {
+        for mesh in sections.into_iter().flatten() {
+            pool.recycle_vertex_buffer(mesh.vertex_buffer, mesh.vertex_bytes);
+            pool.recycle_index_buffer(mesh.index_buffer, mesh.index_bytes);
+        }
+    }
+}
+
 fn create_depth_resources(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
@@ -1303,7 +1425,7 @@ struct VertexIn {
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) light: vec3<f32>,
+    @location(1) light: vec4<f32>,
     @location(2) world_pos: vec3<f32>,
 };
 
@@ -1312,7 +1434,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
     out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
     out.uv = input.uv;
-    out.light = input.light.rgb;
+    out.light = input.light;
     out.world_pos = input.position;
     return out;
 }
@@ -1323,12 +1445,13 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (texel.a <= 0.1) {
         discard;
     }
-    let lit = texel.rgb * input.light;
+    let lit = texel.rgb * input.light.rgb;
+    let alpha = texel.a * input.light.a;
     let distance_to_camera = distance(input.world_pos, camera.camera_pos);
     let fog_span = max(camera.fog_end - camera.fog_start, 0.0001);
     let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
     let color = mix(lit, camera.fog_color, fog_t);
-    return vec4<f32>(color, texel.a);
+    return vec4<f32>(color, alpha);
 }
 "#;
 

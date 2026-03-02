@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::world::{
-    BlockRegistry, ChunkData, ChunkPos, CHUNK_DEPTH, CHUNK_EDGE_SLICE_VOLUME, CHUNK_HEIGHT,
-    CHUNK_SECTION_COUNT, CHUNK_WIDTH, SECTION_HEIGHT,
+    BiomeTintKind, BlockRegistry, ChunkData, ChunkPos, ICE_ID, CHUNK_DEPTH,
+    CHUNK_EDGE_SLICE_VOLUME, CHUNK_HEIGHT, CHUNK_SECTION_COUNT, CHUNK_WIDTH, SECTION_HEIGHT,
 };
 
 const AIR_ID: u8 = 0;
@@ -137,6 +137,27 @@ pub struct ChunkMesh {
     pub indices: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SplitChunkMesh {
+    pub opaque: ChunkMesh,
+    pub transparent: ChunkMesh,
+}
+
+#[derive(Clone, Copy)]
+struct FaceAdjust {
+    vertex_alpha: u8,
+    y_offset: f32,
+    side_y_shrink: f32,
+}
+
+impl FaceAdjust {
+    const OPAQUE: Self = Self {
+        vertex_alpha: u8::MAX,
+        y_offset: 0.0,
+        side_y_shrink: 0.0,
+    };
+}
+
 #[derive(Clone, Copy)]
 struct FaceDef {
     offset: [i32; 3],
@@ -208,14 +229,15 @@ const FACES: [FaceDef; 6] = [
 
 #[must_use]
 pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMesh {
-    build_chunk_mesh_with_neighbor_lookup(
+    let split = build_split_chunk_mesh_with_neighbor_lookup(
         chunk,
         registry,
         0,
         CHUNK_HEIGHT as i32,
         |x, y, z| neighbor_block(chunk, x, y, z),
         |x, y, z| neighbor_light(chunk, x, y, z),
-    )
+    );
+    merge_meshes(&[split.opaque, split.transparent])
 }
 
 #[must_use]
@@ -255,11 +277,27 @@ pub fn build_chunk_section_mesh_with_neighbor_slices(
     neighbor_slices: &CardinalNeighborSlicesOwned,
     section_y: u8,
 ) -> ChunkMesh {
+    let split = build_chunk_section_split_mesh_with_neighbor_slices(
+        chunk,
+        registry,
+        neighbor_slices,
+        section_y,
+    );
+    merge_meshes(&[split.opaque, split.transparent])
+}
+
+#[must_use]
+pub fn build_chunk_section_split_mesh_with_neighbor_slices(
+    chunk: &ChunkData,
+    registry: &BlockRegistry,
+    neighbor_slices: &CardinalNeighborSlicesOwned,
+    section_y: u8,
+) -> SplitChunkMesh {
     let section = usize::from(section_y);
     assert!(section < CHUNK_SECTION_COUNT, "section_y out of range");
     let y_start = section * SECTION_HEIGHT;
     let y_end = y_start + SECTION_HEIGHT;
-    build_chunk_mesh_with_neighbor_lookup(
+    build_split_chunk_mesh_with_neighbor_lookup(
         chunk,
         registry,
         y_start as i32,
@@ -284,32 +322,33 @@ pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> Chun
     let meshes: Vec<_> = chunks
         .iter()
         .map(|chunk| {
-            build_chunk_mesh_with_neighbor_lookup(
+            let split = build_split_chunk_mesh_with_neighbor_lookup(
                 chunk,
                 registry,
                 0,
                 CHUNK_HEIGHT as i32,
                 |x, y, z| neighbor_block_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
                 |x, y, z| neighbor_light_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
-            )
+            );
+            merge_meshes(&[split.opaque, split.transparent])
         })
         .collect();
     merge_meshes(&meshes)
 }
 
-fn build_chunk_mesh_with_neighbor_lookup<FB, FL>(
+fn build_split_chunk_mesh_with_neighbor_lookup<FB, FL>(
     chunk: &ChunkData,
     registry: &BlockRegistry,
     y_start: i32,
     y_end: i32,
     mut neighbor_block_lookup: FB,
     mut neighbor_light_lookup: FL,
-) -> ChunkMesh
+) -> SplitChunkMesh
 where
     FB: FnMut(i32, i32, i32) -> u8,
     FL: FnMut(i32, i32, i32) -> u8,
 {
-    let mut mesh = ChunkMesh::default();
+    let mut split = SplitChunkMesh::default();
     let chunk_origin_x = chunk.pos.x as f32 * CHUNK_WIDTH as f32;
     let chunk_origin_z = chunk.pos.z as f32 * CHUNK_DEPTH as f32;
 
@@ -321,18 +360,77 @@ where
                     continue;
                 }
 
+                let is_water = registry.is_water(block_id);
+                // Surface water: no water above — only these get the lowered top face
+                // and shrunk side-face top corners.
+                let is_surface_water = is_water
+                    && !registry.is_water(neighbor_block_lookup(local_x, y + 1, local_z));
+
                 for face in FACES {
                     let nx = local_x + face.offset[0];
                     let ny = y + face.offset[1];
                     let nz = local_z + face.offset[2];
                     let neighbor_id = neighbor_block_lookup(nx, ny, nz);
-                    if neighbor_id == block_id || registry.is_face_occluder(neighbor_id) {
-                        continue;
+
+                    // Culling rules:
+                    // - Same block type: cull (water-water, lava-lava)
+                    // - Water-ice faces: cull
+                    // - Opaque occluder: cull
+                    // - Water surface top face: always render
+                    if is_water && face.offset[1] > 0 {
+                        // Top face: only render for surface water blocks
+                        if !is_surface_water {
+                            continue;
+                        }
+                    } else {
+                        if neighbor_id == block_id || registry.is_face_occluder(neighbor_id) {
+                            continue;
+                        }
+                        if is_water && neighbor_id == ICE_ID {
+                            continue;
+                        }
                     }
+
                     let neighbor_light = neighbor_light_lookup(nx, ny, nz);
+                    let target_mesh = if is_water {
+                        &mut split.transparent
+                    } else {
+                        &mut split.opaque
+                    };
+
+                    let (tint, adjust) = if is_water {
+                        (
+                            [64_u8, 64, 255],
+                            FaceAdjust {
+                                vertex_alpha: 160,
+                                y_offset: if is_surface_water && face.offset[1] > 0 {
+                                    -2.0 / 16.0
+                                } else {
+                                    0.0
+                                },
+                                side_y_shrink: if is_surface_water && face.offset[1] == 0 {
+                                    -2.0 / 16.0
+                                } else {
+                                    0.0
+                                },
+                            },
+                        )
+                    } else {
+                        (
+                            resolve_face_tint(
+                                chunk,
+                                registry,
+                                block_id,
+                                face.offset,
+                                local_x as u8,
+                                local_z as u8,
+                            ),
+                            FaceAdjust::OPAQUE,
+                        )
+                    };
 
                     append_face(
-                        &mut mesh,
+                        target_mesh,
                         [
                             local_x as f32 + chunk_origin_x,
                             y as f32,
@@ -340,22 +438,16 @@ where
                         ],
                         face,
                         registry.sprite_index_for_face(block_id, face.offset),
-                        resolve_face_tint(
-                            chunk,
-                            registry,
-                            block_id,
-                            face.offset,
-                            local_x as u8,
-                            local_z as u8,
-                        ),
+                        tint,
                         neighbor_light,
+                        adjust,
                     );
                 }
             }
         }
     }
 
-    mesh
+    split
 }
 
 #[must_use]
@@ -526,10 +618,10 @@ fn resolve_face_tint(
     local_x: u8,
     local_z: u8,
 ) -> [u8; 3] {
-    if registry.face_uses_biome_tint(block_id, face_offset) {
-        chunk.grass_tint_at(local_x, local_z)
-    } else {
-        registry.face_tint_rgb(block_id, face_offset)
+    match registry.biome_tint_kind(block_id, face_offset) {
+        BiomeTintKind::Grass => chunk.grass_tint_at(local_x, local_z),
+        BiomeTintKind::Foliage => chunk.foliage_tint_at(local_x, local_z),
+        BiomeTintKind::None => registry.face_tint_rgb(block_id, face_offset),
     }
 }
 
@@ -603,6 +695,7 @@ fn append_face(
     sprite_index: u16,
     tint_rgb: [u8; 3],
     neighbor_light: u8,
+    adjust: FaceAdjust,
 ) {
     let atlas_tile = 1.0 / 16.0;
     let sprite_x = f32::from(sprite_index % 16) * atlas_tile;
@@ -617,14 +710,17 @@ fn append_face(
     let base_index = mesh.vertices.len() as u32;
     let shaded_tint = apply_alpha_light(tint_rgb, neighbor_light, face.offset);
     for (corner, tex) in face.corners.iter().zip(uv.iter()) {
+        let mut pos_y = base_pos[1] + corner[1];
+        if adjust.y_offset != 0.0 {
+            pos_y += adjust.y_offset;
+        }
+        if adjust.side_y_shrink != 0.0 && corner[1] > 0.5 {
+            pos_y += adjust.side_y_shrink;
+        }
         mesh.vertices.push(MeshVertex {
-            position: [
-                base_pos[0] + corner[0],
-                base_pos[1] + corner[1],
-                base_pos[2] + corner[2],
-            ],
+            position: [base_pos[0] + corner[0], pos_y, base_pos[2] + corner[2]],
             uv: *tex,
-            light_rgba: [shaded_tint[0], shaded_tint[1], shaded_tint[2], u8::MAX],
+            light_rgba: [shaded_tint[0], shaded_tint[1], shaded_tint[2], adjust.vertex_alpha],
         });
     }
 
