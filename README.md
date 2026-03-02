@@ -41,7 +41,8 @@ THINGCRAFT_VIEW_RADIUS=5 THINGCRAFT_GEN_BUDGET=12 THINGCRAFT_MESH_BUDGET=12 carg
 - `W/A/S/D`: Move horizontally
 - `Space` / `Left Shift`: Move vertically while fly mode is enabled
 - Mouse movement (after click): Look
-- Left click: Capture cursor
+- Left click: Capture cursor (first click), then break targeted block
+- Right click (while captured): Place block on targeted face
 - `Escape`: Release cursor
 - `F`: Toggle fly mode
 

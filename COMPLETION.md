@@ -26,6 +26,7 @@
 - [x] Renderer now supports incremental per-chunk mesh uploads/removals (avoids full merged scene re-upload on each boundary crossing).
 - [x] Incremental streaming meshing now includes cardinal neighbor context and neighbor remesh triggers (prevents interior seam faces between loaded chunks).
 - [x] Dirty/remesh propagation groundwork added: geometry dirty tracking per chunk, edge-propagated neighbor remesh marking, and remesh counters in runtime metrics.
+- [x] Block interaction vertical slice added: camera voxel raycast emits break/place requests, fixed-tick world mutation applies them, and edited chunks trigger boundary-safe remesh propagation.
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
 

@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glam::{Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3};
 use tracing::{debug, error, info, warn};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent};
@@ -24,6 +25,28 @@ const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
     "calloop=warn",
 ];
 const APPLY_STREAM_UPDATES_TO_RENDERER: bool = true;
+const BLOCK_INTERACTION_REACH_BLOCKS: f64 = 5.0;
+const AIR_BLOCK_ID: u8 = 0;
+const DEFAULT_PLACE_BLOCK_ID: u8 = 3;
+
+#[derive(Debug, Clone, Copy)]
+enum BlockInteractionKind {
+    Break,
+    Place { block_id: u8 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockInteractionRequest {
+    origin: DVec3,
+    direction: DVec3,
+    kind: BlockInteractionKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct BlockRayHit {
+    block: [i32; 3],
+    normal: [i32; 3],
+}
 
 #[derive(Debug, Default)]
 struct LoopStats {
@@ -123,6 +146,7 @@ pub fn run() -> Result<()> {
     let mut last_frame_start = Instant::now();
     let mut loop_stats = LoopStats::default();
     let mut mouse_captured = false;
+    let mut block_interaction_requests = VecDeque::new();
 
     info!(
         tick_hz = fixed_config.tick_hz,
@@ -161,6 +185,10 @@ pub fn run() -> Result<()> {
                     let fixed_dt_seconds = fixed_clock.tick_dt().as_secs_f64();
                     for _ in 0..ticks_to_run {
                         ecs_runtime.run_fixed(fixed_dt_seconds);
+                        process_block_interaction_requests(
+                            &mut chunk_streamer,
+                            &mut block_interaction_requests,
+                        );
                     }
                     let tick_duration = tick_timer_start.elapsed();
 
@@ -273,8 +301,29 @@ pub fn run() -> Result<()> {
                     state: ElementState::Pressed,
                     ..
                 } => {
-                    mouse_captured = true;
-                    set_mouse_capture(window, true);
+                    if !mouse_captured {
+                        mouse_captured = true;
+                        set_mouse_capture(window, true);
+                    } else {
+                        enqueue_block_interaction_request(
+                            &mut ecs_runtime,
+                            &mut block_interaction_requests,
+                            BlockInteractionKind::Break,
+                        );
+                    }
+                }
+                WindowEvent::MouseInput {
+                    button: MouseButton::Right,
+                    state: ElementState::Pressed,
+                    ..
+                } if mouse_captured => {
+                    enqueue_block_interaction_request(
+                        &mut ecs_runtime,
+                        &mut block_interaction_requests,
+                        BlockInteractionKind::Place {
+                            block_id: DEFAULT_PLACE_BLOCK_ID,
+                        },
+                    );
                 }
                 _ => {}
             },
@@ -302,6 +351,190 @@ fn direction_from_angles(yaw: f32, pitch: f32) -> Vec3 {
     let y = pitch.sin();
     let z = yaw.cos() * pitch.cos();
     Vec3::new(x as f32, y as f32, z as f32).normalize_or_zero()
+}
+
+fn direction_from_angles64(yaw: f64, pitch: f64) -> DVec3 {
+    let x = yaw.sin() * pitch.cos();
+    let y = pitch.sin();
+    let z = yaw.cos() * pitch.cos();
+    DVec3::new(x, y, z).normalize_or_zero()
+}
+
+fn enqueue_block_interaction_request(
+    ecs_runtime: &mut EcsRuntime,
+    queue: &mut VecDeque<BlockInteractionRequest>,
+    kind: BlockInteractionKind,
+) {
+    let Some(snapshot) = ecs_runtime.camera_snapshot() else {
+        return;
+    };
+
+    let direction =
+        direction_from_angles64(snapshot.authoritative.yaw, snapshot.authoritative.pitch);
+    if direction.length_squared() == 0.0 {
+        return;
+    }
+
+    queue.push_back(BlockInteractionRequest {
+        origin: snapshot.authoritative.position,
+        direction,
+        kind,
+    });
+}
+
+fn process_block_interaction_requests(
+    chunk_streamer: &mut ChunkStreamer,
+    queue: &mut VecDeque<BlockInteractionRequest>,
+) {
+    while let Some(request) = queue.pop_front() {
+        process_single_block_interaction_request(chunk_streamer, request);
+    }
+}
+
+fn process_single_block_interaction_request(
+    chunk_streamer: &mut ChunkStreamer,
+    request: BlockInteractionRequest,
+) {
+    let Some(hit) = raycast_first_solid_block(
+        request.origin,
+        request.direction,
+        BLOCK_INTERACTION_REACH_BLOCKS,
+        |x, y, z| chunk_streamer.block_at_world(x, y, z),
+    ) else {
+        return;
+    };
+
+    match request.kind {
+        BlockInteractionKind::Break => {
+            let _ = chunk_streamer.set_block_at_world(
+                hit.block[0],
+                hit.block[1],
+                hit.block[2],
+                AIR_BLOCK_ID,
+            );
+        }
+        BlockInteractionKind::Place { block_id } => {
+            if hit.normal == [0, 0, 0] {
+                return;
+            }
+            let [x, y, z] = hit.block;
+            let Some(place_x) = x.checked_add(hit.normal[0]) else {
+                return;
+            };
+            let Some(place_y) = y.checked_add(hit.normal[1]) else {
+                return;
+            };
+            let Some(place_z) = z.checked_add(hit.normal[2]) else {
+                return;
+            };
+
+            if chunk_streamer.block_at_world(place_x, place_y, place_z) == Some(AIR_BLOCK_ID) {
+                let _ = chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id);
+            }
+        }
+    }
+}
+
+fn raycast_first_solid_block<F>(
+    origin: DVec3,
+    direction: DVec3,
+    max_distance: f64,
+    mut block_lookup: F,
+) -> Option<BlockRayHit>
+where
+    F: FnMut(i32, i32, i32) -> Option<u8>,
+{
+    if max_distance <= 0.0 {
+        return None;
+    }
+
+    let dir = direction.normalize_or_zero();
+    if dir.length_squared() == 0.0 {
+        return None;
+    }
+
+    let mut voxel = [
+        origin.x.floor() as i32,
+        origin.y.floor() as i32,
+        origin.z.floor() as i32,
+    ];
+    let step = [axis_step(dir.x), axis_step(dir.y), axis_step(dir.z)];
+    let mut t_max = [
+        axis_t_max(origin.x, dir.x, voxel[0], step[0]),
+        axis_t_max(origin.y, dir.y, voxel[1], step[1]),
+        axis_t_max(origin.z, dir.z, voxel[2], step[2]),
+    ];
+    let t_delta = [
+        axis_t_delta(dir.x, step[0]),
+        axis_t_delta(dir.y, step[1]),
+        axis_t_delta(dir.z, step[2]),
+    ];
+    let mut distance = 0.0_f64;
+    let mut hit_normal = [0, 0, 0];
+
+    loop {
+        if distance > max_distance {
+            return None;
+        }
+
+        if block_lookup(voxel[0], voxel[1], voxel[2]).is_some_and(|block| block != AIR_BLOCK_ID) {
+            return Some(BlockRayHit {
+                block: voxel,
+                normal: hit_normal,
+            });
+        }
+
+        let (axis, next_distance) = min_axis_with_distance(t_max);
+        if !next_distance.is_finite() || next_distance > max_distance {
+            return None;
+        }
+
+        voxel[axis] += step[axis];
+        distance = next_distance;
+        t_max[axis] += t_delta[axis];
+        hit_normal = [0, 0, 0];
+        hit_normal[axis] = -step[axis];
+    }
+}
+
+fn axis_step(component: f64) -> i32 {
+    if component > 0.0 {
+        1
+    } else if component < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn axis_t_delta(component: f64, step: i32) -> f64 {
+    if step == 0 {
+        f64::INFINITY
+    } else {
+        1.0 / component.abs()
+    }
+}
+
+fn axis_t_max(origin: f64, component: f64, voxel: i32, step: i32) -> f64 {
+    if step == 0 {
+        return f64::INFINITY;
+    }
+    let next_boundary = if step > 0 {
+        f64::from(voxel + 1)
+    } else {
+        f64::from(voxel)
+    };
+    (next_boundary - origin) / component
+}
+
+fn min_axis_with_distance(t_max: [f64; 3]) -> (usize, f64) {
+    if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
+        (0, t_max[0])
+    } else if t_max[1] <= t_max[2] {
+        (1, t_max[1])
+    } else {
+        (2, t_max[2])
+    }
 }
 
 fn set_mouse_capture(window: &Window, captured: bool) {
@@ -390,7 +623,11 @@ fn parse_env_u32(key: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_target_directive, parse_env_u32};
+    use glam::DVec3;
+
+    use super::{
+        has_target_directive, parse_env_u32, raycast_first_solid_block, BlockRayHit, AIR_BLOCK_ID,
+    };
 
     #[test]
     fn detects_target_directives_exactly() {
@@ -408,5 +645,40 @@ mod tests {
     #[test]
     fn env_u32_parser_handles_valid_and_invalid_values() {
         assert_eq!(parse_env_u32("THINGCRAFT_TEST_MISSING"), None);
+    }
+
+    #[test]
+    fn raycast_hits_expected_voxel_and_face() {
+        let hit = raycast_first_solid_block(
+            DVec3::new(0.5, 1.5, 0.5),
+            DVec3::new(1.0, 0.0, 0.0),
+            8.0,
+            |x, y, z| {
+                if [x, y, z] == [3, 1, 0] {
+                    Some(1)
+                } else {
+                    Some(AIR_BLOCK_ID)
+                }
+            },
+        );
+
+        assert_eq!(
+            hit,
+            Some(BlockRayHit {
+                block: [3, 1, 0],
+                normal: [-1, 0, 0],
+            })
+        );
+    }
+
+    #[test]
+    fn raycast_misses_when_no_solid_voxel_exists() {
+        let hit = raycast_first_solid_block(
+            DVec3::new(0.5, 1.5, 0.5),
+            DVec3::new(0.0, 0.0, 1.0),
+            5.0,
+            |_x, _y, _z| Some(AIR_BLOCK_ID),
+        );
+        assert_eq!(hit, None);
     }
 }

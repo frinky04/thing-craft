@@ -8,7 +8,8 @@ use crate::mesh::{
     build_chunk_mesh_with_neighbors, merge_meshes, CardinalChunkNeighbors, ChunkMesh,
 };
 use crate::world::{
-    BlockRegistry, ChunkData, ChunkPos, OverworldChunkGenerator, CHUNK_DEPTH, CHUNK_WIDTH,
+    BlockRegistry, ChunkData, ChunkPos, OverworldChunkGenerator, CHUNK_DEPTH, CHUNK_HEIGHT,
+    CHUNK_WIDTH,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -98,6 +99,7 @@ struct MeshingResult {
 }
 
 pub struct ChunkStreamer {
+    registry: BlockRegistry,
     config: ResidencyConfig,
     slots: HashMap<ChunkPos, ChunkResidencyEntry>,
     required: HashSet<ChunkPos>,
@@ -139,7 +141,7 @@ impl ChunkStreamer {
             })
             .expect("failed to spawn generation worker thread");
 
-        let meshing_registry = registry;
+        let meshing_registry = registry.clone();
         let meshing_thread = thread::Builder::new()
             .name("thingcraft-meshing-worker".to_owned())
             .spawn(move || {
@@ -168,6 +170,7 @@ impl ChunkStreamer {
             .expect("failed to spawn meshing worker thread");
 
         Self {
+            registry,
             config,
             slots: HashMap::new(),
             required: HashSet::new(),
@@ -207,7 +210,6 @@ impl ChunkStreamer {
         self.enqueue_geometry_remesh(pos);
     }
 
-    #[cfg(test)]
     pub fn mark_block_geometry_dirty(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
         if usize::from(local_x) >= CHUNK_WIDTH || usize::from(local_z) >= CHUNK_DEPTH {
             return;
@@ -238,6 +240,60 @@ impl ChunkStreamer {
                 z: pos.z + 1,
             });
         }
+    }
+
+    #[must_use]
+    pub fn block_at_world(&self, world_x: i32, world_y: i32, world_z: i32) -> Option<u8> {
+        if !(0..CHUNK_HEIGHT as i32).contains(&world_y) {
+            return None;
+        }
+
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
+        let slot = self.slots.get(&pos)?;
+        if slot.state == ChunkResidencyState::Evicting {
+            return None;
+        }
+
+        let chunk = slot.chunk.as_ref()?;
+        Some(chunk.block(local_x, world_y as u8, local_z))
+    }
+
+    pub fn set_block_at_world(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        block_id: u8,
+    ) -> bool {
+        if !(0..CHUNK_HEIGHT as i32).contains(&world_y) || !self.registry.is_defined_block(block_id)
+        {
+            return false;
+        }
+
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
+        let changed = {
+            let Some(slot) = self.slots.get_mut(&pos) else {
+                return false;
+            };
+            if slot.state == ChunkResidencyState::Evicting {
+                return false;
+            }
+
+            let Some(chunk) = slot.chunk.as_mut() else {
+                return false;
+            };
+            let local_y = world_y as u8;
+            if chunk.block(local_x, local_y, local_z) == block_id {
+                return false;
+            }
+            chunk.set_block(local_x, local_y, local_z, block_id);
+            true
+        };
+
+        if changed {
+            self.mark_block_geometry_dirty(pos, local_x, local_z);
+        }
+        changed
     }
 
     #[must_use]
@@ -580,6 +636,22 @@ pub fn world_pos_to_chunk_pos(world_x: f64, world_z: f64) -> ChunkPos {
 }
 
 #[must_use]
+pub fn world_block_to_chunk_pos_and_local(world_x: i32, world_z: i32) -> (ChunkPos, u8, u8) {
+    let chunk_x = world_x.div_euclid(CHUNK_WIDTH as i32);
+    let chunk_z = world_z.div_euclid(CHUNK_DEPTH as i32);
+    let local_x = world_x.rem_euclid(CHUNK_WIDTH as i32) as u8;
+    let local_z = world_z.rem_euclid(CHUNK_DEPTH as i32) as u8;
+    (
+        ChunkPos {
+            x: chunk_x,
+            z: chunk_z,
+        },
+        local_x,
+        local_z,
+    )
+}
+
+#[must_use]
 fn world_coord_to_chunk_coord(world: f64, chunk_size: i32) -> i32 {
     (world.floor() as i32).div_euclid(chunk_size)
 }
@@ -723,6 +795,25 @@ mod tests {
     }
 
     #[test]
+    fn world_block_to_chunk_and_local_handles_negative_coordinates() {
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(0, 0);
+        assert_eq!(pos, ChunkPos { x: 0, z: 0 });
+        assert_eq!(local_x, 0);
+        assert_eq!(local_z, 0);
+
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(-1, -1);
+        assert_eq!(pos, ChunkPos { x: -1, z: -1 });
+        assert_eq!(local_x, (CHUNK_WIDTH - 1) as u8);
+        assert_eq!(local_z, (CHUNK_DEPTH - 1) as u8);
+
+        let (pos, local_x, local_z) =
+            world_block_to_chunk_pos_and_local(CHUNK_WIDTH as i32, CHUNK_DEPTH as i32);
+        assert_eq!(pos, ChunkPos { x: 1, z: 1 });
+        assert_eq!(local_x, 0);
+        assert_eq!(local_z, 0);
+    }
+
+    #[test]
     fn residency_emits_render_updates_for_ready_and_evict() {
         let registry = BlockRegistry::alpha_1_2_6();
         let mut streamer = ChunkStreamer::new(
@@ -790,5 +881,93 @@ mod tests {
         );
         assert!(metrics.remesh_enqueued > remesh_before);
         assert!(metrics.dirty_chunks > 0);
+    }
+
+    #[test]
+    fn set_block_at_world_marks_chunk_meshing_dirty() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 2,
+                max_meshing_dispatch: 2,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(streamer.metrics().ready, 1);
+
+        let mut target = None;
+        'search: for y in (0..CHUNK_HEIGHT as i32).rev() {
+            for z in 0..CHUNK_DEPTH as i32 {
+                for x in 0..CHUNK_WIDTH as i32 {
+                    if streamer.block_at_world(x, y, z).is_some_and(|id| id != 0) {
+                        target = Some((x, y, z));
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let (x, y, z) = target.expect("expected a non-air block in generated chunk");
+
+        assert!(streamer.set_block_at_world(x, y, z, 0));
+        assert_eq!(streamer.block_at_world(x, y, z), Some(0));
+        assert_eq!(
+            streamer.slot_state(center),
+            Some(ChunkResidencyState::Meshing)
+        );
+    }
+
+    #[test]
+    fn set_block_at_world_on_chunk_edge_marks_neighbor_meshing_dirty() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 9,
+                max_meshing_dispatch: 9,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready >= 9 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(streamer.metrics().ready >= 9);
+
+        let edge_x = CHUNK_WIDTH as i32 - 1;
+        let edge_z = (CHUNK_DEPTH / 2) as i32;
+        let mut target_y = None;
+        for y in (0..CHUNK_HEIGHT as i32).rev() {
+            if streamer
+                .block_at_world(edge_x, y, edge_z)
+                .is_some_and(|id| id != 0)
+            {
+                target_y = Some(y);
+                break;
+            }
+        }
+        let y = target_y.expect("expected non-air edge block");
+
+        assert!(streamer.set_block_at_world(edge_x, y, edge_z, 0));
+        assert_eq!(
+            streamer.slot_state(ChunkPos { x: 1, z: 0 }),
+            Some(ChunkResidencyState::Meshing)
+        );
     }
 }

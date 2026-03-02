@@ -55,6 +55,13 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 Input is represented as commands (`SimCommandEvent`) that are processed by simulation.
 This allows future network packets to feed the same command path without forking logic.
 
+## Block Interaction Slice
+
+- Mouse button input now enqueues explicit block interaction requests (break/place), rather than mutating chunks directly in the input event handler.
+- Requests are consumed during fixed simulation ticks, preserving deterministic simulation ownership and keeping input/render paths side-effect free.
+- Interaction targeting uses a voxel DDA raycast from the authoritative camera transform.
+- Chunk edits are applied through `ChunkStreamer` world-coordinate mutation APIs, which immediately mark edited chunk geometry dirty and propagate boundary remesh to cardinal neighbors when needed.
+
 ## Early Pitfalls to Avoid
 
 - Running chunk generation/meshing/lighting in render callbacks.
