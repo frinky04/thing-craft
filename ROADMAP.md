@@ -4,10 +4,10 @@
 
 - M0 complete: project scaffold, CI, docs baseline.
 - M1 complete: fixed simulation schedule separated from frame loop.
-- M2 in progress: fly camera and interpolation complete; voxel rendering still pending.
+- M2 complete: fly camera, interpolation, and screen-space strafe controls are functioning.
 - M3 started: block registry and chunk core data model implemented.
 - M4 started: deterministic biome/climate and startup overworld generation scaffold implemented.
-- M5 started: chunk face-culling mesh extraction, GPU draw path, and terrain-atlas sampling implemented.
+- M5 in progress: chunk face-culling mesh extraction, GPU draw path, terrain-atlas sampling, and corrected face winding are implemented.
 
 ## M0 - Repository Foundation
 

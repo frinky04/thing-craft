@@ -14,6 +14,8 @@
 - [x] Alpha `terrain.png` texture atlas is loaded and sampled by the chunk render pipeline.
 - [x] Bootstrap now generates and renders a small chunk region (3x3 around spawn), not a single chunk.
 - [x] Reference tracking doc added (`docs/REFERENCES.md`) for copied constants/behaviors.
+- [x] Camera strafe basis and chunk `+Z/-Z` face winding corrected; side-face culling is now consistent.
+- [x] Terrain atlas loader now resolves from both repo root and crate-local working directories.
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
 
