@@ -12,8 +12,9 @@ use winit::window::{CursorGrabMode, Window, WindowBuilder};
 use crate::ecs::EcsRuntime;
 use crate::mesh::build_region_mesh;
 use crate::renderer::{RenderError, Renderer};
+use crate::streaming::{world_pos_to_chunk_pos, ChunkStreamer, ResidencyConfig};
 use crate::time_step::FixedStepClock;
-use crate::world::BootstrapWorld;
+use crate::world::{BootstrapWorld, ChunkPos};
 
 #[derive(Debug, Default)]
 struct LoopStats {
@@ -91,8 +92,19 @@ pub fn run() -> Result<()> {
     let fixed_config = ecs_runtime.fixed_tick_config();
     let mut fixed_clock = FixedStepClock::new(fixed_config.tick_hz, fixed_config.max_catchup_steps);
     let bootstrap_world = BootstrapWorld::alpha_bootstrap();
-    let spawn_mesh = build_region_mesh(&bootstrap_world.spawn_region, &bootstrap_world.registry);
-    renderer.set_scene_mesh(&spawn_mesh);
+    let bootstrap_mesh =
+        build_region_mesh(&bootstrap_world.spawn_region, &bootstrap_world.registry);
+    renderer.set_scene_mesh(&bootstrap_mesh);
+
+    let residency_config = ResidencyConfig::default();
+    let mut chunk_streamer = ChunkStreamer::new(
+        0xA126_0001,
+        bootstrap_world.registry.clone(),
+        residency_config,
+    );
+    if let Some(scene_mesh) = chunk_streamer.update_target(ChunkPos { x: 0, z: 0 }) {
+        renderer.set_scene_mesh(&scene_mesh);
+    }
 
     let mut last_frame_start = Instant::now();
     let mut loop_stats = LoopStats::default();
@@ -107,8 +119,11 @@ pub fn run() -> Result<()> {
         spawn_chunk_z = bootstrap_world.spawn_chunk.pos.z,
         spawn_region_chunks = bootstrap_world.spawn_region.len(),
         center_height = bootstrap_world.spawn_chunk.height_at(8, 8),
-        spawn_mesh_vertices = spawn_mesh.vertices.len(),
-        spawn_mesh_indices = spawn_mesh.indices.len(),
+        bootstrap_mesh_vertices = bootstrap_mesh.vertices.len(),
+        bootstrap_mesh_indices = bootstrap_mesh.indices.len(),
+        stream_view_radius = residency_config.view_radius,
+        stream_gen_budget = residency_config.max_generation_dispatch,
+        stream_mesh_budget = residency_config.max_meshing_dispatch,
         "thingcraft client booted"
     );
 
@@ -137,6 +152,7 @@ pub fn run() -> Result<()> {
 
                     ecs_runtime.run_render_prep(fixed_clock.alpha() as f32);
                     let mut frame_camera: Option<(crate::ecs::CameraSnapshot, Mat4)> = None;
+                    let mut camera_chunk = ChunkPos { x: 0, z: 0 };
                     if let Some(snapshot) = ecs_runtime.camera_snapshot() {
                         let direction = direction_from_angles(
                             snapshot.interpolated.yaw,
@@ -151,7 +167,15 @@ pub fn run() -> Result<()> {
                             512.0,
                         );
                         renderer.update_camera((projection * view).to_cols_array_2d());
+                        camera_chunk = world_pos_to_chunk_pos(
+                            snapshot.authoritative.position.x,
+                            snapshot.authoritative.position.z,
+                        );
                         frame_camera = Some((snapshot, view));
+                    }
+
+                    if let Some(scene_mesh) = chunk_streamer.update_target(camera_chunk) {
+                        renderer.set_scene_mesh(&scene_mesh);
                     }
 
                     match renderer.render() {
@@ -169,6 +193,7 @@ pub fn run() -> Result<()> {
                     if let Some(report) =
                         loop_stats.record_frame(frame_delta, ticks_to_run, tick_duration)
                     {
+                        let residency = chunk_streamer.metrics();
                         if let Some((snapshot, view)) = frame_camera {
                             debug!(
                                 fps = report.fps,
@@ -179,6 +204,13 @@ pub fn run() -> Result<()> {
                                 camera_y = snapshot.authoritative.position.y,
                                 camera_z = snapshot.authoritative.position.z,
                                 fly_mode = snapshot.fly_mode,
+                                resident_chunks = residency.total,
+                                ready_chunks = residency.ready,
+                                generating_chunks = residency.generating,
+                                meshing_chunks = residency.meshing,
+                                evicting_chunks = residency.evicting,
+                                in_flight_generation = residency.in_flight_generation,
+                                in_flight_meshing = residency.in_flight_meshing,
                                 view_matrix = ?view.to_cols_array(),
                                 "runtime stats"
                             );
@@ -188,6 +220,13 @@ pub fn run() -> Result<()> {
                                 tps = report.tps,
                                 avg_frame_ms = report.avg_frame_ms,
                                 avg_tick_ms = report.avg_tick_ms,
+                                resident_chunks = residency.total,
+                                ready_chunks = residency.ready,
+                                generating_chunks = residency.generating,
+                                meshing_chunks = residency.meshing,
+                                evicting_chunks = residency.evicting,
+                                in_flight_generation = residency.in_flight_generation,
+                                in_flight_meshing = residency.in_flight_meshing,
                                 "runtime stats"
                             );
                         }
