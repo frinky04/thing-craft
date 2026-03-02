@@ -331,7 +331,7 @@ fn apply_render_update(renderer: &mut Renderer<'_>, update: RenderMeshUpdate) ->
 fn build_env_filter() -> tracing_subscriber::EnvFilter {
     let rust_log = std::env::var("RUST_LOG").ok();
     let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,thingcraft_client=debug"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,thingcraft_client=info"));
 
     for directive in NOISY_LOG_TARGET_DEFAULTS {
         let target = directive.split('=').next().unwrap_or_default();

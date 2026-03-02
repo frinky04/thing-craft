@@ -4,7 +4,9 @@ use std::mem;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use crate::mesh::{build_chunk_mesh, merge_meshes, ChunkMesh};
+use crate::mesh::{
+    build_chunk_mesh_with_neighbors, merge_meshes, CardinalChunkNeighbors, ChunkMesh,
+};
 use crate::world::{
     BlockRegistry, ChunkData, ChunkPos, OverworldChunkGenerator, CHUNK_DEPTH, CHUNK_WIDTH,
 };
@@ -73,6 +75,10 @@ struct GenerationResult {
 #[derive(Debug)]
 struct MeshingJob {
     chunk: ChunkData,
+    neg_x: Option<ChunkData>,
+    pos_x: Option<ChunkData>,
+    neg_z: Option<ChunkData>,
+    pos_z: Option<ChunkData>,
 }
 
 #[derive(Debug)]
@@ -129,7 +135,14 @@ impl ChunkStreamer {
             .spawn(move || {
                 while let Ok(job) = meshing_job_rx.recv() {
                     let pos = job.chunk.pos;
-                    let mesh = build_chunk_mesh(&job.chunk, &meshing_registry);
+                    let neighbors = CardinalChunkNeighbors {
+                        neg_x: job.neg_x.as_ref(),
+                        pos_x: job.pos_x.as_ref(),
+                        neg_z: job.neg_z.as_ref(),
+                        pos_z: job.pos_z.as_ref(),
+                    };
+                    let mesh =
+                        build_chunk_mesh_with_neighbors(&job.chunk, &meshing_registry, &neighbors);
                     if meshing_result_tx
                         .send(MeshingResult {
                             pos,
@@ -218,6 +231,7 @@ impl ChunkStreamer {
             }
         }
 
+        let mut evicted = Vec::new();
         for (pos, slot) in &mut self.slots {
             if !required.contains(pos) && slot.state != ChunkResidencyState::Evicting {
                 slot.state = ChunkResidencyState::Evicting;
@@ -226,7 +240,12 @@ impl ChunkStreamer {
                 self.mesh_dirty = true;
                 self.render_updates
                     .push(RenderMeshUpdate::Remove { pos: *pos });
+                evicted.push(*pos);
             }
+        }
+
+        for pos in evicted {
+            self.mark_neighbors_for_remesh(pos);
         }
 
         self.required = required;
@@ -304,7 +323,33 @@ impl ChunkStreamer {
                 continue;
             };
 
-            if tx.send(MeshingJob { chunk }).is_err() {
+            let neg_x = self.chunk_data_at(ChunkPos {
+                x: pos.x - 1,
+                z: pos.z,
+            });
+            let pos_x = self.chunk_data_at(ChunkPos {
+                x: pos.x + 1,
+                z: pos.z,
+            });
+            let neg_z = self.chunk_data_at(ChunkPos {
+                x: pos.x,
+                z: pos.z - 1,
+            });
+            let pos_z = self.chunk_data_at(ChunkPos {
+                x: pos.x,
+                z: pos.z + 1,
+            });
+
+            if tx
+                .send(MeshingJob {
+                    chunk,
+                    neg_x,
+                    pos_x,
+                    neg_z,
+                    pos_z,
+                })
+                .is_err()
+            {
                 break;
             }
             self.meshing_in_flight.insert(pos);
@@ -327,6 +372,7 @@ impl ChunkStreamer {
                         slot.mesh = None;
                         slot.state = ChunkResidencyState::Meshing;
                     }
+                    self.mark_neighbors_for_remesh(pos);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
@@ -415,6 +461,27 @@ impl ChunkStreamer {
     fn slot_state(&self, pos: ChunkPos) -> Option<ChunkResidencyState> {
         self.slots.get(&pos).map(|slot| slot.state)
     }
+
+    fn chunk_data_at(&self, pos: ChunkPos) -> Option<ChunkData> {
+        self.slots.get(&pos).and_then(|slot| {
+            if slot.state == ChunkResidencyState::Evicting {
+                None
+            } else {
+                slot.chunk.clone()
+            }
+        })
+    }
+
+    fn mark_neighbors_for_remesh(&mut self, pos: ChunkPos) {
+        for neighbor in cardinal_neighbors(pos) {
+            let Some(slot) = self.slots.get_mut(&neighbor) else {
+                continue;
+            };
+            if slot.state == ChunkResidencyState::Ready && slot.chunk.is_some() {
+                slot.state = ChunkResidencyState::Meshing;
+            }
+        }
+    }
 }
 
 impl Drop for ChunkStreamer {
@@ -449,6 +516,27 @@ fn chunk_distance_sq(a: ChunkPos, b: ChunkPos) -> i64 {
     let dx = i64::from(a.x - b.x);
     let dz = i64::from(a.z - b.z);
     dx * dx + dz * dz
+}
+
+fn cardinal_neighbors(pos: ChunkPos) -> [ChunkPos; 4] {
+    [
+        ChunkPos {
+            x: pos.x - 1,
+            z: pos.z,
+        },
+        ChunkPos {
+            x: pos.x + 1,
+            z: pos.z,
+        },
+        ChunkPos {
+            x: pos.x,
+            z: pos.z - 1,
+        },
+        ChunkPos {
+            x: pos.x,
+            z: pos.z + 1,
+        },
+    ]
 }
 
 #[cfg(test)]

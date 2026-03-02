@@ -4,6 +4,14 @@ use crate::world::{BlockRegistry, ChunkData, ChunkPos, CHUNK_DEPTH, CHUNK_HEIGHT
 
 const AIR_ID: u8 = 0;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CardinalChunkNeighbors<'a> {
+    pub neg_x: Option<&'a ChunkData>,
+    pub pos_x: Option<&'a ChunkData>,
+    pub neg_z: Option<&'a ChunkData>,
+    pub pos_z: Option<&'a ChunkData>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {
@@ -107,6 +115,17 @@ pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMes
 }
 
 #[must_use]
+pub fn build_chunk_mesh_with_neighbors(
+    chunk: &ChunkData,
+    registry: &BlockRegistry,
+    neighbors: &CardinalChunkNeighbors<'_>,
+) -> ChunkMesh {
+    build_chunk_mesh_with_neighbor_lookup(chunk, registry, |x, y, z| {
+        neighbor_block_with_cardinal_neighbors(chunk, neighbors, x, y, z)
+    })
+}
+
+#[must_use]
 pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> ChunkMesh {
     if let [single] = chunks {
         return build_chunk_mesh(single, registry);
@@ -207,6 +226,45 @@ fn neighbor_block(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
     }
 
     chunk.block(x as u8, y as u8, z as u8)
+}
+
+fn neighbor_block_with_cardinal_neighbors(
+    chunk: &ChunkData,
+    neighbors: &CardinalChunkNeighbors<'_>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        return AIR_ID;
+    }
+
+    if (0..CHUNK_WIDTH as i32).contains(&x) && (0..CHUNK_DEPTH as i32).contains(&z) {
+        return chunk.block(x as u8, y as u8, z as u8);
+    }
+
+    if x < 0 {
+        return neighbors.neg_x.map_or(AIR_ID, |neighbor| {
+            neighbor.block((CHUNK_WIDTH - 1) as u8, y as u8, z as u8)
+        });
+    }
+    if x >= CHUNK_WIDTH as i32 {
+        return neighbors
+            .pos_x
+            .map_or(AIR_ID, |neighbor| neighbor.block(0, y as u8, z as u8));
+    }
+    if z < 0 {
+        return neighbors.neg_z.map_or(AIR_ID, |neighbor| {
+            neighbor.block(x as u8, y as u8, (CHUNK_DEPTH - 1) as u8)
+        });
+    }
+    if z >= CHUNK_DEPTH as i32 {
+        return neighbors
+            .pos_z
+            .map_or(AIR_ID, |neighbor| neighbor.block(x as u8, y as u8, 0));
+    }
+
+    AIR_ID
 }
 
 fn resolve_face_tint(
@@ -338,6 +396,27 @@ mod tests {
         let mesh = build_chunk_mesh(&chunk, &registry);
         assert_eq!(mesh.vertices.len(), 40);
         assert_eq!(mesh.indices.len(), 60);
+    }
+
+    #[test]
+    fn neighbor_aware_meshing_culls_boundary_faces() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        let mut east_neighbor = ChunkData::new(ChunkPos { x: 1, z: 0 }, AIR_ID);
+        chunk.set_block(15, 10, 5, 1);
+        east_neighbor.set_block(0, 10, 5, 1);
+
+        let isolated = build_chunk_mesh(&chunk, &registry);
+        let neighbors = CardinalChunkNeighbors {
+            pos_x: Some(&east_neighbor),
+            ..Default::default()
+        };
+        let neighbor_aware = build_chunk_mesh_with_neighbors(&chunk, &registry, &neighbors);
+
+        assert_eq!(isolated.vertices.len(), 24);
+        assert_eq!(neighbor_aware.vertices.len(), 20);
+        assert_eq!(isolated.indices.len(), 36);
+        assert_eq!(neighbor_aware.indices.len(), 30);
     }
 
     #[test]
