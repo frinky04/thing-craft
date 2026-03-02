@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::world::{
-    BlockRegistry, ChunkData, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_VOLUME, CHUNK_WIDTH,
+    BlockRegistry, ChunkData, CHUNK_DEPTH, CHUNK_EDGE_SLICE_VOLUME, CHUNK_HEIGHT,
+    CHUNK_SECTION_COUNT, CHUNK_VOLUME, CHUNK_WIDTH, SECTION_HEIGHT,
 };
 
 const LIGHT_DIRECTIONS: [[i32; 3]; 6] = [
@@ -15,10 +16,76 @@ const LIGHT_DIRECTIONS: [[i32; 3]; 6] = [
 
 #[derive(Debug, Clone, Default)]
 pub struct CardinalChunkNeighborsOwned {
-    pub neg_x: Option<ChunkData>,
-    pub pos_x: Option<ChunkData>,
-    pub neg_z: Option<ChunkData>,
-    pub pos_z: Option<ChunkData>,
+    pub neg_x: Option<LightEdgeSlice>,
+    pub pos_x: Option<LightEdgeSlice>,
+    pub neg_z: Option<LightEdgeSlice>,
+    pub pos_z: Option<LightEdgeSlice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LightEdgeSlice {
+    sky_light: Box<[u8; CHUNK_EDGE_SLICE_VOLUME]>,
+    block_light: Box<[u8; CHUNK_EDGE_SLICE_VOLUME]>,
+}
+
+impl LightEdgeSlice {
+    #[must_use]
+    pub fn from_neg_x(chunk: &ChunkData) -> Self {
+        Self::from_chunk_face(chunk, NeighborFace::NegX)
+    }
+
+    #[must_use]
+    pub fn from_pos_x(chunk: &ChunkData) -> Self {
+        Self::from_chunk_face(chunk, NeighborFace::PosX)
+    }
+
+    #[must_use]
+    pub fn from_neg_z(chunk: &ChunkData) -> Self {
+        Self::from_chunk_face(chunk, NeighborFace::NegZ)
+    }
+
+    #[must_use]
+    pub fn from_pos_z(chunk: &ChunkData) -> Self {
+        Self::from_chunk_face(chunk, NeighborFace::PosZ)
+    }
+
+    fn from_chunk_face(chunk: &ChunkData, face: NeighborFace) -> Self {
+        let mut sky_light = Box::new([0_u8; CHUNK_EDGE_SLICE_VOLUME]);
+        let mut block_light = Box::new([0_u8; CHUNK_EDGE_SLICE_VOLUME]);
+        for lateral in 0..CHUNK_WIDTH as u8 {
+            for y in 0..CHUNK_HEIGHT as u8 {
+                let (x, z) = match face {
+                    NeighborFace::NegX => ((CHUNK_WIDTH as u8) - 1, lateral),
+                    NeighborFace::PosX => (0, lateral),
+                    NeighborFace::NegZ => (lateral, (CHUNK_DEPTH as u8) - 1),
+                    NeighborFace::PosZ => (lateral, 0),
+                };
+                let index = edge_index(y, lateral);
+                sky_light[index] = chunk.sky_light(x, y, z);
+                block_light[index] = chunk.block_light(x, y, z);
+            }
+        }
+        Self {
+            sky_light,
+            block_light,
+        }
+    }
+
+    fn channel_at(&self, channel: LightChannel, y: u8, lateral: u8) -> u8 {
+        let index = edge_index(y, lateral);
+        match channel {
+            LightChannel::Sky => self.sky_light[index],
+            LightChannel::Block => self.block_light[index],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NeighborFace {
+    NegX,
+    PosX,
+    NegZ,
+    PosZ,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +93,7 @@ pub struct LightingOutput {
     pub sky_light: Box<[u8; CHUNK_VOLUME]>,
     pub block_light: Box<[u8; CHUNK_VOLUME]>,
     pub changed: bool,
+    pub changed_sections_mask: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,11 +135,12 @@ pub fn relight_chunk(
     );
     propagate_channel(&mut block_light, &mut block_queue, chunk, registry);
 
-    let changed = channel_differs(chunk, &sky_light, &block_light);
+    let (changed, changed_sections_mask) = channel_differs(chunk, &sky_light, &block_light);
     LightingOutput {
         sky_light,
         block_light,
         changed,
+        changed_sections_mask,
     }
 }
 
@@ -128,11 +197,11 @@ fn seed_boundary_channel(
     for y in 0..CHUNK_HEIGHT as u8 {
         for z in 0..CHUNK_DEPTH as u8 {
             if let Some(neighbor) = neighbors.neg_x.as_ref() {
-                let incoming = read_channel(neighbor, channel, (CHUNK_WIDTH as u8) - 1, y, z);
+                let incoming = neighbor.channel_at(channel, y, z);
                 seed_from_neighbor(levels, queue, chunk, registry, [0, y, z], incoming);
             }
             if let Some(neighbor) = neighbors.pos_x.as_ref() {
-                let incoming = read_channel(neighbor, channel, 0, y, z);
+                let incoming = neighbor.channel_at(channel, y, z);
                 seed_from_neighbor(
                     levels,
                     queue,
@@ -146,11 +215,11 @@ fn seed_boundary_channel(
 
         for x in 0..CHUNK_WIDTH as u8 {
             if let Some(neighbor) = neighbors.neg_z.as_ref() {
-                let incoming = read_channel(neighbor, channel, x, y, (CHUNK_DEPTH as u8) - 1);
+                let incoming = neighbor.channel_at(channel, y, x);
                 seed_from_neighbor(levels, queue, chunk, registry, [x, y, 0], incoming);
             }
             if let Some(neighbor) = neighbors.pos_z.as_ref() {
-                let incoming = read_channel(neighbor, channel, x, y, 0);
+                let incoming = neighbor.channel_at(channel, y, x);
                 seed_from_neighbor(
                     levels,
                     queue,
@@ -225,13 +294,6 @@ fn propagate_channel(
     }
 }
 
-fn read_channel(chunk: &ChunkData, channel: LightChannel, local_x: u8, y: u8, local_z: u8) -> u8 {
-    match channel {
-        LightChannel::Sky => chunk.sky_light(local_x, y, local_z),
-        LightChannel::Block => chunk.block_light(local_x, y, local_z),
-    }
-}
-
 fn light_attenuation(registry: &BlockRegistry, block_id: u8) -> u8 {
     registry.opacity_of(block_id).clamp(1, 15)
 }
@@ -254,24 +316,47 @@ fn coords_from_light_index(index: usize) -> (i32, i32, i32) {
     (x, y, z)
 }
 
+fn edge_index(y: u8, lateral: u8) -> usize {
+    usize::from(lateral) * CHUNK_HEIGHT + usize::from(y)
+}
+
 fn channel_differs(
     chunk: &ChunkData,
     sky_light: &[u8; CHUNK_VOLUME],
     block_light: &[u8; CHUNK_VOLUME],
-) -> bool {
-    for local_x in 0..CHUNK_WIDTH as u8 {
-        for local_z in 0..CHUNK_DEPTH as u8 {
-            for y in 0..CHUNK_HEIGHT as u8 {
-                let index = light_index(local_x as usize, y as usize, local_z as usize);
-                if chunk.sky_light(local_x, y, local_z) != sky_light[index]
-                    || chunk.block_light(local_x, y, local_z) != block_light[index]
-                {
-                    return true;
+) -> (bool, u8) {
+    let mut any_changed = false;
+    let mut changed_sections_mask = 0_u8;
+    for section in 0..CHUNK_SECTION_COUNT as u8 {
+        let y_start = usize::from(section) * SECTION_HEIGHT;
+        let y_end = y_start + SECTION_HEIGHT;
+        let mut section_changed = false;
+        for local_x in 0..CHUNK_WIDTH as u8 {
+            for local_z in 0..CHUNK_DEPTH as u8 {
+                for y in y_start..y_end {
+                    let y = y as u8;
+                    let index = light_index(local_x as usize, usize::from(y), local_z as usize);
+                    if chunk.sky_light(local_x, y, local_z) != sky_light[index]
+                        || chunk.block_light(local_x, y, local_z) != block_light[index]
+                    {
+                        section_changed = true;
+                        any_changed = true;
+                        break;
+                    }
+                }
+                if section_changed {
+                    break;
                 }
             }
+            if section_changed {
+                break;
+            }
+        }
+        if section_changed {
+            changed_sections_mask |= 1 << section;
         }
     }
-    false
+    (any_changed, changed_sections_mask)
 }
 
 #[cfg(test)]
@@ -305,7 +390,7 @@ mod tests {
         let output = relight_chunk(
             &center,
             &CardinalChunkNeighborsOwned {
-                neg_x: Some(west),
+                neg_x: Some(LightEdgeSlice::from_neg_x(&west)),
                 ..Default::default()
             },
             &registry,
@@ -328,7 +413,7 @@ mod tests {
         let output = relight_chunk(
             &center,
             &CardinalChunkNeighborsOwned {
-                neg_x: Some(west),
+                neg_x: Some(LightEdgeSlice::from_neg_x(&west)),
                 ..Default::default()
             },
             &registry,
@@ -352,7 +437,7 @@ mod tests {
         let output = relight_chunk(
             &center,
             &CardinalChunkNeighborsOwned {
-                neg_x: Some(west),
+                neg_x: Some(LightEdgeSlice::from_neg_x(&west)),
                 ..Default::default()
             },
             &registry,

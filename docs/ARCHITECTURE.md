@@ -40,9 +40,9 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 
 - Runtime chunk residency is managed with explicit states: `Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`.
 - Residency targets are derived from the camera chunk position with a configurable square radius.
-- Chunk generation, chunk lighting, and chunk meshing run on dedicated worker threads.
-- Lighting jobs run a queue-based sunlight/block-light propagation pass against immutable chunk snapshots (center + cardinal neighbors), then return packed nibble-channel updates to the main thread.
-- Meshing jobs include cardinal neighbor chunk snapshots so chunk-boundary face culling remains correct with incremental uploads.
+- Chunk generation, chunk lighting, and chunk meshing run in per-lane worker pools (configurable worker counts per lane).
+- Lighting jobs run a queue-based sunlight/block-light propagation pass against immutable chunk snapshots (center + cardinal neighbor edge-light slices), then return packed nibble-channel updates to the main thread plus section-diff masks.
+- Meshing jobs consume cardinal neighbor edge slices (block + light boundary bands) and rebuild only dirty `16x16x16` sections.
 - The main thread only:
   - computes residency deltas,
   - dispatches bounded job batches per frame,
@@ -55,6 +55,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - Boundary lighting diffs are now scoped to chunk edges, so neighbor relight/remesh is only propagated when edge light channels actually changed.
 - Meshing results are now applied only when the target chunk is still clean; stale in-flight meshes are dropped if new edits arrived while meshing.
 - Meshing dispatch now requires neighboring lighting to be settled (no dirty/in-flight neighbor lighting) to reduce transient chunk-edge seam artifacts.
+- Geometry dirtiness is tracked as an 8-bit section mask per chunk (`128 / 16 = 8` sections), with edge and Y-boundary propagation rules for edit correctness.
 
 ## Networking-Ready Input Pattern
 
@@ -71,9 +72,10 @@ This allows future network packets to feed the same command path without forking
 
 ## Renderer Culling
 
-- Chunk mesh draw calls are frustum-culled on CPU using camera view-projection planes and Alpha chunk AABBs (`16x16x128`).
+- Chunk mesh draw calls are frustum-culled on CPU using camera view-projection planes and per-section AABBs (`16x16x16`).
 - Runtime debug stats include visible chunk count and edit-to-visible mesh latency metrics.
 - Chunk border debug mode now overlays per-chunk generation/lighting/meshing status bars to diagnose queue pressure and lighting churn near seams.
+- Terrain shading now includes Alpha-style alpha cutout discard and linear fog blending in WGSL.
 
 ## Early Pitfalls to Avoid
 

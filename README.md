@@ -14,6 +14,9 @@ The repository currently includes a bootstrap client with:
 - Deterministic Overworld chunk bootstrap with Alpha climate thresholds and waterline targeting `Y=64`
 - CPU chunk mesher with face culling + terrain atlas UV assignment (geometry generation path)
 - `wgpu` indexed draw pipeline now renders the generated startup chunk region using `terrain.png`
+- Alpha-style fog and alpha-test discard are now integrated in the terrain shader
+- Section-level (`16x16x16`) chunk meshing + per-section GPU uploads are active
+- Streaming workers now support per-lane worker pool sizing (`GEN/LIGHT/MESH`)
 
 ## Development Commands
 
@@ -34,6 +37,18 @@ Streaming tuning (useful to push boundary walls farther out while exploring unde
 
 ```bash
 THINGCRAFT_VIEW_RADIUS=5 THINGCRAFT_GEN_BUDGET=12 THINGCRAFT_LIGHT_BUDGET=12 THINGCRAFT_MESH_BUDGET=12 cargo run -p thingcraft-client
+```
+
+If edit-heavy scenes cause upload spikes, cap section uploads per frame:
+
+```bash
+THINGCRAFT_UPLOAD_BUDGET=12 cargo run -p thingcraft-client
+```
+
+Worker pool tuning:
+
+```bash
+THINGCRAFT_GEN_WORKERS=2 THINGCRAFT_LIGHT_WORKERS=4 THINGCRAFT_MESH_WORKERS=4 cargo run -p thingcraft-client
 ```
 
 ## Controls

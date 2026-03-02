@@ -9,8 +9,11 @@ use rand::{Rng, SeedableRng};
 pub const CHUNK_WIDTH: usize = 16;
 pub const CHUNK_DEPTH: usize = 16;
 pub const CHUNK_HEIGHT: usize = 128;
+pub const SECTION_HEIGHT: usize = 16;
+pub const CHUNK_SECTION_COUNT: usize = CHUNK_HEIGHT / SECTION_HEIGHT;
 pub const CHUNK_AREA: usize = CHUNK_WIDTH * CHUNK_DEPTH;
 pub const CHUNK_VOLUME: usize = CHUNK_AREA * CHUNK_HEIGHT;
+pub const CHUNK_EDGE_SLICE_VOLUME: usize = CHUNK_WIDTH * CHUNK_HEIGHT;
 
 const AIR_ID: u8 = 0;
 const STONE_ID: u8 = 1;
@@ -1495,7 +1498,8 @@ fn try_place_tree(
             for dz in -radius..=radius {
                 let bx = local_x + dx;
                 let bz = local_z + dz;
-                if !(0..CHUNK_WIDTH as i32).contains(&bx) || !(0..CHUNK_DEPTH as i32).contains(&bz) {
+                if !(0..CHUNK_WIDTH as i32).contains(&bx) || !(0..CHUNK_DEPTH as i32).contains(&bz)
+                {
                     // Out-of-chunk blocks: skip (acceptable clipping for single-chunk gen).
                     continue;
                 }
@@ -1521,7 +1525,8 @@ fn try_place_tree(
             for dz in -radius..=radius {
                 let bx = local_x + dx;
                 let bz = local_z + dz;
-                if !(0..CHUNK_WIDTH as i32).contains(&bx) || !(0..CHUNK_DEPTH as i32).contains(&bz) {
+                if !(0..CHUNK_WIDTH as i32).contains(&bx) || !(0..CHUNK_DEPTH as i32).contains(&bz)
+                {
                     continue;
                 }
                 if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
@@ -1532,11 +1537,7 @@ fn try_place_tree(
                     continue;
                 }
                 // Prune corners on wide layers.
-                if radius == 2
-                    && dx.abs() == 2
-                    && dz.abs() == 2
-                    && rng.gen_range(0..2_i32) == 0
-                {
+                if radius == 2 && dx.abs() == 2 && dz.abs() == 2 && rng.gen_range(0..2_i32) == 0 {
                     continue;
                 }
                 let existing = chunk.block(bx as u8, cy as u8, bz as u8);

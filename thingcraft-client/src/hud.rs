@@ -86,8 +86,8 @@ pub fn build_hotbar_vertices(
     slot_counts: &[u8; HOTBAR_SLOT_COUNT],
 ) -> Vec<HudVertex> {
     let _ = slot_counts; // Reserved for future stack count display.
-    let total_width =
-        HOTBAR_SLOT_COUNT as f32 * HOTBAR_SLOT_SIZE + (HOTBAR_SLOT_COUNT - 1) as f32 * HOTBAR_SLOT_GAP;
+    let total_width = HOTBAR_SLOT_COUNT as f32 * HOTBAR_SLOT_SIZE
+        + (HOTBAR_SLOT_COUNT - 1) as f32 * HOTBAR_SLOT_GAP;
     let start_x = ((screen_w - total_width) / 2.0).floor();
     let bottom_y = screen_h - HOTBAR_BOTTOM_MARGIN - HOTBAR_SLOT_SIZE;
 
@@ -103,7 +103,14 @@ pub fn build_hotbar_vertices(
         };
 
         // Slot background.
-        push_quad(&mut verts, x, y, x + HOTBAR_SLOT_SIZE, y + HOTBAR_SLOT_SIZE, color);
+        push_quad(
+            &mut verts,
+            x,
+            y,
+            x + HOTBAR_SLOT_SIZE,
+            y + HOTBAR_SLOT_SIZE,
+            color,
+        );
 
         // Border around slot.
         let b = HOTBAR_BORDER_THICKNESS;

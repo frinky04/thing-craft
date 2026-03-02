@@ -17,6 +17,8 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [x] Lighting Engine: Async queue propagation and rendered-light sampling are integrated with boundary-aware neighbor relight/remesh invalidation and stale-result dropping.
 - [x] Light Levels: 16 levels (0..15) are represented in data + render mapping.
 - [x] Light Spread: Sunlight and block light both spread with 1-level attenuation per step, including cross-chunk boundary seeding/propagation.
+- [x] Distance Fog: Linear distance fog blending is active in the terrain shader.
+- [x] Alpha Test: Terrain shader now discards low-alpha texels (Alpha-style cutout behavior).
 
 ## Blocks and Items
 - [x] Placement Controls: Hotbar slot selection (`1..9`) drives right-click block placement (torch included), with finite slot stacks (64 max) that consume on successful placement and refill on matching-block pickup from break actions.

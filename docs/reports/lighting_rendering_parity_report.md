@@ -396,3 +396,22 @@ Transparent texels (leaves, flowers, glass panes) are not discarded in the fragm
 1. **Thread pool per lane** is the highest-impact performance improvement available.
 2. **Section-level meshing** would reduce edit rebuild cost ~8x.
 3. **Neighbor slice sharing** (instead of full clone) would reduce per-job memory ~4x.
+
+---
+
+## 14. Implementation Follow-Up (2026-03-02)
+
+This report's actionable non-time-of-day items have now been implemented in ThingCraft:
+
+- `DONE`: Shader alpha test discard (`texel.a <= 0.1`) added.
+- `DONE`: Linear distance fog added in terrain shader.
+- `DONE`: Per-lane configurable worker pools added (`THINGCRAFT_GEN_WORKERS`, `THINGCRAFT_LIGHT_WORKERS`, `THINGCRAFT_MESH_WORKERS`).
+- `DONE`: Section-level (`16x16x16`) meshing path added with section dirty masks and per-section GPU uploads.
+- `DONE`: Neighbor job payloads switched from full cardinal chunk clones to edge-slice snapshots for both lighting and meshing.
+- `DONE`: Reusable GPU mesh buffer pooling added for chunk section vertex/index buffers.
+
+Still intentionally deferred (as noted in the original report):
+
+- `DEFERRED`: Ambient darkness/day-night sky modulation.
+- `DEFERRED`: Slab/farmland above-neighbor light borrow behavior (blocks/mechanics not yet in scope).
+- `DEFERRED`: Distance-based LOD.

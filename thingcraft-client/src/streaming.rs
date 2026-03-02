@@ -1,16 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::lighting::{relight_chunk, CardinalChunkNeighborsOwned, LightingOutput};
+use crate::lighting::{relight_chunk, CardinalChunkNeighborsOwned, LightEdgeSlice, LightingOutput};
 use crate::mesh::{
-    build_chunk_mesh_with_neighbors, merge_meshes, CardinalChunkNeighbors, ChunkMesh,
+    build_chunk_section_mesh_with_neighbor_slices, merge_meshes, CardinalNeighborSlicesOwned,
+    ChunkMesh, NeighborEdgeSliceOwned,
 };
 use crate::world::{
     BlockRegistry, ChunkData, ChunkPos, OverworldChunkGenerator, CHUNK_DEPTH, CHUNK_HEIGHT,
-    CHUNK_WIDTH,
+    CHUNK_SECTION_COUNT, CHUNK_WIDTH, SECTION_HEIGHT,
 };
 
 const MAX_IN_FLIGHT_MULTIPLIER: usize = 4;
@@ -37,6 +39,10 @@ pub struct ResidencyConfig {
     pub max_generation_dispatch: usize,
     pub max_lighting_dispatch: usize,
     pub max_meshing_dispatch: usize,
+    pub max_render_upload_sections_per_tick: usize,
+    pub generation_workers: usize,
+    pub lighting_workers: usize,
+    pub meshing_workers: usize,
 }
 
 impl Default for ResidencyConfig {
@@ -46,6 +52,10 @@ impl Default for ResidencyConfig {
             max_generation_dispatch: 8,
             max_lighting_dispatch: 8,
             max_meshing_dispatch: 8,
+            max_render_upload_sections_per_tick: 24,
+            generation_workers: 1,
+            lighting_workers: 2,
+            meshing_workers: 2,
         }
     }
 }
@@ -71,8 +81,14 @@ pub struct ResidencyMetrics {
 
 #[derive(Debug, Clone)]
 pub enum RenderMeshUpdate {
-    Upsert { pos: ChunkPos, mesh: ChunkMesh },
-    Remove { pos: ChunkPos },
+    UpsertSection {
+        pos: ChunkPos,
+        section_y: u8,
+        mesh: ChunkMesh,
+    },
+    RemoveChunk {
+        pos: ChunkPos,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -93,11 +109,14 @@ struct ChunkResidencyEntry {
     lighting_revision: u64,
     chunk: Option<ChunkData>,
     mesh: Option<ChunkMesh>,
+    section_meshes: [Option<ChunkMesh>; CHUNK_SECTION_COUNT],
+    meshed_section_mask: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ChunkDirtyFlags {
     geometry: bool,
+    geometry_sections: u8,
     lighting: bool,
 }
 
@@ -130,17 +149,17 @@ struct LightingResult {
 
 #[derive(Debug)]
 struct MeshingJob {
+    pos: ChunkPos,
     chunk: ChunkData,
-    neg_x: Option<ChunkData>,
-    pos_x: Option<ChunkData>,
-    neg_z: Option<ChunkData>,
-    pos_z: Option<ChunkData>,
+    neighbors: CardinalNeighborSlicesOwned,
+    section_mask: u8,
 }
 
 #[derive(Debug)]
 struct MeshingResult {
     pos: ChunkPos,
-    mesh: ChunkMesh,
+    section_mask: u8,
+    section_meshes: Vec<(u8, ChunkMesh)>,
 }
 
 pub struct ChunkStreamer {
@@ -153,10 +172,8 @@ pub struct ChunkStreamer {
     meshing_in_flight: HashSet<ChunkPos>,
     urgent_lighting: HashSet<ChunkPos>,
     urgent_meshing: HashSet<ChunkPos>,
-    fast_feedback_meshing: HashSet<ChunkPos>,
-    fast_feedback_upload_allow: HashSet<ChunkPos>,
-    stale_lighting_upload_pending: HashSet<ChunkPos>,
     pending_render_upload: HashSet<ChunkPos>,
+    pending_render_upload_masks: HashMap<ChunkPos, u8>,
     coherence_pending: HashSet<ChunkPos>,
     generation_tx: Option<Sender<GenerationJob>>,
     generation_rx: Receiver<GenerationResult>,
@@ -166,9 +183,9 @@ pub struct ChunkStreamer {
     meshing_regular_tx: Option<Sender<MeshingJob>>,
     meshing_urgent_tx: Option<Sender<MeshingJob>>,
     meshing_rx: Receiver<MeshingResult>,
-    generation_thread: Option<thread::JoinHandle<()>>,
-    lighting_thread: Option<thread::JoinHandle<()>>,
-    meshing_thread: Option<thread::JoinHandle<()>>,
+    generation_threads: Vec<thread::JoinHandle<()>>,
+    lighting_threads: Vec<thread::JoinHandle<()>>,
+    meshing_threads: Vec<thread::JoinHandle<()>>,
     mesh_dirty: bool,
     remesh_enqueued_total: u64,
     relight_enqueued_total: u64,
@@ -188,174 +205,268 @@ impl ChunkStreamer {
         let (meshing_urgent_tx, meshing_urgent_rx) = mpsc::channel::<MeshingJob>();
         let (meshing_result_tx, meshing_rx) = mpsc::channel::<MeshingResult>();
 
-        let generation_registry = registry.clone();
-        let generation_thread = thread::Builder::new()
-            .name("thingcraft-generation-worker".to_owned())
-            .spawn(move || {
-                let generator = OverworldChunkGenerator::new(seed);
-                while let Ok(job) = generation_job_rx.recv() {
-                    let chunk = generator.generate_chunk(job.pos, &generation_registry);
-                    if generation_result_tx
-                        .send(GenerationResult { chunk })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .expect("failed to spawn generation worker thread");
+        let generation_job_rx = Arc::new(Mutex::new(generation_job_rx));
+        let lighting_regular_rx = Arc::new(Mutex::new(lighting_regular_rx));
+        let lighting_urgent_rx = Arc::new(Mutex::new(lighting_urgent_rx));
+        let meshing_regular_rx = Arc::new(Mutex::new(meshing_regular_rx));
+        let meshing_urgent_rx = Arc::new(Mutex::new(meshing_urgent_rx));
 
-        let lighting_registry = registry.clone();
-        let lighting_thread = thread::Builder::new()
-            .name("thingcraft-lighting-worker".to_owned())
-            .spawn(move || {
-                let mut urgent_closed = false;
-                let mut regular_closed = false;
-                loop {
-                    if !urgent_closed {
-                        match lighting_urgent_rx.try_recv() {
-                            Ok(job) => {
-                                let lighting =
-                                    relight_chunk(&job.chunk, &job.neighbors, &lighting_registry);
-                                if lighting_result_tx
-                                    .send(LightingResult {
-                                        pos: job.pos,
-                                        revision: job.revision,
-                                        lighting,
-                                        priority: job.priority,
-                                    })
-                                    .is_err()
-                                {
+        let generation_worker_count = config.generation_workers.clamp(1, 32);
+        let lighting_worker_count = config.lighting_workers.clamp(1, 32);
+        let meshing_worker_count = config.meshing_workers.clamp(1, 32);
+
+        let mut generation_threads = Vec::with_capacity(generation_worker_count);
+        for worker_index in 0..generation_worker_count {
+            let generation_registry = registry.clone();
+            let generation_result_tx = generation_result_tx.clone();
+            let generation_job_rx = generation_job_rx.clone();
+            generation_threads.push(
+                thread::Builder::new()
+                    .name(format!("thingcraft-generation-worker-{worker_index}"))
+                    .spawn(move || {
+                        let generator = OverworldChunkGenerator::new(seed);
+                        loop {
+                            let job = {
+                                let rx = generation_job_rx.lock().expect("generation rx poisoned");
+                                rx.recv()
+                            };
+                            let Ok(job) = job else {
+                                break;
+                            };
+                            let chunk = generator.generate_chunk(job.pos, &generation_registry);
+                            if generation_result_tx
+                                .send(GenerationResult { chunk })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .expect("failed to spawn generation worker thread"),
+            );
+        }
+
+        let mut lighting_threads = Vec::with_capacity(lighting_worker_count);
+        for worker_index in 0..lighting_worker_count {
+            let lighting_registry = registry.clone();
+            let lighting_result_tx = lighting_result_tx.clone();
+            let lighting_regular_rx = lighting_regular_rx.clone();
+            let lighting_urgent_rx = lighting_urgent_rx.clone();
+            lighting_threads.push(
+                thread::Builder::new()
+                    .name(format!("thingcraft-lighting-worker-{worker_index}"))
+                    .spawn(move || loop {
+                        let urgent_job = {
+                            let rx = lighting_urgent_rx
+                                .lock()
+                                .expect("lighting urgent rx poisoned");
+                            rx.try_recv()
+                        };
+                        if let Ok(job) = urgent_job {
+                            let lighting =
+                                relight_chunk(&job.chunk, &job.neighbors, &lighting_registry);
+                            if lighting_result_tx
+                                .send(LightingResult {
+                                    pos: job.pos,
+                                    revision: job.revision,
+                                    lighting,
+                                    priority: job.priority,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        let regular_job = {
+                            let rx = lighting_regular_rx
+                                .lock()
+                                .expect("lighting regular rx poisoned");
+                            rx.recv_timeout(Duration::from_millis(1))
+                        };
+                        let job = match regular_job {
+                            Ok(job) => Some(job),
+                            Err(RecvTimeoutError::Timeout) => {
+                                let urgent_fallback = {
+                                    let rx = lighting_urgent_rx
+                                        .lock()
+                                        .expect("lighting urgent rx poisoned");
+                                    rx.recv_timeout(Duration::from_millis(1))
+                                };
+                                match urgent_fallback {
+                                    Ok(job) => Some(job),
+                                    Err(RecvTimeoutError::Timeout) => None,
+                                    Err(RecvTimeoutError::Disconnected) => {
+                                        let regular_disconnected = {
+                                            let rx = lighting_regular_rx
+                                                .lock()
+                                                .expect("lighting regular rx poisoned");
+                                            matches!(rx.try_recv(), Err(TryRecvError::Disconnected))
+                                        };
+                                        if regular_disconnected {
+                                            break;
+                                        }
+                                        None
+                                    }
+                                }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                let urgent_closed = {
+                                    let rx = lighting_urgent_rx
+                                        .lock()
+                                        .expect("lighting urgent rx poisoned");
+                                    matches!(rx.try_recv(), Err(TryRecvError::Disconnected))
+                                };
+                                if urgent_closed {
                                     break;
                                 }
-                                continue;
-                            }
-                            Err(TryRecvError::Empty) => {}
-                            Err(TryRecvError::Disconnected) => urgent_closed = true,
-                        }
-                    }
-
-                    if urgent_closed && regular_closed {
-                        break;
-                    }
-
-                    let job = if !regular_closed {
-                        match lighting_regular_rx.recv_timeout(Duration::from_millis(1)) {
-                            Ok(job) => Some(job),
-                            Err(RecvTimeoutError::Timeout) => None,
-                            Err(RecvTimeoutError::Disconnected) => {
-                                regular_closed = true;
                                 None
                             }
-                        }
-                    } else if !urgent_closed {
-                        match lighting_urgent_rx.recv_timeout(Duration::from_millis(1)) {
-                            Ok(job) => Some(job),
-                            Err(RecvTimeoutError::Timeout) => None,
-                            Err(RecvTimeoutError::Disconnected) => {
-                                urgent_closed = true;
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                        };
 
-                    let Some(job) = job else {
-                        continue;
-                    };
-                    let lighting = relight_chunk(&job.chunk, &job.neighbors, &lighting_registry);
-                    if lighting_result_tx
-                        .send(LightingResult {
-                            pos: job.pos,
-                            revision: job.revision,
-                            lighting,
-                            priority: job.priority,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .expect("failed to spawn lighting worker thread");
+                        let Some(job) = job else {
+                            continue;
+                        };
+                        let lighting =
+                            relight_chunk(&job.chunk, &job.neighbors, &lighting_registry);
+                        if lighting_result_tx
+                            .send(LightingResult {
+                                pos: job.pos,
+                                revision: job.revision,
+                                lighting,
+                                priority: job.priority,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    })
+                    .expect("failed to spawn lighting worker thread"),
+            );
+        }
 
-        let meshing_registry = registry.clone();
-        let meshing_thread = thread::Builder::new()
-            .name("thingcraft-meshing-worker".to_owned())
-            .spawn(move || {
-                let mut urgent_closed = false;
-                let mut regular_closed = false;
-                loop {
-                    if !urgent_closed {
-                        match meshing_urgent_rx.try_recv() {
-                            Ok(job) => {
-                                let pos = job.chunk.pos;
-                                let neighbors = CardinalChunkNeighbors {
-                                    neg_x: job.neg_x.as_ref(),
-                                    pos_x: job.pos_x.as_ref(),
-                                    neg_z: job.neg_z.as_ref(),
-                                    pos_z: job.pos_z.as_ref(),
-                                };
-                                let mesh = build_chunk_mesh_with_neighbors(
+        let mut meshing_threads = Vec::with_capacity(meshing_worker_count);
+        for worker_index in 0..meshing_worker_count {
+            let meshing_registry = registry.clone();
+            let meshing_result_tx = meshing_result_tx.clone();
+            let meshing_regular_rx = meshing_regular_rx.clone();
+            let meshing_urgent_rx = meshing_urgent_rx.clone();
+            meshing_threads.push(
+                thread::Builder::new()
+                    .name(format!("thingcraft-meshing-worker-{worker_index}"))
+                    .spawn(move || loop {
+                        let urgent_job = {
+                            let rx = meshing_urgent_rx
+                                .lock()
+                                .expect("meshing urgent rx poisoned");
+                            rx.try_recv()
+                        };
+                        if let Ok(job) = urgent_job {
+                            let mut section_meshes = Vec::new();
+                            for section_y in 0..CHUNK_SECTION_COUNT as u8 {
+                                let bit = 1_u8 << section_y;
+                                if job.section_mask & bit == 0 {
+                                    continue;
+                                }
+                                let mesh = build_chunk_section_mesh_with_neighbor_slices(
                                     &job.chunk,
                                     &meshing_registry,
-                                    &neighbors,
+                                    &job.neighbors,
+                                    section_y,
                                 );
-                                if meshing_result_tx.send(MeshingResult { pos, mesh }).is_err() {
+                                section_meshes.push((section_y, mesh));
+                            }
+                            if meshing_result_tx
+                                .send(MeshingResult {
+                                    pos: job.pos,
+                                    section_mask: job.section_mask,
+                                    section_meshes,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        let regular_job = {
+                            let rx = meshing_regular_rx
+                                .lock()
+                                .expect("meshing regular rx poisoned");
+                            rx.recv_timeout(Duration::from_millis(1))
+                        };
+                        let job = match regular_job {
+                            Ok(job) => Some(job),
+                            Err(RecvTimeoutError::Timeout) => {
+                                let urgent_fallback = {
+                                    let rx = meshing_urgent_rx
+                                        .lock()
+                                        .expect("meshing urgent rx poisoned");
+                                    rx.recv_timeout(Duration::from_millis(1))
+                                };
+                                match urgent_fallback {
+                                    Ok(job) => Some(job),
+                                    Err(RecvTimeoutError::Timeout) => None,
+                                    Err(RecvTimeoutError::Disconnected) => {
+                                        let regular_disconnected = {
+                                            let rx = meshing_regular_rx
+                                                .lock()
+                                                .expect("meshing regular rx poisoned");
+                                            matches!(rx.try_recv(), Err(TryRecvError::Disconnected))
+                                        };
+                                        if regular_disconnected {
+                                            break;
+                                        }
+                                        None
+                                    }
+                                }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                let urgent_closed = {
+                                    let rx = meshing_urgent_rx
+                                        .lock()
+                                        .expect("meshing urgent rx poisoned");
+                                    matches!(rx.try_recv(), Err(TryRecvError::Disconnected))
+                                };
+                                if urgent_closed {
                                     break;
                                 }
+                                None
+                            }
+                        };
+
+                        let Some(job) = job else {
+                            continue;
+                        };
+                        let mut section_meshes = Vec::new();
+                        for section_y in 0..CHUNK_SECTION_COUNT as u8 {
+                            let bit = 1_u8 << section_y;
+                            if job.section_mask & bit == 0 {
                                 continue;
                             }
-                            Err(TryRecvError::Empty) => {}
-                            Err(TryRecvError::Disconnected) => urgent_closed = true,
+                            let mesh = build_chunk_section_mesh_with_neighbor_slices(
+                                &job.chunk,
+                                &meshing_registry,
+                                &job.neighbors,
+                                section_y,
+                            );
+                            section_meshes.push((section_y, mesh));
                         }
-                    }
-
-                    if urgent_closed && regular_closed {
-                        break;
-                    }
-
-                    let job = if !regular_closed {
-                        match meshing_regular_rx.recv_timeout(Duration::from_millis(1)) {
-                            Ok(job) => Some(job),
-                            Err(RecvTimeoutError::Timeout) => None,
-                            Err(RecvTimeoutError::Disconnected) => {
-                                regular_closed = true;
-                                None
-                            }
+                        if meshing_result_tx
+                            .send(MeshingResult {
+                                pos: job.pos,
+                                section_mask: job.section_mask,
+                                section_meshes,
+                            })
+                            .is_err()
+                        {
+                            break;
                         }
-                    } else if !urgent_closed {
-                        match meshing_urgent_rx.recv_timeout(Duration::from_millis(1)) {
-                            Ok(job) => Some(job),
-                            Err(RecvTimeoutError::Timeout) => None,
-                            Err(RecvTimeoutError::Disconnected) => {
-                                urgent_closed = true;
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let Some(job) = job else {
-                        continue;
-                    };
-                    let pos = job.chunk.pos;
-                    let neighbors = CardinalChunkNeighbors {
-                        neg_x: job.neg_x.as_ref(),
-                        pos_x: job.pos_x.as_ref(),
-                        neg_z: job.neg_z.as_ref(),
-                        pos_z: job.pos_z.as_ref(),
-                    };
-                    let mesh =
-                        build_chunk_mesh_with_neighbors(&job.chunk, &meshing_registry, &neighbors);
-                    if meshing_result_tx.send(MeshingResult { pos, mesh }).is_err() {
-                        break;
-                    }
-                }
-            })
-            .expect("failed to spawn meshing worker thread");
+                    })
+                    .expect("failed to spawn meshing worker thread"),
+            );
+        }
 
         Self {
             registry,
@@ -367,10 +478,8 @@ impl ChunkStreamer {
             meshing_in_flight: HashSet::new(),
             urgent_lighting: HashSet::new(),
             urgent_meshing: HashSet::new(),
-            fast_feedback_meshing: HashSet::new(),
-            fast_feedback_upload_allow: HashSet::new(),
-            stale_lighting_upload_pending: HashSet::new(),
             pending_render_upload: HashSet::new(),
+            pending_render_upload_masks: HashMap::new(),
             coherence_pending: HashSet::new(),
             generation_tx: Some(generation_tx),
             generation_rx,
@@ -380,9 +489,9 @@ impl ChunkStreamer {
             meshing_regular_tx: Some(meshing_regular_tx),
             meshing_urgent_tx: Some(meshing_urgent_tx),
             meshing_rx,
-            generation_thread: Some(generation_thread),
-            lighting_thread: Some(lighting_thread),
-            meshing_thread: Some(meshing_thread),
+            generation_threads,
+            lighting_threads,
+            meshing_threads,
             mesh_dirty: true,
             remesh_enqueued_total: 0,
             relight_enqueued_total: 0,
@@ -428,19 +537,43 @@ impl ChunkStreamer {
         self.enqueue_lighting_relight(pos, WorkPriority::Urgent);
     }
 
+    #[allow(dead_code)]
     pub fn mark_block_geometry_dirty(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
-        if usize::from(local_x) >= CHUNK_WIDTH || usize::from(local_z) >= CHUNK_DEPTH {
+        self.mark_block_geometry_dirty_at_y(pos, local_x, 64, local_z);
+    }
+
+    fn mark_block_geometry_dirty_at_y(
+        &mut self,
+        pos: ChunkPos,
+        local_x: u8,
+        local_y: u8,
+        local_z: u8,
+    ) {
+        if usize::from(local_x) >= CHUNK_WIDTH
+            || usize::from(local_y) >= CHUNK_HEIGHT
+            || usize::from(local_z) >= CHUNK_DEPTH
+        {
             return;
         }
 
+        let mut section_mask = section_mask_for_y(local_y);
+        if usize::from(local_y) % SECTION_HEIGHT == 0 && local_y > 0 {
+            section_mask |= section_mask_for_y(local_y - 1);
+        }
+        if (usize::from(local_y) + 1) % SECTION_HEIGHT == 0
+            && usize::from(local_y) + 1 < CHUNK_HEIGHT
+        {
+            section_mask |= section_mask_for_y(local_y + 1);
+        }
+
         let mut edge_coherence_targets = vec![pos];
-        self.enqueue_geometry_remesh(pos, WorkPriority::Urgent);
+        self.enqueue_geometry_sections_remesh(pos, section_mask, WorkPriority::Urgent);
         if local_x == 0 {
             let west = ChunkPos {
                 x: pos.x - 1,
                 z: pos.z,
             };
-            self.enqueue_geometry_remesh(west, WorkPriority::Urgent);
+            self.enqueue_geometry_sections_remesh(west, section_mask, WorkPriority::Urgent);
             edge_coherence_targets.push(west);
         }
         if local_x == (CHUNK_WIDTH as u8 - 1) {
@@ -448,7 +581,7 @@ impl ChunkStreamer {
                 x: pos.x + 1,
                 z: pos.z,
             };
-            self.enqueue_geometry_remesh(east, WorkPriority::Urgent);
+            self.enqueue_geometry_sections_remesh(east, section_mask, WorkPriority::Urgent);
             edge_coherence_targets.push(east);
         }
         if local_z == 0 {
@@ -456,7 +589,7 @@ impl ChunkStreamer {
                 x: pos.x,
                 z: pos.z - 1,
             };
-            self.enqueue_geometry_remesh(north, WorkPriority::Urgent);
+            self.enqueue_geometry_sections_remesh(north, section_mask, WorkPriority::Urgent);
             edge_coherence_targets.push(north);
         }
         if local_z == (CHUNK_DEPTH as u8 - 1) {
@@ -464,17 +597,14 @@ impl ChunkStreamer {
                 x: pos.x,
                 z: pos.z + 1,
             };
-            self.enqueue_geometry_remesh(south, WorkPriority::Urgent);
+            self.enqueue_geometry_sections_remesh(south, section_mask, WorkPriority::Urgent);
             edge_coherence_targets.push(south);
         }
 
         if edge_coherence_targets.len() > 1 {
             for chunk in edge_coherence_targets {
                 self.coherence_pending.insert(chunk);
-                self.fast_feedback_meshing.insert(chunk);
             }
-        } else {
-            self.fast_feedback_meshing.insert(pos);
         }
     }
 
@@ -532,7 +662,7 @@ impl ChunkStreamer {
             states.push(ChunkDebugState {
                 pos: *pos,
                 residency_state: slot.state,
-                dirty_geometry: slot.dirty.geometry,
+                dirty_geometry: slot.dirty.geometry || slot.dirty.geometry_sections != 0,
                 dirty_lighting: slot.dirty.lighting,
                 in_flight_generation: self.generation_in_flight.contains(pos),
                 in_flight_lighting: self.lighting_in_flight.contains(pos),
@@ -594,7 +724,7 @@ impl ChunkStreamer {
         if changed {
             self.refresh_columns_after_block_edit(pos, local_x, local_z);
             self.mark_block_lighting_dirty(pos, local_x, local_z);
-            self.mark_block_geometry_dirty(pos, local_x, local_z);
+            self.mark_block_geometry_dirty_at_y(pos, local_x, world_y as u8, local_z);
         }
         changed
     }
@@ -622,7 +752,7 @@ impl ChunkStreamer {
                 ChunkResidencyState::Ready => metrics.ready += 1,
                 ChunkResidencyState::Evicting => metrics.evicting += 1,
             }
-            if slot.dirty.geometry || slot.dirty.lighting {
+            if slot.dirty.geometry || slot.dirty.geometry_sections != 0 || slot.dirty.lighting {
                 metrics.dirty_chunks += 1;
             }
         }
@@ -645,6 +775,8 @@ impl ChunkStreamer {
                     lighting_revision: 0,
                     chunk: None,
                     mesh: None,
+                    section_meshes: std::array::from_fn(|_| None),
+                    meshed_section_mask: 0,
                 });
             }
         }
@@ -656,9 +788,11 @@ impl ChunkStreamer {
                 slot.dirty = ChunkDirtyFlags::default();
                 slot.chunk = None;
                 slot.mesh = None;
+                slot.section_meshes = std::array::from_fn(|_| None);
+                slot.meshed_section_mask = 0;
                 self.mesh_dirty = true;
                 self.render_updates
-                    .push(RenderMeshUpdate::Remove { pos: *pos });
+                    .push(RenderMeshUpdate::RemoveChunk { pos: *pos });
                 evicted.push(*pos);
             }
         }
@@ -782,22 +916,34 @@ impl ChunkStreamer {
             };
 
             let neighbors = CardinalChunkNeighborsOwned {
-                neg_x: self.chunk_data_at(ChunkPos {
-                    x: pos.x - 1,
-                    z: pos.z,
-                }),
-                pos_x: self.chunk_data_at(ChunkPos {
-                    x: pos.x + 1,
-                    z: pos.z,
-                }),
-                neg_z: self.chunk_data_at(ChunkPos {
-                    x: pos.x,
-                    z: pos.z - 1,
-                }),
-                pos_z: self.chunk_data_at(ChunkPos {
-                    x: pos.x,
-                    z: pos.z + 1,
-                }),
+                neg_x: self
+                    .chunk_data_at(ChunkPos {
+                        x: pos.x - 1,
+                        z: pos.z,
+                    })
+                    .as_ref()
+                    .map(LightEdgeSlice::from_neg_x),
+                pos_x: self
+                    .chunk_data_at(ChunkPos {
+                        x: pos.x + 1,
+                        z: pos.z,
+                    })
+                    .as_ref()
+                    .map(LightEdgeSlice::from_pos_x),
+                neg_z: self
+                    .chunk_data_at(ChunkPos {
+                        x: pos.x,
+                        z: pos.z - 1,
+                    })
+                    .as_ref()
+                    .map(LightEdgeSlice::from_neg_z),
+                pos_z: self
+                    .chunk_data_at(ChunkPos {
+                        x: pos.x,
+                        z: pos.z + 1,
+                    })
+                    .as_ref()
+                    .map(LightEdgeSlice::from_pos_z),
             };
 
             let sender = if priority == WorkPriority::Urgent {
@@ -844,7 +990,7 @@ impl ChunkStreamer {
             self.slots.get(pos).is_some_and(|entry| {
                 entry.state == ChunkResidencyState::Meshing
                     && entry.chunk.is_some()
-                    && entry.dirty.geometry
+                    && (entry.dirty.geometry || entry.dirty.geometry_sections != 0)
                     && !entry.dirty.lighting
                     && !self.lighting_in_flight.contains(pos)
                     && !self.meshing_in_flight.contains(pos)
@@ -855,15 +1001,14 @@ impl ChunkStreamer {
         let mut urgent_candidates = Vec::new();
         let mut regular_candidates = Vec::new();
         for (pos, entry) in &self.slots {
-            let fast_feedback = self.fast_feedback_meshing.contains(pos);
             if entry.state == ChunkResidencyState::Meshing
                 && entry.chunk.is_some()
-                && entry.dirty.geometry
-                && (fast_feedback
-                    || (!entry.dirty.lighting && !self.lighting_in_flight.contains(pos)))
+                && (entry.dirty.geometry || entry.dirty.geometry_sections != 0)
+                && !entry.dirty.lighting
+                && !self.lighting_in_flight.contains(pos)
                 && !self.meshing_in_flight.contains(pos)
                 && self.required.contains(pos)
-                && (fast_feedback || self.neighbor_lighting_ready(*pos))
+                && self.neighbor_lighting_ready(*pos)
             {
                 if self.urgent_meshing.contains(pos) {
                     urgent_candidates.push(*pos);
@@ -899,23 +1044,45 @@ impl ChunkStreamer {
             let Some(chunk) = slot.chunk.clone() else {
                 continue;
             };
+            let section_mask = if slot.dirty.geometry_sections == 0 && slot.dirty.geometry {
+                full_section_mask()
+            } else {
+                slot.dirty.geometry_sections
+            };
+            if section_mask == 0 {
+                continue;
+            }
 
-            let neg_x = self.chunk_data_at(ChunkPos {
-                x: pos.x - 1,
-                z: pos.z,
-            });
-            let pos_x = self.chunk_data_at(ChunkPos {
-                x: pos.x + 1,
-                z: pos.z,
-            });
-            let neg_z = self.chunk_data_at(ChunkPos {
-                x: pos.x,
-                z: pos.z - 1,
-            });
-            let pos_z = self.chunk_data_at(ChunkPos {
-                x: pos.x,
-                z: pos.z + 1,
-            });
+            let neighbors = CardinalNeighborSlicesOwned {
+                neg_x: self
+                    .chunk_data_at(ChunkPos {
+                        x: pos.x - 1,
+                        z: pos.z,
+                    })
+                    .as_ref()
+                    .map(NeighborEdgeSliceOwned::from_neg_x),
+                pos_x: self
+                    .chunk_data_at(ChunkPos {
+                        x: pos.x + 1,
+                        z: pos.z,
+                    })
+                    .as_ref()
+                    .map(NeighborEdgeSliceOwned::from_pos_x),
+                neg_z: self
+                    .chunk_data_at(ChunkPos {
+                        x: pos.x,
+                        z: pos.z - 1,
+                    })
+                    .as_ref()
+                    .map(NeighborEdgeSliceOwned::from_neg_z),
+                pos_z: self
+                    .chunk_data_at(ChunkPos {
+                        x: pos.x,
+                        z: pos.z + 1,
+                    })
+                    .as_ref()
+                    .map(NeighborEdgeSliceOwned::from_pos_z),
+            };
 
             let sender = if self.urgent_meshing.contains(&pos) {
                 urgent_tx
@@ -924,24 +1091,21 @@ impl ChunkStreamer {
             };
             if sender
                 .send(MeshingJob {
+                    pos,
                     chunk,
-                    neg_x,
-                    pos_x,
-                    neg_z,
-                    pos_z,
+                    neighbors,
+                    section_mask,
                 })
                 .is_err()
             {
                 break;
             }
             if let Some(slot) = self.slots.get_mut(&pos) {
+                slot.dirty.geometry_sections = 0;
                 slot.dirty.geometry = false;
             }
             self.meshing_in_flight.insert(pos);
             self.urgent_meshing.remove(&pos);
-            if self.fast_feedback_meshing.remove(&pos) {
-                self.fast_feedback_upload_allow.insert(pos);
-            }
         }
     }
 
@@ -961,6 +1125,8 @@ impl ChunkStreamer {
                         slot.dirty = ChunkDirtyFlags::default();
                         slot.state = ChunkResidencyState::Meshing;
                         slot.mesh = None;
+                        slot.section_meshes = std::array::from_fn(|_| None);
+                        slot.meshed_section_mask = 0;
                     }
                     self.mark_chunk_lighting_dirty(pos);
                     self.mark_neighbors_for_relight(pos);
@@ -982,7 +1148,7 @@ impl ChunkStreamer {
                     }
 
                     let mut boundary_lighting_changed = false;
-                    let mut should_mark_geometry_dirty = false;
+                    let mut geometry_remesh_mask = 0_u8;
                     if let Some(slot) = self.slots.get_mut(&result.pos) {
                         let is_stale =
                             slot.dirty.lighting || slot.lighting_revision != result.revision;
@@ -993,7 +1159,9 @@ impl ChunkStreamer {
                             continue;
                         }
 
-                        let should_remesh = result.lighting.changed || slot.mesh.is_none();
+                        let missing_sections = missing_section_mask(slot);
+                        geometry_remesh_mask =
+                            result.lighting.changed_sections_mask | missing_sections;
                         let Some(chunk) = slot.chunk.as_mut() else {
                             continue;
                         };
@@ -1005,15 +1173,14 @@ impl ChunkStreamer {
                                 &result.lighting.block_light,
                             );
                         }
-                        should_mark_geometry_dirty = should_remesh;
                     }
 
-                    if should_mark_geometry_dirty {
-                        if result.priority == WorkPriority::Urgent {
-                            self.mark_chunk_geometry_dirty_urgent(result.pos);
-                        } else {
-                            self.mark_chunk_geometry_dirty(result.pos);
-                        }
+                    if geometry_remesh_mask != 0 {
+                        self.enqueue_geometry_sections_remesh(
+                            result.pos,
+                            geometry_remesh_mask,
+                            result.priority,
+                        );
                     }
                     if boundary_lighting_changed {
                         self.mark_neighbors_for_relight_with_priority(result.pos, result.priority);
@@ -1035,25 +1202,45 @@ impl ChunkStreamer {
                         continue;
                     }
 
-                    let allow_stale_lighting_upload =
-                        self.fast_feedback_upload_allow.remove(&result.pos);
                     if let Some(slot) = self.slots.get_mut(&result.pos) {
-                        if slot.dirty.geometry
-                            || (slot.dirty.lighting && !allow_stale_lighting_upload)
+                        if (slot.dirty.geometry || slot.dirty.geometry_sections != 0)
+                            || slot.dirty.lighting
+                            || self.lighting_in_flight.contains(&result.pos)
                         {
+                            // This result raced with a newer edit/relight; keep its section mask dirty
+                            // so the latest geometry is rebuilt once lighting settles.
+                            slot.dirty.geometry_sections |= result.section_mask;
+                            slot.dirty.geometry = slot.dirty.geometry_sections != 0;
                             slot.state = ChunkResidencyState::Meshing;
                             continue;
                         }
 
-                        slot.mesh = Some(result.mesh);
-                        if slot.dirty.lighting {
-                            slot.state = ChunkResidencyState::Meshing;
-                            self.stale_lighting_upload_pending.insert(result.pos);
-                        } else {
-                            slot.state = ChunkResidencyState::Ready;
+                        for (section_y, mesh) in result.section_meshes {
+                            let index = usize::from(section_y);
+                            if index >= CHUNK_SECTION_COUNT {
+                                continue;
+                            }
+                            slot.section_meshes[index] =
+                                if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                                    None
+                                } else {
+                                    Some(mesh)
+                                };
                         }
+                        slot.meshed_section_mask |= result.section_mask & full_section_mask();
+                        let merged_sections: Vec<_> =
+                            slot.section_meshes.iter().flatten().cloned().collect();
+                        slot.mesh = if merged_sections.is_empty() {
+                            None
+                        } else {
+                            Some(merge_meshes(&merged_sections))
+                        };
+                        slot.state = ChunkResidencyState::Ready;
                         self.mesh_dirty = true;
-                        self.pending_render_upload.insert(result.pos);
+                        self.pending_render_upload_masks
+                            .entry(result.pos)
+                            .and_modify(|mask| *mask |= result.section_mask)
+                            .or_insert(result.section_mask);
                     }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
@@ -1062,32 +1249,48 @@ impl ChunkStreamer {
     }
 
     fn flush_render_uploads(&mut self) {
-        let pending: Vec<_> = self.pending_render_upload.iter().copied().collect();
+        let upload_budget = self.config.max_render_upload_sections_per_tick.max(1);
+        let mut uploaded_sections = 0_usize;
+        let pending_chunks: Vec<_> = self.pending_render_upload.iter().copied().collect();
+        for pos in pending_chunks {
+            self.pending_render_upload_masks
+                .entry(pos)
+                .or_insert(full_section_mask());
+        }
+
+        let pending: Vec<_> = self
+            .pending_render_upload_masks
+            .iter()
+            .map(|(pos, mask)| (*pos, *mask))
+            .collect();
         if pending.is_empty() {
             return;
         }
 
-        for pos in pending {
+        for (pos, section_mask) in pending {
+            if uploaded_sections >= upload_budget {
+                break;
+            }
             if !self.required.contains(&pos) {
                 self.pending_render_upload.remove(&pos);
+                self.pending_render_upload_masks.remove(&pos);
                 self.coherence_pending.remove(&pos);
                 continue;
             }
 
             let Some(slot) = self.slots.get(&pos) else {
                 self.pending_render_upload.remove(&pos);
+                self.pending_render_upload_masks.remove(&pos);
                 self.coherence_pending.remove(&pos);
-                self.fast_feedback_upload_allow.remove(&pos);
-                self.stale_lighting_upload_pending.remove(&pos);
                 continue;
             };
 
-            let allow_stale_lighting =
-                self.stale_lighting_upload_pending.contains(&pos) && !slot.dirty.geometry;
-            if !allow_stale_lighting
-                && (slot.state != ChunkResidencyState::Ready
-                    || slot.dirty.geometry
-                    || slot.dirty.lighting)
+            if slot.state != ChunkResidencyState::Ready
+                || slot.dirty.geometry
+                || slot.dirty.geometry_sections != 0
+                || slot.dirty.lighting
+                || self.lighting_in_flight.contains(&pos)
+                || !self.neighbor_lighting_ready(pos)
             {
                 continue;
             }
@@ -1096,18 +1299,33 @@ impl ChunkStreamer {
                 continue;
             }
 
-            let Some(mesh) = &slot.mesh else {
-                continue;
-            };
-
-            self.render_updates.push(RenderMeshUpdate::Upsert {
-                pos,
-                mesh: mesh.clone(),
-            });
-            self.pending_render_upload.remove(&pos);
-            self.coherence_pending.remove(&pos);
-            self.fast_feedback_upload_allow.remove(&pos);
-            self.stale_lighting_upload_pending.remove(&pos);
+            let mut remaining_mask = section_mask;
+            for section_y in 0..CHUNK_SECTION_COUNT as u8 {
+                if uploaded_sections >= upload_budget {
+                    break;
+                }
+                let bit = 1_u8 << section_y;
+                if remaining_mask & bit == 0 {
+                    continue;
+                }
+                let mesh = slot.section_meshes[usize::from(section_y)]
+                    .clone()
+                    .unwrap_or_default();
+                self.render_updates.push(RenderMeshUpdate::UpsertSection {
+                    pos,
+                    section_y,
+                    mesh,
+                });
+                remaining_mask &= !bit;
+                uploaded_sections += 1;
+            }
+            if remaining_mask == 0 {
+                self.pending_render_upload.remove(&pos);
+                self.pending_render_upload_masks.remove(&pos);
+                self.coherence_pending.remove(&pos);
+            } else {
+                self.pending_render_upload_masks.insert(pos, remaining_mask);
+            }
         }
     }
 
@@ -1139,10 +1357,8 @@ impl ChunkStreamer {
             self.meshing_in_flight.remove(&pos);
             self.urgent_lighting.remove(&pos);
             self.urgent_meshing.remove(&pos);
-            self.fast_feedback_meshing.remove(&pos);
-            self.fast_feedback_upload_allow.remove(&pos);
-            self.stale_lighting_upload_pending.remove(&pos);
             self.pending_render_upload.remove(&pos);
+            self.pending_render_upload_masks.remove(&pos);
             self.coherence_pending.remove(&pos);
         }
 
@@ -1155,17 +1371,15 @@ impl ChunkStreamer {
         }
 
         self.mesh_dirty = false;
-        let meshes: Vec<_> = self
-            .slots
-            .values()
-            .filter_map(|slot| {
-                if slot.state == ChunkResidencyState::Ready {
-                    slot.mesh.clone()
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut meshes = Vec::new();
+        for slot in self.slots.values() {
+            if slot.state != ChunkResidencyState::Ready {
+                continue;
+            }
+            for mesh in slot.section_meshes.iter().flatten() {
+                meshes.push(mesh.clone());
+            }
+        }
 
         Some(merge_meshes(&meshes))
     }
@@ -1227,6 +1441,18 @@ impl ChunkStreamer {
     }
 
     fn enqueue_geometry_remesh(&mut self, pos: ChunkPos, priority: WorkPriority) {
+        self.enqueue_geometry_sections_remesh(pos, full_section_mask(), priority);
+    }
+
+    fn enqueue_geometry_sections_remesh(
+        &mut self,
+        pos: ChunkPos,
+        section_mask: u8,
+        priority: WorkPriority,
+    ) {
+        if section_mask == 0 {
+            return;
+        }
         let Some(slot) = self.slots.get_mut(&pos) else {
             return;
         };
@@ -1234,8 +1460,13 @@ impl ChunkStreamer {
             return;
         }
 
-        slot.dirty.geometry = true;
+        slot.dirty.geometry_sections |= section_mask;
+        slot.dirty.geometry = slot.dirty.geometry_sections != 0;
         self.pending_render_upload.insert(pos);
+        self.pending_render_upload_masks
+            .entry(pos)
+            .and_modify(|mask| *mask |= section_mask)
+            .or_insert(section_mask);
         if slot.state != ChunkResidencyState::Meshing {
             slot.state = ChunkResidencyState::Meshing;
             self.remesh_enqueued_total = self.remesh_enqueued_total.saturating_add(1);
@@ -1272,7 +1503,10 @@ impl ChunkStreamer {
             if slot.state == ChunkResidencyState::Evicting || slot.chunk.is_none() {
                 continue;
             }
-            if slot.dirty.geometry || self.meshing_in_flight.contains(&neighbor) {
+            if slot.dirty.geometry
+                || slot.dirty.geometry_sections != 0
+                || self.meshing_in_flight.contains(&neighbor)
+            {
                 return false;
             }
         }
@@ -1347,13 +1581,13 @@ impl Drop for ChunkStreamer {
         self.meshing_regular_tx.take();
         self.meshing_urgent_tx.take();
 
-        if let Some(handle) = self.generation_thread.take() {
+        for handle in self.generation_threads.drain(..) {
             let _ = handle.join();
         }
-        if let Some(handle) = self.lighting_thread.take() {
+        for handle in self.lighting_threads.drain(..) {
             let _ = handle.join();
         }
-        if let Some(handle) = self.meshing_thread.take() {
+        for handle in self.meshing_threads.drain(..) {
             let _ = handle.join();
         }
     }
@@ -1437,6 +1671,19 @@ fn boosted_dispatch_budget(
     base_budget.max(urgent_target).min(headroom)
 }
 
+fn full_section_mask() -> u8 {
+    ((1_u16 << CHUNK_SECTION_COUNT) - 1) as u8
+}
+
+fn section_mask_for_y(local_y: u8) -> u8 {
+    let section = usize::from(local_y) / SECTION_HEIGHT;
+    1_u8 << section
+}
+
+fn missing_section_mask(entry: &ChunkResidencyEntry) -> u8 {
+    full_section_mask() & !entry.meshed_section_mask
+}
+
 fn cardinal_neighbors(pos: ChunkPos) -> [ChunkPos; 4] {
     [
         ChunkPos {
@@ -1483,11 +1730,11 @@ fn boundary_light_channels_changed(chunk: &ChunkData, lighting: &LightingOutput)
     false
 }
 
-fn boundary_light_cell_changed(
-    chunk: &ChunkData,
-    lighting: &LightingOutput,
-    local_x: u8,
-    y: u8,
+    fn boundary_light_cell_changed(
+        chunk: &ChunkData,
+        lighting: &LightingOutput,
+        local_x: u8,
+        y: u8,
     local_z: u8,
 ) -> bool {
     let index = ChunkData::index(local_x, y, local_z);
@@ -1503,6 +1750,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_sections_do_not_include_empty_but_meshed_sections() {
+        let meshed_mask = (1_u8 << 0) | (1_u8 << 3);
+        let entry = ChunkResidencyEntry {
+            state: ChunkResidencyState::Ready,
+            dirty: ChunkDirtyFlags::default(),
+            lighting_revision: 0,
+            chunk: None,
+            mesh: None,
+            section_meshes: std::array::from_fn(|_| None),
+            meshed_section_mask: meshed_mask,
+        };
+
+        assert_eq!(
+            missing_section_mask(&entry),
+            full_section_mask() & !meshed_mask
+        );
+    }
+
+    #[test]
     fn residency_requests_expected_radius_square() {
         let registry = BlockRegistry::alpha_1_2_6();
         let mut streamer = ChunkStreamer::new(
@@ -1513,6 +1779,7 @@ mod tests {
                 max_generation_dispatch: 0,
                 max_lighting_dispatch: 0,
                 max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1533,6 +1800,7 @@ mod tests {
                 max_generation_dispatch: 1,
                 max_lighting_dispatch: 1,
                 max_meshing_dispatch: 1,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1563,6 +1831,7 @@ mod tests {
                 max_generation_dispatch: 2,
                 max_lighting_dispatch: 2,
                 max_meshing_dispatch: 2,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1665,6 +1934,7 @@ mod tests {
                 max_generation_dispatch: 2,
                 max_lighting_dispatch: 2,
                 max_meshing_dispatch: 2,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1675,7 +1945,7 @@ mod tests {
             saw_upsert |= streamer
                 .drain_render_updates()
                 .iter()
-                .any(|update| matches!(update, RenderMeshUpdate::Upsert { .. }));
+                .any(|update| matches!(update, RenderMeshUpdate::UpsertSection { .. }));
             if streamer.metrics().ready == 1 && saw_upsert {
                 break;
             }
@@ -1685,9 +1955,9 @@ mod tests {
 
         streamer.tick(ChunkPos { x: 3, z: 0 });
         let updates = streamer.drain_render_updates();
-        assert!(updates
-            .iter()
-            .any(|update| matches!(update, RenderMeshUpdate::Remove { pos } if *pos == start)));
+        assert!(updates.iter().any(
+            |update| matches!(update, RenderMeshUpdate::RemoveChunk { pos } if *pos == start)
+        ));
     }
 
     #[test]
@@ -1701,6 +1971,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 9,
                 max_meshing_dispatch: 9,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1737,6 +2008,7 @@ mod tests {
                 max_generation_dispatch: 2,
                 max_lighting_dispatch: 2,
                 max_meshing_dispatch: 2,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1782,6 +2054,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 9,
                 max_meshing_dispatch: 9,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1827,6 +2100,7 @@ mod tests {
                 max_generation_dispatch: 2,
                 max_lighting_dispatch: 2,
                 max_meshing_dispatch: 2,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1900,6 +2174,7 @@ mod tests {
                 max_generation_dispatch: 1,
                 max_lighting_dispatch: 1,
                 max_meshing_dispatch: 1,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1957,6 +2232,7 @@ mod tests {
                 max_generation_dispatch: 1,
                 max_lighting_dispatch: 1,
                 max_meshing_dispatch: 1,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -1985,6 +2261,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 9,
                 max_meshing_dispatch: 9,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2022,6 +2299,7 @@ mod tests {
                 max_generation_dispatch: 1,
                 max_lighting_dispatch: 1,
                 max_meshing_dispatch: 1,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2060,6 +2338,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 9,
                 max_meshing_dispatch: 9,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2123,6 +2402,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 9,
                 max_meshing_dispatch: 9,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2188,6 +2468,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 9,
                 max_meshing_dispatch: 9,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2248,6 +2529,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 1,
                 max_meshing_dispatch: 9,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2286,6 +2568,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 9,
                 max_meshing_dispatch: 1,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2329,6 +2612,7 @@ mod tests {
                 max_generation_dispatch: 9,
                 max_lighting_dispatch: 9,
                 max_meshing_dispatch: 1,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2365,6 +2649,7 @@ mod tests {
                 max_generation_dispatch: 0,
                 max_lighting_dispatch: 0,
                 max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2386,6 +2671,8 @@ mod tests {
                 lighting_revision: 0,
                 chunk: Some(center_chunk),
                 mesh: Some(ChunkMesh::default()),
+                section_meshes: std::array::from_fn(|_| None),
+                meshed_section_mask: full_section_mask(),
             },
         );
         streamer.slots.insert(
@@ -2396,6 +2683,8 @@ mod tests {
                 lighting_revision: 0,
                 chunk: Some(east_chunk),
                 mesh: Some(ChunkMesh::default()),
+                section_meshes: std::array::from_fn(|_| None),
+                meshed_section_mask: full_section_mask(),
             },
         );
         streamer.required.insert(center);
@@ -2415,13 +2704,13 @@ mod tests {
         }
         streamer.flush_render_uploads();
         assert!(streamer.render_updates.iter().any(
-            |update| matches!(update, RenderMeshUpdate::Upsert { pos, .. } if *pos == center)
+            |update| matches!(update, RenderMeshUpdate::UpsertSection { pos, .. } if *pos == center)
         ));
         assert!(!streamer.pending_render_upload.contains(&center));
     }
 
     #[test]
-    fn urgent_edit_mesh_uploads_before_lighting_finishes() {
+    fn urgent_edit_mesh_waits_until_lighting_settles() {
         let registry = BlockRegistry::alpha_1_2_6();
         let mut streamer = ChunkStreamer::new(
             42,
@@ -2431,6 +2720,7 @@ mod tests {
                 max_generation_dispatch: 2,
                 max_lighting_dispatch: 2,
                 max_meshing_dispatch: 2,
+                ..ResidencyConfig::default()
             },
         );
 
@@ -2446,6 +2736,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(streamer.metrics().ready, 1);
+        streamer.drain_render_updates();
         streamer.config.max_lighting_dispatch = 0;
 
         let mut target = None;
@@ -2465,9 +2756,12 @@ mod tests {
                 .slots
                 .get(&center)
                 .is_some_and(|slot| slot.dirty.lighting);
-            let had_upsert = streamer.drain_render_updates().iter().any(
-                |update| matches!(update, RenderMeshUpdate::Upsert { pos, .. } if *pos == center),
-            );
+            let had_upsert = streamer.drain_render_updates().iter().any(|update| {
+                matches!(
+                    update,
+                    RenderMeshUpdate::UpsertSection { pos, .. } if *pos == center
+                )
+            });
             if center_dirty_lighting && had_upsert {
                 saw_upsert_while_lighting_dirty = true;
                 break;
@@ -2475,7 +2769,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
 
-        assert!(saw_upsert_while_lighting_dirty);
+        assert!(!saw_upsert_while_lighting_dirty);
     }
 
     #[test]
@@ -2489,6 +2783,7 @@ mod tests {
                 max_generation_dispatch: 0,
                 max_lighting_dispatch: 0,
                 max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
             },
         );
         streamer.tick(ChunkPos { x: 0, z: 0 });

@@ -43,3 +43,8 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Oak tree generation added: biome-density-driven placement (forest/rainforest/taiga=10, seasonal=4, desert/tundra=-1), Alpha trunk height (4-6), leaf canopy with corner pruning, clearance validation, and ground-to-dirt replacement.
 - [x] Player physics added: `PhysicsBody` ECS component with Alpha constants (gravity 0.08, air drag 0.98, ground friction 0.546, jump velocity 0.42), AABB swept collision (Y-first axis resolution + step-up), and fly/walk toggle via `F` key. Camera uses eye_height (1.62) offset in physics mode.
 - [x] Basic HUD overlay added: screen-space crosshair (white "+") and hotbar bar (9 slots with selection highlight), rendered via a dedicated wgpu pipeline (orthographic, no depth, alpha blending) in a second render pass.
+- [x] Terrain chunk shader now applies Alpha-style transparent alpha-test discard (`a <= 0.1`) and distance fog blend against sky clear color.
+- [x] Meshing pipeline now supports section-level (`16x16x16`) dirty tracking and worker rebuilds with per-section incremental render uploads.
+- [x] Streaming lane workers now run as per-lane configurable worker pools (`THINGCRAFT_GEN_WORKERS`, `THINGCRAFT_LIGHT_WORKERS`, `THINGCRAFT_MESH_WORKERS`).
+- [x] Lighting/meshing neighbor payloads now use boundary edge snapshots instead of full cardinal `ChunkData` clones.
+- [x] Renderer mesh uploads now use a reusable GPU buffer pool for section vertex/index buffers (bounded byte budget).

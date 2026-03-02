@@ -19,7 +19,9 @@ use crate::streaming::{
     ResidencyConfig,
 };
 use crate::time_step::FixedStepClock;
-use crate::world::{BlockRegistry, BootstrapWorld, ChunkPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH};
+use crate::world::{
+    BlockRegistry, BootstrapWorld, ChunkPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH,
+};
 
 const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
     "wgpu_core=warn",
@@ -293,7 +295,9 @@ pub fn run() -> Result<()> {
     let mut hotbar_inventory = HotbarInventory::alpha_defaults();
     let mut selected_hotbar_slot = 0_usize;
     let mut hud_dirty = true;
-    let selected_slot = hotbar_inventory.slot(selected_hotbar_slot).unwrap_or_default();
+    let selected_slot = hotbar_inventory
+        .slot(selected_hotbar_slot)
+        .unwrap_or_default();
 
     info!(
         tick_hz = fixed_config.tick_hz,
@@ -310,6 +314,10 @@ pub fn run() -> Result<()> {
         stream_gen_budget = residency_config.max_generation_dispatch,
         stream_light_budget = residency_config.max_lighting_dispatch,
         stream_mesh_budget = residency_config.max_meshing_dispatch,
+        stream_upload_budget = residency_config.max_render_upload_sections_per_tick,
+        stream_gen_workers = residency_config.generation_workers,
+        stream_light_workers = residency_config.lighting_workers,
+        stream_mesh_workers = residency_config.meshing_workers,
         selected_hotbar_slot = 1,
         selected_place_block = selected_slot.block_id,
         selected_place_count = selected_slot.count,
@@ -378,7 +386,13 @@ pub fn run() -> Result<()> {
                             0.05,
                             512.0,
                         );
-                        renderer.update_camera((projection * view).to_cols_array_2d());
+                        let fog_end = (residency_config.view_radius as f32 + 1.0) * 16.0;
+                        renderer.update_camera(
+                            (projection * view).to_cols_array_2d(),
+                            snapshot.interpolated.position.to_array(),
+                            fog_end * 0.25,
+                            fog_end,
+                        );
                         camera_chunk = world_pos_to_chunk_pos(
                             snapshot.authoritative.position.x,
                             snapshot.authoritative.position.z,
@@ -393,8 +407,8 @@ pub fn run() -> Result<()> {
                     if APPLY_STREAM_UPDATES_TO_RENDERER {
                         for update in chunk_streamer.drain_render_updates() {
                             let update_pos = match &update {
-                                RenderMeshUpdate::Upsert { pos, .. }
-                                | RenderMeshUpdate::Remove { pos } => *pos,
+                                RenderMeshUpdate::UpsertSection { pos, .. }
+                                | RenderMeshUpdate::RemoveChunk { pos } => *pos,
                             };
                             if apply_render_update(&mut renderer, update) && bootstrap_mesh_active {
                                 renderer.set_scene_mesh(&ChunkMesh::default());
@@ -888,11 +902,15 @@ fn set_mouse_capture(window: &Window, captured: bool) {
 
 fn apply_render_update(renderer: &mut Renderer<'_>, update: RenderMeshUpdate) -> bool {
     match update {
-        RenderMeshUpdate::Upsert { pos, mesh } => {
-            renderer.upsert_chunk_mesh(pos, &mesh);
+        RenderMeshUpdate::UpsertSection {
+            pos,
+            section_y,
+            mesh,
+        } => {
+            renderer.upsert_chunk_section_mesh(pos, section_y, &mesh);
             true
         }
-        RenderMeshUpdate::Remove { pos } => {
+        RenderMeshUpdate::RemoveChunk { pos } => {
             renderer.remove_chunk_mesh(pos);
             false
         }
@@ -944,6 +962,18 @@ fn resolve_residency_config() -> ResidencyConfig {
     if let Some(parsed) = parse_env_u32("THINGCRAFT_MESH_BUDGET") {
         config.max_meshing_dispatch = parsed as usize;
     }
+    if let Some(parsed) = parse_env_u32("THINGCRAFT_UPLOAD_BUDGET") {
+        config.max_render_upload_sections_per_tick = parsed as usize;
+    }
+    if let Some(parsed) = parse_env_u32("THINGCRAFT_GEN_WORKERS") {
+        config.generation_workers = parsed as usize;
+    }
+    if let Some(parsed) = parse_env_u32("THINGCRAFT_LIGHT_WORKERS") {
+        config.lighting_workers = parsed as usize;
+    }
+    if let Some(parsed) = parse_env_u32("THINGCRAFT_MESH_WORKERS") {
+        config.meshing_workers = parsed as usize;
+    }
     config
 }
 
@@ -994,47 +1024,53 @@ fn resolve_player_physics(
     let mut scratch = Vec::with_capacity(32);
 
     // Y axis first (gravity is the most important axis to resolve).
-    let expanded_min_y = DVec3::new(
-        pos.x - half_w,
-        pos.y.min(pos.y + delta.y),
-        pos.z - half_w,
-    );
+    let expanded_min_y = DVec3::new(pos.x - half_w, pos.y.min(pos.y + delta.y), pos.z - half_w);
     let expanded_max_y = DVec3::new(
         pos.x + half_w,
         (pos.y + height).max(pos.y + height + delta.y),
         pos.z + half_w,
     );
-    collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, expanded_min_y, expanded_max_y);
+    collect_solid_block_aabbs(
+        &mut scratch,
+        chunk_streamer,
+        registry,
+        expanded_min_y,
+        expanded_max_y,
+    );
     delta.y = resolve_axis(pos, half_w, height, delta.y, &scratch, 1);
     pos.y += delta.y;
 
     // X axis.
-    let expanded_min_x = DVec3::new(
-        pos.x.min(pos.x + delta.x) - half_w,
-        pos.y,
-        pos.z - half_w,
-    );
+    let expanded_min_x = DVec3::new(pos.x.min(pos.x + delta.x) - half_w, pos.y, pos.z - half_w);
     let expanded_max_x = DVec3::new(
         pos.x.max(pos.x + delta.x) + half_w,
         pos.y + height,
         pos.z + half_w,
     );
-    collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, expanded_min_x, expanded_max_x);
+    collect_solid_block_aabbs(
+        &mut scratch,
+        chunk_streamer,
+        registry,
+        expanded_min_x,
+        expanded_max_x,
+    );
     delta.x = resolve_axis(pos, half_w, height, delta.x, &scratch, 0);
     pos.x += delta.x;
 
     // Z axis.
-    let expanded_min_z = DVec3::new(
-        pos.x - half_w,
-        pos.y,
-        pos.z.min(pos.z + delta.z) - half_w,
-    );
+    let expanded_min_z = DVec3::new(pos.x - half_w, pos.y, pos.z.min(pos.z + delta.z) - half_w);
     let expanded_max_z = DVec3::new(
         pos.x + half_w,
         pos.y + height,
         pos.z.max(pos.z + delta.z) + half_w,
     );
-    collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, expanded_min_z, expanded_max_z);
+    collect_solid_block_aabbs(
+        &mut scratch,
+        chunk_streamer,
+        registry,
+        expanded_min_z,
+        expanded_max_z,
+    );
     delta.z = resolve_axis(pos, half_w, height, delta.z, &scratch, 2);
     pos.z += delta.z;
 
@@ -1389,10 +1425,7 @@ mod tests {
         let wall = [6.0, 4.0, 4.0, 7.0, 7.0, 6.0];
         let dx = resolve_axis(pos, half_w, height, 2.0, &[wall], 0);
         // Player right edge at 5.3, wall starts at x=6. Gap = 6.0 - 5.3 = 0.7.
-        assert!(
-            (dx - 0.7).abs() < 1e-10,
-            "expected dx=0.7, got {dx}"
-        );
+        assert!((dx - 0.7).abs() < 1e-10, "expected dx=0.7, got {dx}");
     }
 
     #[test]
@@ -1404,9 +1437,6 @@ mod tests {
         let wall = [4.0, 4.0, 6.0, 6.0, 7.0, 7.0];
         let dz = resolve_axis(pos, half_w, height, 2.0, &[wall], 2);
         // Player front edge at 5.3, wall starts at z=6. Gap = 6.0 - 5.3 = 0.7.
-        assert!(
-            (dz - 0.7).abs() < 1e-10,
-            "expected dz=0.7, got {dz}"
-        );
+        assert!((dz - 0.7).abs() < 1e-10, "expected dz=0.7, got {dz}");
     }
 }

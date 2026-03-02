@@ -220,8 +220,7 @@ impl EcsRuntime {
             &FlyCamera,
             &PhysicsBody,
         ), With<Player>>();
-        let (transform, render_transform, fly_camera, physics) =
-            query.iter(&self.world).next()?;
+        let (transform, render_transform, fly_camera, physics) = query.iter(&self.world).next()?;
 
         Some(CameraSnapshot {
             authoritative: *transform,
@@ -233,9 +232,7 @@ impl EcsRuntime {
 
     /// Check if the player is currently in fly mode.
     pub fn is_fly_mode(&mut self) -> bool {
-        let mut query = self
-            .world
-            .query_filtered::<&FlyCamera, With<Player>>();
+        let mut query = self.world.query_filtered::<&FlyCamera, With<Player>>();
         query
             .iter(&self.world)
             .next()

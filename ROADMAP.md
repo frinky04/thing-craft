@@ -10,6 +10,7 @@
 - M5 complete: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, fixed-tick block interaction requests (raycast break/place + dirty remesh propagation), per-edit column height/light refresh, and renderer frustum culling are implemented.
 - M6 complete: async lighting worker lane plus Alpha-style rendered light integration are validated end-to-end (bounded dispatch, queue-based sky/block propagation, stale-result dropping, boundary-scoped neighbor invalidation, urgent edit relight/remesh lanes, neighbor-lighting-stable meshing, and brightness-table-based face shading from propagated light).
 - M7 in progress: Wave 1 includes hotbar-driven block placement (`1..9`), finite stack state for those slots (place consumes, break pickups refill matching slots), and torch placement wired through runtime relight/remesh propagation. Wave 2 adds oak tree generation (biome-density-driven), player physics (gravity, AABB collision, jumping, fly/walk toggle via `F`), and a basic HUD (crosshair + hotbar overlay).
+- Rendering/lighting parity follow-up landed during M7: linear fog + alpha-test discard in shader, section-level (`16x16x16`) meshing/upload path, per-lane worker pools, neighbor-edge snapshot job payloads, and GPU mesh buffer pooling.
 
 ## M0 - Repository Foundation
 

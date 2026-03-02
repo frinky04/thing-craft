@@ -12,9 +12,11 @@ use winit::window::Window;
 use crate::hud::{HudUniform, HudVertex};
 use crate::mesh::{ChunkMesh, MeshVertex};
 use crate::streaming::{ChunkDebugState, ChunkResidencyState};
-use crate::world::ChunkPos;
+use crate::world::{ChunkPos, CHUNK_SECTION_COUNT, SECTION_HEIGHT};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const DEFAULT_FOG_COLOR: [f32; 3] = [0.04, 0.07, 0.12];
+const BUFFER_POOL_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
 
 pub struct Renderer<'w> {
     surface: wgpu::Surface<'w>,
@@ -30,7 +32,7 @@ pub struct Renderer<'w> {
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     scene_mesh: Option<SceneMeshGpu>,
-    chunk_meshes: HashMap<ChunkPos, SceneMeshGpu>,
+    chunk_meshes: HashMap<ChunkPos, [Option<SceneMeshGpu>; CHUNK_SECTION_COUNT]>,
     chunk_debug_states: HashMap<ChunkPos, ChunkDebugState>,
     chunk_border_mesh: Option<DebugLineMeshGpu>,
     chunk_border_mesh_dirty: bool,
@@ -42,12 +44,16 @@ pub struct Renderer<'w> {
     hud_bind_group: wgpu::BindGroup,
     hud_vertex_buffer: Option<wgpu::Buffer>,
     hud_vertex_count: u32,
+    fog_color: [f32; 3],
+    mesh_buffer_pool: MeshBufferPool,
 }
 
 struct SceneMeshGpu {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    vertex_bytes: u64,
+    index_bytes: u64,
 }
 
 struct DebugLineMeshGpu {
@@ -85,6 +91,22 @@ impl DebugLineVertex {
 #[repr(C)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    camera_pos: [f32; 3],
+    fog_start: f32,
+    fog_color: [f32; 3],
+    fog_end: f32,
+}
+
+#[derive(Default)]
+struct MeshBufferPool {
+    vertex_buffers: Vec<PooledBuffer>,
+    index_buffers: Vec<PooledBuffer>,
+    total_bytes: u64,
+}
+
+struct PooledBuffer {
+    buffer: wgpu::Buffer,
+    size: u64,
 }
 
 #[derive(Debug, Error)]
@@ -93,6 +115,96 @@ pub enum RenderError {
     OutOfMemory,
     #[error("surface timeout")]
     Timeout,
+}
+
+impl MeshBufferPool {
+    fn acquire_vertex_buffer(
+        &mut self,
+        device: &wgpu::Device,
+        required_size: u64,
+        label: &'static str,
+    ) -> wgpu::Buffer {
+        self.acquire_buffer(
+            device,
+            required_size,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            label,
+            true,
+        )
+    }
+
+    fn acquire_index_buffer(
+        &mut self,
+        device: &wgpu::Device,
+        required_size: u64,
+        label: &'static str,
+    ) -> wgpu::Buffer {
+        self.acquire_buffer(
+            device,
+            required_size,
+            wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            label,
+            false,
+        )
+    }
+
+    fn acquire_buffer(
+        &mut self,
+        device: &wgpu::Device,
+        required_size: u64,
+        usage: wgpu::BufferUsages,
+        label: &'static str,
+        vertex: bool,
+    ) -> wgpu::Buffer {
+        let bucket = if vertex {
+            &mut self.vertex_buffers
+        } else {
+            &mut self.index_buffers
+        };
+        if let Some(index) = bucket.iter().position(|entry| {
+            entry.size >= required_size && entry.size <= required_size.saturating_mul(2)
+        }) {
+            let entry = bucket.swap_remove(index);
+            self.total_bytes = self.total_bytes.saturating_sub(entry.size);
+            return entry.buffer;
+        }
+
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: required_size.max(4),
+            usage,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn recycle_vertex_buffer(&mut self, buffer: wgpu::Buffer, size: u64) {
+        self.recycle_buffer(buffer, size, true);
+    }
+
+    fn recycle_index_buffer(&mut self, buffer: wgpu::Buffer, size: u64) {
+        self.recycle_buffer(buffer, size, false);
+    }
+
+    fn recycle_buffer(&mut self, buffer: wgpu::Buffer, size: u64, vertex: bool) {
+        let bucket = if vertex {
+            &mut self.vertex_buffers
+        } else {
+            &mut self.index_buffers
+        };
+        bucket.push(PooledBuffer { buffer, size });
+        self.total_bytes = self.total_bytes.saturating_add(size);
+        while self.total_bytes > BUFFER_POOL_BYTE_BUDGET {
+            if let Some(old) = self.vertex_buffers.pop() {
+                self.total_bytes = self.total_bytes.saturating_sub(old.size);
+                continue;
+            }
+            if let Some(old) = self.index_buffers.pop() {
+                self.total_bytes = self.total_bytes.saturating_sub(old.size);
+                continue;
+            }
+            break;
+        }
+    }
 }
 
 impl<'w> Renderer<'w> {
@@ -164,6 +276,10 @@ impl<'w> Renderer<'w> {
 
         let camera_uniform = CameraUniform {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            camera_pos: [0.0, 0.0, 0.0],
+            fog_start: 0.0,
+            fog_color: DEFAULT_FOG_COLOR,
+            fog_end: 1.0,
         };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("thingcraft-camera-buffer"),
@@ -176,7 +292,7 @@ impl<'w> Renderer<'w> {
                 label: Some("thingcraft-camera-bind-group-layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -444,6 +560,8 @@ impl<'w> Renderer<'w> {
             hud_bind_group,
             hud_vertex_buffer: None,
             hud_vertex_count: 0,
+            fog_color: DEFAULT_FOG_COLOR,
+            mesh_buffer_pool: MeshBufferPool::default(),
         })
     }
 
@@ -455,8 +573,20 @@ impl<'w> Renderer<'w> {
         }
     }
 
-    pub fn update_camera(&mut self, view_proj: [[f32; 4]; 4]) {
-        let uniform = CameraUniform { view_proj };
+    pub fn update_camera(
+        &mut self,
+        view_proj: [[f32; 4]; 4],
+        camera_pos: [f32; 3],
+        fog_start: f32,
+        fog_end: f32,
+    ) {
+        let uniform = CameraUniform {
+            view_proj,
+            camera_pos,
+            fog_start,
+            fog_color: self.fog_color,
+            fog_end: fog_end.max(fog_start + 0.001),
+        };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         let matrix = Mat4::from_cols_array_2d(&view_proj);
@@ -489,45 +619,73 @@ impl<'w> Renderer<'w> {
             vertex_buffer,
             index_buffer,
             index_count: mesh.indices.len() as u32,
+            vertex_bytes: std::mem::size_of_val(mesh.vertices.as_slice()) as u64,
+            index_bytes: std::mem::size_of_val(mesh.indices.as_slice()) as u64,
         });
     }
 
-    pub fn upsert_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
+    pub fn upsert_chunk_section_mesh(&mut self, pos: ChunkPos, section_y: u8, mesh: &ChunkMesh) {
+        let index = usize::from(section_y);
+        if index >= CHUNK_SECTION_COUNT {
+            return;
+        }
+
+        let sections = self
+            .chunk_meshes
+            .entry(pos)
+            .or_insert_with(|| std::array::from_fn(|_| None));
+
+        if let Some(old_mesh) = sections[index].take() {
+            self.mesh_buffer_pool
+                .recycle_vertex_buffer(old_mesh.vertex_buffer, old_mesh.vertex_bytes);
+            self.mesh_buffer_pool
+                .recycle_index_buffer(old_mesh.index_buffer, old_mesh.index_bytes);
+        }
+
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-            self.chunk_meshes.remove(&pos);
+            if sections.iter().all(Option::is_none) {
+                self.chunk_meshes.remove(&pos);
+            }
             self.chunk_border_mesh_dirty = true;
             return;
         }
 
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("thingcraft-chunk-vertex-buffer"),
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("thingcraft-chunk-index-buffer"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-
-        self.chunk_meshes.insert(
-            pos,
-            SceneMeshGpu {
-                vertex_buffer,
-                index_buffer,
-                index_count: mesh.indices.len() as u32,
-            },
+        let vertex_bytes = std::mem::size_of_val(mesh.vertices.as_slice()) as u64;
+        let index_bytes = std::mem::size_of_val(mesh.indices.as_slice()) as u64;
+        let vertex_buffer = self.mesh_buffer_pool.acquire_vertex_buffer(
+            &self.device,
+            vertex_bytes,
+            "thingcraft-chunk-section-vertex-buffer",
         );
+        self.queue
+            .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&mesh.vertices));
+        let index_buffer = self.mesh_buffer_pool.acquire_index_buffer(
+            &self.device,
+            index_bytes,
+            "thingcraft-chunk-section-index-buffer",
+        );
+        self.queue
+            .write_buffer(&index_buffer, 0, bytemuck::cast_slice(&mesh.indices));
+
+        sections[index] = Some(SceneMeshGpu {
+            vertex_buffer,
+            index_buffer,
+            index_count: mesh.indices.len() as u32,
+            vertex_bytes,
+            index_bytes,
+        });
         self.chunk_border_mesh_dirty = true;
     }
 
     pub fn remove_chunk_mesh(&mut self, pos: ChunkPos) {
-        self.chunk_meshes.remove(&pos);
+        if let Some(sections) = self.chunk_meshes.remove(&pos) {
+            for mesh in sections.into_iter().flatten() {
+                self.mesh_buffer_pool
+                    .recycle_vertex_buffer(mesh.vertex_buffer, mesh.vertex_bytes);
+                self.mesh_buffer_pool
+                    .recycle_index_buffer(mesh.index_buffer, mesh.index_bytes);
+            }
+        }
         self.chunk_border_mesh_dirty = true;
     }
 
@@ -653,9 +811,9 @@ impl<'w> Renderer<'w> {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.04,
-                            g: 0.07,
-                            b: 0.12,
+                            r: self.fog_color[0] as f64,
+                            g: self.fog_color[1] as f64,
+                            b: self.fog_color[2] as f64,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -689,18 +847,29 @@ impl<'w> Renderer<'w> {
                 render_pass.set_bind_group(1, &self.terrain_bind_group, &[]);
                 let frustum = self.camera_frustum.as_ref();
                 let mut visible = 0_usize;
-                for (pos, chunk_mesh) in &self.chunk_meshes {
-                    if frustum.is_some_and(|view| !view.intersects_chunk(*pos)) {
-                        continue;
-                    }
+                for (pos, sections) in &self.chunk_meshes {
+                    let mut chunk_visible = false;
+                    for (section_y, chunk_mesh) in sections.iter().enumerate() {
+                        let Some(chunk_mesh) = chunk_mesh else {
+                            continue;
+                        };
+                        if frustum.is_some_and(|view| {
+                            !view.intersects_chunk_section(*pos, section_y as u8)
+                        }) {
+                            continue;
+                        }
 
-                    render_pass.set_vertex_buffer(0, chunk_mesh.vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(
-                        chunk_mesh.index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
-                    visible += 1;
+                        render_pass.set_vertex_buffer(0, chunk_mesh.vertex_buffer.slice(..));
+                        render_pass.set_index_buffer(
+                            chunk_mesh.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
+                        chunk_visible = true;
+                    }
+                    if chunk_visible {
+                        visible += 1;
+                    }
                 }
                 self.visible_chunk_meshes = visible;
             } else {
@@ -929,8 +1098,14 @@ impl FrustumPlanes {
         Self { planes }
     }
 
+    #[allow(dead_code)]
     fn intersects_chunk(&self, pos: ChunkPos) -> bool {
         let (min, max) = chunk_aabb(pos);
+        self.intersects_aabb(min, max)
+    }
+
+    fn intersects_chunk_section(&self, pos: ChunkPos, section_y: u8) -> bool {
+        let (min, max) = chunk_section_aabb(pos, section_y);
         self.intersects_aabb(min, max)
     }
 
@@ -951,6 +1126,13 @@ impl FrustumPlanes {
 fn chunk_aabb(pos: ChunkPos) -> ([f32; 3], [f32; 3]) {
     let min = [pos.x as f32 * 16.0, 0.0, pos.z as f32 * 16.0];
     let max = [min[0] + 16.0, 128.0, min[2] + 16.0];
+    (min, max)
+}
+
+fn chunk_section_aabb(pos: ChunkPos, section_y: u8) -> ([f32; 3], [f32; 3]) {
+    let y_min = f32::from(section_y) * SECTION_HEIGHT as f32;
+    let min = [pos.x as f32 * 16.0, y_min, pos.z as f32 * 16.0];
+    let max = [min[0] + 16.0, y_min + SECTION_HEIGHT as f32, min[2] + 16.0];
     (min, max)
 }
 
@@ -1097,6 +1279,10 @@ fn load_terrain_atlas_rgba(atlas_path: &Path) -> (u32, u32, Vec<u8>) {
 const CHUNK_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    fog_start: f32,
+    fog_color: vec3<f32>,
+    fog_end: f32,
 };
 
 @group(0) @binding(0)
@@ -1118,6 +1304,7 @@ struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) light: vec3<f32>,
+    @location(2) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -1126,13 +1313,22 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
     out.uv = input.uv;
     out.light = input.light.rgb;
+    out.world_pos = input.position;
     return out;
 }
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let texel = textureSample(terrain_atlas, terrain_sampler, input.uv);
-    return vec4<f32>(texel.rgb * input.light, texel.a);
+    if (texel.a <= 0.1) {
+        discard;
+    }
+    let lit = texel.rgb * input.light;
+    let distance_to_camera = distance(input.world_pos, camera.camera_pos);
+    let fog_span = max(camera.fog_end - camera.fog_start, 0.0001);
+    let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
+    let color = mix(lit, camera.fog_color, fog_t);
+    return vec4<f32>(color, texel.a);
 }
 "#;
 
