@@ -2,11 +2,26 @@ use crate::world::{BlockRegistry, ChunkData, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WI
 
 const AIR_ID: u8 = 0;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
-    pub emitted_light: u8,
+    pub light_rgba: [u8; 4],
+}
+
+impl MeshVertex {
+    pub const ATTRS: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Unorm8x4];
+
+    #[must_use]
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,10 +172,11 @@ fn append_face(
 
     let base_index = mesh.vertices.len() as u32;
     for (corner, tex) in face.corners.iter().zip(uv.iter()) {
+        let light = emitted_light.saturating_mul(17);
         mesh.vertices.push(MeshVertex {
             position: [base_x + corner[0], base_y + corner[1], base_z + corner[2]],
             uv: *tex,
-            emitted_light,
+            light_rgba: [light, light, light, u8::MAX],
         });
     }
 

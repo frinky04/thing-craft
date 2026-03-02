@@ -92,6 +92,7 @@ pub fn run() -> Result<()> {
     let mut fixed_clock = FixedStepClock::new(fixed_config.tick_hz, fixed_config.max_catchup_steps);
     let bootstrap_world = BootstrapWorld::alpha_bootstrap();
     let spawn_mesh = build_chunk_mesh(&bootstrap_world.spawn_chunk, &bootstrap_world.registry);
+    renderer.set_scene_mesh(&spawn_mesh);
 
     let mut last_frame_start = Instant::now();
     let mut loop_stats = LoopStats::default();
@@ -134,6 +135,23 @@ pub fn run() -> Result<()> {
                     let tick_duration = tick_timer_start.elapsed();
 
                     ecs_runtime.run_render_prep(fixed_clock.alpha() as f32);
+                    let mut frame_camera: Option<(crate::ecs::CameraSnapshot, Mat4)> = None;
+                    if let Some(snapshot) = ecs_runtime.camera_snapshot() {
+                        let direction = direction_from_angles(
+                            snapshot.interpolated.yaw,
+                            snapshot.interpolated.pitch,
+                        );
+                        let view =
+                            Mat4::look_to_rh(snapshot.interpolated.position, direction, Vec3::Y);
+                        let projection = Mat4::perspective_rh_gl(
+                            70_f32.to_radians(),
+                            renderer.viewport_aspect().max(0.001),
+                            0.05,
+                            512.0,
+                        );
+                        renderer.update_camera((projection * view).to_cols_array_2d());
+                        frame_camera = Some((snapshot, view));
+                    }
 
                     match renderer.render() {
                         Ok(()) => {}
@@ -150,17 +168,7 @@ pub fn run() -> Result<()> {
                     if let Some(report) =
                         loop_stats.record_frame(frame_delta, ticks_to_run, tick_duration)
                     {
-                        if let Some(snapshot) = ecs_runtime.camera_snapshot() {
-                            let direction = direction_from_angles(
-                                snapshot.interpolated.yaw,
-                                snapshot.interpolated.pitch,
-                            );
-                            let view = Mat4::look_to_rh(
-                                snapshot.interpolated.position,
-                                direction,
-                                Vec3::Y,
-                            );
-
+                        if let Some((snapshot, view)) = frame_camera {
                             debug!(
                                 fps = report.fps,
                                 tps = report.tps,

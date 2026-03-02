@@ -13,6 +13,7 @@ The repository currently includes a bootstrap client with:
 - Alpha-derived block registry and chunk core model (`16x16x128`, nibble light storage)
 - Deterministic Overworld chunk bootstrap with Alpha climate thresholds and waterline targeting `Y=64`
 - CPU chunk mesher with face culling + terrain atlas UV assignment (geometry generation path)
+- `wgpu` indexed draw pipeline now renders the generated startup chunk mesh
 
 ## Development Commands
 
