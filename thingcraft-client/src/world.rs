@@ -766,7 +766,7 @@ fn normalize_noise(value: f64) -> f64 {
     ((value + 1.0) * 0.5).clamp(0.0, 1.0)
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ChunkPos {
     pub x: i32,
     pub z: i32,

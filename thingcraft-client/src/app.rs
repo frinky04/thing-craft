@@ -10,7 +10,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
 use crate::ecs::EcsRuntime;
-use crate::mesh::{build_chunk_mesh, merge_meshes};
+use crate::mesh::build_region_mesh;
 use crate::renderer::{RenderError, Renderer};
 use crate::time_step::FixedStepClock;
 use crate::world::BootstrapWorld;
@@ -91,12 +91,7 @@ pub fn run() -> Result<()> {
     let fixed_config = ecs_runtime.fixed_tick_config();
     let mut fixed_clock = FixedStepClock::new(fixed_config.tick_hz, fixed_config.max_catchup_steps);
     let bootstrap_world = BootstrapWorld::alpha_bootstrap();
-    let chunk_meshes: Vec<_> = bootstrap_world
-        .spawn_region
-        .iter()
-        .map(|chunk| build_chunk_mesh(chunk, &bootstrap_world.registry))
-        .collect();
-    let spawn_mesh = merge_meshes(&chunk_meshes);
+    let spawn_mesh = build_region_mesh(&bootstrap_world.spawn_region, &bootstrap_world.registry);
     renderer.set_scene_mesh(&spawn_mesh);
 
     let mut last_frame_start = Instant::now();

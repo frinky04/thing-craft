@@ -1,4 +1,6 @@
-use crate::world::{BlockRegistry, ChunkData, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH};
+use std::collections::HashMap;
+
+use crate::world::{BlockRegistry, ChunkData, ChunkPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH};
 
 const AIR_ID: u8 = 0;
 
@@ -101,6 +103,40 @@ const FACES: [FaceDef; 6] = [
 
 #[must_use]
 pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMesh {
+    build_chunk_mesh_with_neighbor_lookup(chunk, registry, |x, y, z| neighbor_block(chunk, x, y, z))
+}
+
+#[must_use]
+pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> ChunkMesh {
+    if let [single] = chunks {
+        return build_chunk_mesh(single, registry);
+    }
+
+    let index_by_pos: HashMap<ChunkPos, usize> = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| (chunk.pos, index))
+        .collect();
+
+    let meshes: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            build_chunk_mesh_with_neighbor_lookup(chunk, registry, |x, y, z| {
+                neighbor_block_from_region(chunks, &index_by_pos, chunk.pos, x, y, z)
+            })
+        })
+        .collect();
+    merge_meshes(&meshes)
+}
+
+fn build_chunk_mesh_with_neighbor_lookup<F>(
+    chunk: &ChunkData,
+    registry: &BlockRegistry,
+    mut neighbor_lookup: F,
+) -> ChunkMesh
+where
+    F: FnMut(i32, i32, i32) -> u8,
+{
     let mut mesh = ChunkMesh::default();
     let chunk_origin_x = chunk.pos.x as f32 * CHUNK_WIDTH as f32;
     let chunk_origin_z = chunk.pos.z as f32 * CHUNK_DEPTH as f32;
@@ -117,7 +153,7 @@ pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMes
                     let nx = local_x + face.offset[0];
                     let ny = y + face.offset[1];
                     let nz = local_z + face.offset[2];
-                    let neighbor_id = neighbor_block(chunk, nx, ny, nz);
+                    let neighbor_id = neighbor_lookup(nx, ny, nz);
                     if registry.is_face_occluder(neighbor_id) {
                         continue;
                     }
@@ -164,6 +200,34 @@ fn neighbor_block(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
     }
 
     chunk.block(x as u8, y as u8, z as u8)
+}
+
+fn neighbor_block_from_region(
+    chunks: &[ChunkData],
+    index_by_pos: &HashMap<ChunkPos, usize>,
+    chunk_pos: ChunkPos,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        return AIR_ID;
+    }
+
+    let world_x = chunk_pos.x * CHUNK_WIDTH as i32 + x;
+    let world_z = chunk_pos.z * CHUNK_DEPTH as i32 + z;
+    let neighbor_chunk_pos = ChunkPos {
+        x: world_x.div_euclid(CHUNK_WIDTH as i32),
+        z: world_z.div_euclid(CHUNK_DEPTH as i32),
+    };
+    let local_x = world_x.rem_euclid(CHUNK_WIDTH as i32) as u8;
+    let local_z = world_z.rem_euclid(CHUNK_DEPTH as i32) as u8;
+
+    index_by_pos
+        .get(&neighbor_chunk_pos)
+        .map_or(AIR_ID, |index| {
+            chunks[*index].block(local_x, y as u8, local_z)
+        })
 }
 
 fn append_face(
@@ -277,6 +341,41 @@ mod tests {
             .indices
             .iter()
             .any(|index| *index >= mesh_a.vertices.len() as u32));
+    }
+
+    #[test]
+    fn region_meshing_culls_shared_boundary_faces_across_chunks() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk_a = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        let mut chunk_b = ChunkData::new(ChunkPos { x: 1, z: 0 }, AIR_ID);
+
+        chunk_a.set_block(15, 10, 5, 1);
+        chunk_b.set_block(0, 10, 5, 1);
+
+        let per_chunk_merged = merge_meshes(&[
+            build_chunk_mesh(&chunk_a, &registry),
+            build_chunk_mesh(&chunk_b, &registry),
+        ]);
+        let region_mesh = build_region_mesh(&[chunk_a, chunk_b], &registry);
+
+        assert_eq!(per_chunk_merged.vertices.len(), 48);
+        assert_eq!(per_chunk_merged.indices.len(), 72);
+        assert_eq!(region_mesh.vertices.len(), 40);
+        assert_eq!(region_mesh.indices.len(), 60);
+    }
+
+    #[test]
+    fn region_meshing_matches_single_chunk_when_isolated() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 4, z: -2 }, AIR_ID);
+        chunk.set_block(7, 20, 7, 1);
+        chunk.set_block(8, 20, 7, 1);
+
+        let single_mesh = build_chunk_mesh(&chunk, &registry);
+        let region_mesh = build_region_mesh(&[chunk], &registry);
+
+        assert_eq!(single_mesh.vertices.len(), region_mesh.vertices.len());
+        assert_eq!(single_mesh.indices.len(), region_mesh.indices.len());
     }
 
     #[test]
