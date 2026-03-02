@@ -173,7 +173,7 @@ where
                     let ny = y + face.offset[1];
                     let nz = local_z + face.offset[2];
                     let neighbor_id = neighbor_lookup(nx, ny, nz);
-                    if registry.is_face_occluder(neighbor_id) {
+                    if neighbor_id == block_id || registry.is_face_occluder(neighbor_id) {
                         continue;
                     }
 
@@ -392,6 +392,18 @@ mod tests {
         let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
         chunk.set_block(1, 1, 1, 1);
         chunk.set_block(2, 1, 1, 1);
+
+        let mesh = build_chunk_mesh(&chunk, &registry);
+        assert_eq!(mesh.vertices.len(), 40);
+        assert_eq!(mesh.indices.len(), 60);
+    }
+
+    #[test]
+    fn adjacent_ice_blocks_cull_shared_face() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        chunk.set_block(1, 1, 1, 79);
+        chunk.set_block(2, 1, 1, 79);
 
         let mesh = build_chunk_mesh(&chunk, &registry);
         assert_eq!(mesh.vertices.len(), 40);
