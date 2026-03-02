@@ -16,16 +16,17 @@ const AIR_ID: u8 = 0;
 const STONE_ID: u8 = 1;
 const GRASS_ID: u8 = 2;
 const DIRT_ID: u8 = 3;
-const SAND_ID: u8 = 12;
+const COBBLESTONE_ID: u8 = 4;
 const BEDROCK_ID: u8 = 7;
 const FLOWING_WATER_ID: u8 = 8;
 const WATER_ID: u8 = 9;
 const FLOWING_LAVA_ID: u8 = 10;
+const LAVA_ID: u8 = 11;
+const SAND_ID: u8 = 12;
 const GRAVEL_ID: u8 = 13;
 const GOLD_ORE_ID: u8 = 14;
 const IRON_ORE_ID: u8 = 15;
 const COAL_ORE_ID: u8 = 16;
-const COBBLESTONE_ID: u8 = 4;
 const MOSSY_COBBLESTONE_ID: u8 = 48;
 const MOB_SPAWNER_ID: u8 = 52;
 const DIAMOND_ORE_ID: u8 = 56;
@@ -131,7 +132,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            4,
+            COBBLESTONE_ID,
             "cobblestone",
             16,
             MaterialKind::Stone,
@@ -162,7 +163,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            8,
+            FLOWING_WATER_ID,
             "flowing_water",
             0,
             MaterialKind::Liquid,
@@ -182,7 +183,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            10,
+            FLOWING_LAVA_ID,
             "flowing_lava",
             0,
             MaterialKind::Liquid,
@@ -192,7 +193,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            11,
+            LAVA_ID,
             "lava",
             0,
             MaterialKind::Liquid,
@@ -212,7 +213,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            13,
+            GRAVEL_ID,
             "gravel",
             19,
             MaterialKind::Sand,
@@ -222,7 +223,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            14,
+            GOLD_ORE_ID,
             "gold_ore",
             32,
             MaterialKind::Stone,
@@ -232,7 +233,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            15,
+            IRON_ORE_ID,
             "iron_ore",
             33,
             MaterialKind::Stone,
@@ -242,7 +243,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            16,
+            COAL_ORE_ID,
             "coal_ore",
             34,
             MaterialKind::Stone,
@@ -275,7 +276,7 @@ impl BlockRegistry {
         add(&mut by_id, 46, "tnt", 8, MaterialKind::Wood, true, 255, 0);
         add(
             &mut by_id,
-            48,
+            MOSSY_COBBLESTONE_ID,
             "mossy_cobblestone",
             36,
             MaterialKind::Stone,
@@ -296,7 +297,7 @@ impl BlockRegistry {
         add(&mut by_id, 51, "fire", 31, MaterialKind::Fire, false, 0, 15);
         add(
             &mut by_id,
-            52,
+            MOB_SPAWNER_ID,
             "mob_spawner",
             65,
             MaterialKind::Metal,
@@ -316,7 +317,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            56,
+            DIAMOND_ORE_ID,
             "diamond_ore",
             50,
             MaterialKind::Stone,
@@ -396,7 +397,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            73,
+            REDSTONE_ORE_ID,
             "redstone_ore",
             51,
             MaterialKind::Stone,
@@ -714,6 +715,7 @@ impl BiomeSource {
 
 #[derive(Debug, Clone)]
 pub struct OverworldChunkGenerator {
+    /// Retained for population passes (caves, ores, dungeons) since noise objects are opaque.
     seed: u64,
     biome_source: BiomeSource,
     terrain_noise: Fbm<OpenSimplex>,
@@ -840,6 +842,15 @@ fn alpha_seed_multipliers(world_seed: u64) -> (i64, i64) {
     (l, m)
 }
 
+/// Derive a deterministic per-chunk seed from the Alpha multiplier pattern.
+fn alpha_chunk_seed(world_seed: u64, cx: i32, cz: i32) -> i64 {
+    let (mul_l, mul_m) = alpha_seed_multipliers(world_seed);
+    (cx as i64)
+        .wrapping_mul(mul_l)
+        .wrapping_add((cz as i64).wrapping_mul(mul_m))
+        ^ (world_seed as i64)
+}
+
 /// Minimal Java LCG state — just enough to replicate `java.util.Random`.
 fn java_random_seed(seed: i64) -> i64 {
     (seed ^ 0x5DEECE66D) & ((1_i64 << 48) - 1)
@@ -873,18 +884,12 @@ fn java_next_float(state: &mut i64) -> f32 {
 }
 
 fn carve_caves(chunk: &mut ChunkData, world_seed: u64) {
-    let (mul_l, mul_m) = alpha_seed_multipliers(world_seed);
     let cx = chunk.pos.x;
     let cz = chunk.pos.z;
 
     for source_cx in (cx - 8)..=(cx + 8) {
         for source_cz in (cz - 8)..=(cz + 8) {
-            // Per-source-chunk seed: (long)j * l + (long)k * m ^ worldSeed
-            let combined = (source_cx as i64)
-                .wrapping_mul(mul_l)
-                .wrapping_add((source_cz as i64).wrapping_mul(mul_m))
-                ^ (world_seed as i64);
-            let mut rng = java_random_seed(combined);
+            let mut rng = java_random_seed(alpha_chunk_seed(world_seed, source_cx, source_cz));
 
             // Triple-nested random for cave count, skip 14/15 chunks
             let inner = java_next_int(&mut rng, 40) + 1;
@@ -943,8 +948,8 @@ fn carve_tunnel(
 ) {
     let center_x = chunk_x as f64 * 16.0 + 8.0;
     let center_z = chunk_z as f64 * 16.0 + 8.0;
-    let mut f = 0.0_f32;
-    let mut g = 0.0_f32;
+    let mut yaw_drift = 0.0_f32;
+    let mut pitch_drift = 0.0_f32;
     let mut rng = java_random_seed(java_next_long(parent_rng));
 
     if tunnel_count <= 0 {
@@ -962,10 +967,9 @@ fn carve_tunnel(
     let gradual_pitch = java_next_int(&mut rng, 6) == 0;
 
     while tunnel < tunnel_count {
-        let h = 1.5
-            + ((tunnel as f32 * PI as f32 / tunnel_count as f32).sin() * base_width * 1.0)
-                as f64;
-        let m = h * width_height_ratio;
+        let horiz_radius = 1.5
+            + ((tunnel as f32 * PI as f32 / tunnel_count as f32).sin() * base_width) as f64;
+        let vert_radius = horiz_radius * width_height_ratio;
 
         let cos_pitch = pitch.cos();
         let sin_pitch = pitch.sin();
@@ -978,13 +982,13 @@ fn carve_tunnel(
         } else {
             pitch * 0.7
         };
-        pitch += g * 0.1;
-        yaw += f * 0.1;
+        pitch += pitch_drift * 0.1;
+        yaw += yaw_drift * 0.1;
 
-        g *= 0.9;
-        f *= 0.75;
-        g += (java_next_float(&mut rng) - java_next_float(&mut rng)) * java_next_float(&mut rng) * 2.0;
-        f += (java_next_float(&mut rng) - java_next_float(&mut rng)) * java_next_float(&mut rng) * 4.0;
+        pitch_drift *= 0.9;
+        yaw_drift *= 0.75;
+        pitch_drift += (java_next_float(&mut rng) - java_next_float(&mut rng)) * java_next_float(&mut rng) * 2.0;
+        yaw_drift += (java_next_float(&mut rng) - java_next_float(&mut rng)) * java_next_float(&mut rng) * 4.0;
 
         // Fork at midpoint
         if !is_room && tunnel == fork_point && base_width > 1.0 {
@@ -1016,12 +1020,12 @@ fn carve_tunnel(
                 return;
             }
 
-            if x >= center_x - 16.0 - h * 2.0
-                && z >= center_z - 16.0 - h * 2.0
-                && x <= center_x + 16.0 + h * 2.0
-                && z <= center_z + 16.0 + h * 2.0
+            if x >= center_x - 16.0 - horiz_radius * 2.0
+                && z >= center_z - 16.0 - horiz_radius * 2.0
+                && x <= center_x + 16.0 + horiz_radius * 2.0
+                && z <= center_z + 16.0 + horiz_radius * 2.0
             {
-                carve_ellipsoid(chunk, chunk_x, chunk_z, x, y, z, h, m);
+                carve_ellipsoid(chunk, chunk_x, chunk_z, x, y, z, horiz_radius, vert_radius);
             }
         }
 
@@ -1038,15 +1042,15 @@ fn carve_ellipsoid(
     cx: f64,
     cy: f64,
     cz: f64,
-    h: f64,
-    m: f64,
+    horiz_radius: f64,
+    vert_radius: f64,
 ) {
-    let min_x = ((cx - h).floor() as i32 - chunk_x * 16 - 1).max(0);
-    let max_x = ((cx + h).floor() as i32 - chunk_x * 16 + 1).min(16);
-    let min_y = ((cy - m).floor() as i32 - 1).max(1);
-    let max_y = ((cy + m).floor() as i32 + 1).min(120);
-    let min_z = ((cz - h).floor() as i32 - chunk_z * 16 - 1).max(0);
-    let max_z = ((cz + h).floor() as i32 - chunk_z * 16 + 1).min(16);
+    let min_x = ((cx - horiz_radius).floor() as i32 - chunk_x * 16 - 1).max(0);
+    let max_x = ((cx + horiz_radius).floor() as i32 - chunk_x * 16 + 1).min(16);
+    let min_y = ((cy - vert_radius).floor() as i32 - 1).max(1);
+    let max_y = ((cy + vert_radius).floor() as i32 + 1).min(120);
+    let min_z = ((cz - horiz_radius).floor() as i32 - chunk_z * 16 - 1).max(0);
+    let max_z = ((cz + horiz_radius).floor() as i32 - chunk_z * 16 + 1).min(16);
 
     // Check for water — abort if any water in bounding box
     for lx in min_x..max_x {
@@ -1061,13 +1065,14 @@ fn carve_ellipsoid(
     }
 
     for lx in min_x..max_x {
-        let fx = ((lx + chunk_x * 16) as f64 + 0.5 - cx) / h;
+        let fx = ((lx + chunk_x * 16) as f64 + 0.5 - cx) / horiz_radius;
         for lz in min_z..max_z {
-            let fz = ((lz + chunk_z * 16) as f64 + 0.5 - cz) / h;
+            let fz = ((lz + chunk_z * 16) as f64 + 0.5 - cz) / horiz_radius;
+            let fxz_sq = fx * fx + fz * fz;
             let mut was_grass = false;
             for ly in (min_y..max_y).rev() {
-                let fy = (ly as f64 + 0.5 - cy) / m;
-                if fy > -0.7 && fx * fx + fy * fy + fz * fz < 1.0 {
+                let fy = (ly as f64 + 0.5 - cy) / vert_radius;
+                if fy > -0.7 && fxz_sq + fy * fy < 1.0 {
                     let b = chunk.block(lx as u8, ly as u8, lz as u8);
                     if b == GRASS_ID {
                         was_grass = true;
@@ -1095,7 +1100,6 @@ fn carve_ellipsoid(
             }
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,17 +1124,11 @@ const ORE_TABLE: &[OreConfig] = &[
 ];
 
 fn populate_ores(chunk: &mut ChunkData, world_seed: u64) {
-    let (mul_l, mul_m) = alpha_seed_multipliers(world_seed);
     let cx = chunk.pos.x;
     let cz = chunk.pos.z;
 
-    // Derive per-chunk RNG using the same Alpha multiplier pattern
-    let combined = (cx as i64)
-        .wrapping_mul(mul_l)
-        .wrapping_add((cz as i64).wrapping_mul(mul_m))
-        ^ (world_seed as i64);
-    // Use SmallRng for ore placement (doesn't need Java-exact RNG)
-    let mut rng = SmallRng::seed_from_u64(combined as u64);
+    // SmallRng is fine — ore placement doesn't need Java-exact RNG sequences
+    let mut rng = SmallRng::seed_from_u64(alpha_chunk_seed(world_seed, cx, cz) as u64);
 
     let base_x = cx * 16;
     let base_z = cz * 16;
@@ -1157,55 +1155,55 @@ fn place_vein(
     let angle: f32 = rng.gen::<f32>() * PI as f32;
     let size_f = size as f32;
 
-    let d = (x as f32 + 8.0) + angle.sin() * size_f / 8.0;
-    let e = (x as f32 + 8.0) - angle.sin() * size_f / 8.0;
-    let g = (z as f32 + 8.0) + angle.cos() * size_f / 8.0;
-    let h_val = (z as f32 + 8.0) - angle.cos() * size_f / 8.0;
-    let i = (y + rng.gen_range(0..3) + 2) as f64;
-    let j = (y + rng.gen_range(0..3) + 2) as f64;
+    let vein_x_start = (x as f32 + 8.0) + angle.sin() * size_f / 8.0;
+    let vein_x_end = (x as f32 + 8.0) - angle.sin() * size_f / 8.0;
+    let vein_z_start = (z as f32 + 8.0) + angle.cos() * size_f / 8.0;
+    let vein_z_end = (z as f32 + 8.0) - angle.cos() * size_f / 8.0;
+    let vein_y_start = (y + rng.gen_range(0..3) + 2) as f64;
+    let vein_y_end = (y + rng.gen_range(0..3) + 2) as f64;
 
     let chunk_base_x = chunk.pos.x * 16;
     let chunk_base_z = chunk.pos.z * 16;
 
-    for k in 0..=size {
-        let t = k as f64 / size as f64;
-        let l = d as f64 + (e as f64 - d as f64) * t;
-        let m = i + (j - i) * t;
-        let n = g as f64 + (h_val as f64 - g as f64) * t;
+    for step in 0..=size {
+        let t = step as f64 / size as f64;
+        let interp_x = vein_x_start as f64 + (vein_x_end as f64 - vein_x_start as f64) * t;
+        let interp_y = vein_y_start + (vein_y_end - vein_y_start) * t;
+        let interp_z = vein_z_start as f64 + (vein_z_end as f64 - vein_z_start as f64) * t;
 
-        let o = rng.gen::<f64>() * size as f64 / 16.0;
-        let sin_val = ((k as f32 * PI as f32 / size_f).sin() + 1.0) as f64;
-        let p = sin_val * o + 1.0;
-        let q = sin_val * o + 1.0;
+        let radius_noise = rng.gen::<f64>() * size as f64 / 16.0;
+        let sin_val = ((step as f32 * PI as f32 / size_f).sin() + 1.0) as f64;
+        // Alpha uses identical horizontal and vertical radii (spherical cross-section)
+        let half_extent = sin_val * radius_noise + 1.0;
 
-        let r_min = (l - p / 2.0).floor() as i32;
-        let r_max = (l + p / 2.0).floor() as i32;
-        let s_min = (m - q / 2.0).floor() as i32;
-        let s_max = (m + q / 2.0).floor() as i32;
-        let t_min = (n - p / 2.0).floor() as i32;
-        let t_max = (n + p / 2.0).floor() as i32;
+        let x_min = (interp_x - half_extent / 2.0).floor() as i32;
+        let x_max = (interp_x + half_extent / 2.0).floor() as i32;
+        let y_min = (interp_y - half_extent / 2.0).floor() as i32;
+        let y_max = (interp_y + half_extent / 2.0).floor() as i32;
+        let z_min = (interp_z - half_extent / 2.0).floor() as i32;
+        let z_max = (interp_z + half_extent / 2.0).floor() as i32;
 
-        for r in r_min..=r_max {
-            let local_x = r - chunk_base_x;
+        for bx in x_min..=x_max {
+            let local_x = bx - chunk_base_x;
             if !(0..16).contains(&local_x) {
                 continue;
             }
-            let fu = (r as f64 + 0.5 - l) / (p / 2.0);
-            for s in s_min..=s_max {
-                if s < 1 || s >= CHUNK_HEIGHT as i32 {
+            let fx = (bx as f64 + 0.5 - interp_x) / (half_extent / 2.0);
+            for by in y_min..=y_max {
+                if by < 1 || by >= CHUNK_HEIGHT as i32 {
                     continue;
                 }
-                let fv = (s as f64 + 0.5 - m) / (q / 2.0);
-                for tt in t_min..=t_max {
-                    let local_z = tt - chunk_base_z;
+                let fy = (by as f64 + 0.5 - interp_y) / (half_extent / 2.0);
+                for bz in z_min..=z_max {
+                    let local_z = bz - chunk_base_z;
                     if !(0..16).contains(&local_z) {
                         continue;
                     }
-                    let fw = (tt as f64 + 0.5 - n) / (p / 2.0);
-                    if fu * fu + fv * fv + fw * fw < 1.0
-                        && chunk.block(local_x as u8, s as u8, local_z as u8) == STONE_ID
+                    let fz = (bz as f64 + 0.5 - interp_z) / (half_extent / 2.0);
+                    if fx * fx + fy * fy + fz * fz < 1.0
+                        && chunk.block(local_x as u8, by as u8, local_z as u8) == STONE_ID
                     {
-                        chunk.set_block(local_x as u8, s as u8, local_z as u8, block_id);
+                        chunk.set_block(local_x as u8, by as u8, local_z as u8, block_id);
                     }
                 }
             }
@@ -1218,17 +1216,12 @@ fn place_vein(
 // ---------------------------------------------------------------------------
 
 fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
-    let (mul_l, mul_m) = alpha_seed_multipliers(world_seed);
     let cx = chunk.pos.x;
     let cz = chunk.pos.z;
 
-    // Distinct seed from ores — offset by a constant so caves/ores/dungeons don't share state
-    let combined = (cx as i64)
-        .wrapping_mul(mul_l)
-        .wrapping_add((cz as i64).wrapping_mul(mul_m))
-        ^ (world_seed as i64)
-        ^ 0x5A5A_5A5A;
-    let mut rng = SmallRng::seed_from_u64(combined as u64);
+    // SmallRng is fine — dungeon placement doesn't need Java-exact RNG sequences.
+    // XOR with a constant to decorrelate from ore placement (same base seed).
+    let mut rng = SmallRng::seed_from_u64((alpha_chunk_seed(world_seed, cx, cz) ^ 0x5A5A_5A5A) as u64);
 
     // 8 attempts per chunk (matching Alpha)
     for _ in 0..8 {
@@ -1250,22 +1243,19 @@ fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
             continue;
         }
 
-        // Validate: floor is solid, ceiling is solid
-        let mut floor_ok = true;
-        let mut ceil_ok = true;
-        for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
+        // Validate: floor and ceiling are solid
+        let mut solid_envelope = true;
+        'envelope: for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
             for vz in (local_z - half_z - 1)..=(local_z + half_z + 1) {
                 let floor_b = chunk.block(vx as u8, (y - 1) as u8, vz as u8);
-                if floor_b == AIR_ID {
-                    floor_ok = false;
-                }
                 let ceil_b = chunk.block(vx as u8, (y + room_height + 1) as u8, vz as u8);
-                if ceil_b == AIR_ID {
-                    ceil_ok = false;
+                if floor_b == AIR_ID || ceil_b == AIR_ID {
+                    solid_envelope = false;
+                    break 'envelope;
                 }
             }
         }
-        if !floor_ok || !ceil_ok {
+        if !solid_envelope {
             continue;
         }
 
