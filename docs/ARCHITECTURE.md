@@ -45,7 +45,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
   - computes residency deltas,
   - dispatches bounded job batches per frame,
   - consumes async worker results,
-  - rebuilds the merged scene mesh when ready/evicted chunk sets change.
+  - applies per-chunk render updates (GPU upsert/remove) from worker results.
 - This keeps heavy world build steps off the render path while preserving deterministic state ownership on the main thread.
 
 ## Networking-Ready Input Pattern

@@ -23,6 +23,7 @@
 - [x] Oak log top/bottom face atlas mapping added (cap texture on `+Y/-Y`, side texture on lateral faces).
 - [x] Chunk residency manager added with lifecycle states (`Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`) around a camera-centered radius.
 - [x] Background generation and meshing workers added (main thread now schedules jobs and applies async results).
+- [x] Renderer now supports incremental per-chunk mesh uploads/removals (avoids full merged scene re-upload on each boundary crossing).
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
 
