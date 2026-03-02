@@ -489,6 +489,7 @@ impl BlockRegistry {
         match (block_id, face_offset[1]) {
             (GRASS_ID, 1) => 0,
             (GRASS_ID, -1) => self.sprite_index_of(DIRT_ID),
+            (17, 1 | -1) => 21,
             _ => self.sprite_index_of(block_id),
         }
     }
@@ -1104,6 +1105,14 @@ mod tests {
         assert_eq!(registry.sprite_index_for_face(GRASS_ID, [0, 1, 0]), 0);
         assert_eq!(registry.sprite_index_for_face(GRASS_ID, [0, -1, 0]), 2);
         assert_eq!(registry.sprite_index_for_face(GRASS_ID, [1, 0, 0]), 3);
+    }
+
+    #[test]
+    fn oak_log_uses_cap_texture_on_top_and_bottom() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert_eq!(registry.sprite_index_for_face(17, [0, 1, 0]), 21);
+        assert_eq!(registry.sprite_index_for_face(17, [0, -1, 0]), 21);
+        assert_eq!(registry.sprite_index_for_face(17, [1, 0, 0]), 20);
     }
 
     #[test]
