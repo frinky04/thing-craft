@@ -36,6 +36,18 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - Bootstrap startup currently pre-generates a small region (`3x3` chunks) and builds one combined region mesh for first render.
 - The renderer owns GPU buffers/pipeline and draws chunk mesh indices each frame using camera view-projection uniforms and the Alpha terrain atlas texture.
 
+## Streaming and Jobs
+
+- Runtime chunk residency is managed with explicit states: `Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`.
+- Residency targets are derived from the camera chunk position with a configurable square radius.
+- Chunk generation and chunk meshing run on dedicated worker threads.
+- The main thread only:
+  - computes residency deltas,
+  - dispatches bounded job batches per frame,
+  - consumes async worker results,
+  - rebuilds the merged scene mesh when ready/evicted chunk sets change.
+- This keeps heavy world build steps off the render path while preserving deterministic state ownership on the main thread.
+
 ## Networking-Ready Input Pattern
 
 Input is represented as commands (`SimCommandEvent`) that are processed by simulation.
