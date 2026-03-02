@@ -31,12 +31,13 @@ const APPLY_STREAM_UPDATES_TO_RENDERER: bool = true;
 const BLOCK_INTERACTION_REACH_BLOCKS: f64 = 5.0;
 const AIR_BLOCK_ID: u8 = 0;
 const HOTBAR_BLOCK_IDS: [u8; 9] = [3, 1, 4, 12, 13, 17, 5, 20, 50];
+const HOTBAR_STACK_LIMIT: u8 = 64;
 const EDIT_LATENCY_SAMPLE_WINDOW: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
 enum BlockInteractionKind {
     Break,
-    Place { block_id: u8 },
+    Place { slot: usize },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +51,17 @@ struct BlockInteractionRequest {
 struct BlockRayHit {
     block: [i32; 3],
     normal: [i32; 3],
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct HotbarSlot {
+    block_id: u8,
+    count: u8,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct HotbarInventory {
+    slots: [HotbarSlot; HOTBAR_BLOCK_IDS.len()],
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +96,49 @@ struct EditLatencyMetrics {
     latest_ms: f64,
     avg_ms: f64,
     p95_ms: f64,
+}
+
+impl HotbarInventory {
+    fn alpha_defaults() -> Self {
+        Self {
+            slots: HOTBAR_BLOCK_IDS.map(|block_id| HotbarSlot {
+                block_id,
+                count: HOTBAR_STACK_LIMIT,
+            }),
+        }
+    }
+
+    fn slot(&self, index: usize) -> Option<HotbarSlot> {
+        self.slots.get(index).copied()
+    }
+
+    fn try_consume_from_slot(&mut self, index: usize) -> bool {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        if slot.count == 0 {
+            return false;
+        }
+        slot.count -= 1;
+        true
+    }
+
+    fn try_pickup_block(&mut self, block_id: u8) -> bool {
+        if block_id == AIR_BLOCK_ID {
+            return false;
+        }
+
+        let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.block_id == block_id && slot.count < HOTBAR_STACK_LIMIT)
+        else {
+            return false;
+        };
+
+        slot.count += 1;
+        true
+    }
 }
 
 impl LoopStats {
@@ -220,7 +275,14 @@ pub fn run() -> Result<()> {
     let mut mouse_captured = false;
     let mut block_interaction_requests = VecDeque::new();
     let mut edit_latency_tracker = EditLatencyTracker::default();
-    let mut selected_place_block_id = HOTBAR_BLOCK_IDS[0];
+    let mut hotbar_inventory = HotbarInventory::alpha_defaults();
+    let mut selected_hotbar_slot = 0_usize;
+    let selected_slot = hotbar_inventory
+        .slot(selected_hotbar_slot)
+        .unwrap_or(HotbarSlot {
+            block_id: AIR_BLOCK_ID,
+            count: 0,
+        });
 
     info!(
         tick_hz = fixed_config.tick_hz,
@@ -238,7 +300,8 @@ pub fn run() -> Result<()> {
         stream_light_budget = residency_config.max_lighting_dispatch,
         stream_mesh_budget = residency_config.max_meshing_dispatch,
         selected_hotbar_slot = 1,
-        selected_place_block = selected_place_block_id,
+        selected_place_block = selected_slot.block_id,
+        selected_place_count = selected_slot.count,
         "thingcraft client booted"
     );
 
@@ -266,6 +329,7 @@ pub fn run() -> Result<()> {
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
                             &mut edit_latency_tracker,
+                            &mut hotbar_inventory,
                         );
                     }
                     let tick_duration = tick_timer_start.elapsed();
@@ -401,16 +465,22 @@ pub fn run() -> Result<()> {
 
                         if is_pressed && !event.repeat {
                             if let Some(slot) = hotbar_slot_for_key(code) {
-                                let block_id = HOTBAR_BLOCK_IDS[slot];
+                                selected_hotbar_slot = slot;
+                                let slot_state = hotbar_inventory.slot(slot).unwrap_or(HotbarSlot {
+                                    block_id: AIR_BLOCK_ID,
+                                    count: 0,
+                                });
+                                let block_id = slot_state.block_id;
+                                let count = slot_state.count;
                                 if bootstrap_world.registry.is_defined_block(block_id) {
-                                    selected_place_block_id = block_id;
                                     let block_name = bootstrap_world
                                         .registry
                                         .get(block_id)
                                         .map_or("unknown", |block| block.name);
                                     info!(
                                         hotbar_slot = slot + 1,
-                                        place_block_id = selected_place_block_id,
+                                        place_block_id = block_id,
+                                        place_stack_count = count,
                                         place_block_name = block_name,
                                         "updated selected placement block"
                                     );
@@ -464,7 +534,7 @@ pub fn run() -> Result<()> {
                         &mut ecs_runtime,
                         &mut block_interaction_requests,
                         BlockInteractionKind::Place {
-                            block_id: selected_place_block_id,
+                            slot: selected_hotbar_slot,
                         },
                     );
                 }
@@ -529,9 +599,15 @@ fn process_block_interaction_requests(
     chunk_streamer: &mut ChunkStreamer,
     queue: &mut VecDeque<BlockInteractionRequest>,
     edit_latency_tracker: &mut EditLatencyTracker,
+    hotbar_inventory: &mut HotbarInventory,
 ) {
     while let Some(request) = queue.pop_front() {
-        process_single_block_interaction_request(chunk_streamer, request, edit_latency_tracker);
+        process_single_block_interaction_request(
+            chunk_streamer,
+            request,
+            edit_latency_tracker,
+            hotbar_inventory,
+        );
     }
 }
 
@@ -539,6 +615,7 @@ fn process_single_block_interaction_request(
     chunk_streamer: &mut ChunkStreamer,
     request: BlockInteractionRequest,
     edit_latency_tracker: &mut EditLatencyTracker,
+    hotbar_inventory: &mut HotbarInventory,
 ) {
     let Some(hit) = raycast_first_solid_block(
         request.origin,
@@ -551,19 +628,31 @@ fn process_single_block_interaction_request(
 
     match request.kind {
         BlockInteractionKind::Break => {
+            let broken_block_id = chunk_streamer
+                .block_at_world(hit.block[0], hit.block[1], hit.block[2])
+                .unwrap_or(AIR_BLOCK_ID);
             if chunk_streamer.set_block_at_world(
                 hit.block[0],
                 hit.block[1],
                 hit.block[2],
                 AIR_BLOCK_ID,
             ) {
+                hotbar_inventory.try_pickup_block(broken_block_id);
                 edit_latency_tracker.record_block_edit(hit.block[0], hit.block[2]);
             }
         }
-        BlockInteractionKind::Place { block_id } => {
+        BlockInteractionKind::Place { slot } => {
             if hit.normal == [0, 0, 0] {
                 return;
             }
+            let Some(slot_data) = hotbar_inventory.slot(slot) else {
+                return;
+            };
+            if slot_data.count == 0 {
+                return;
+            }
+
+            let block_id = slot_data.block_id;
             let [x, y, z] = hit.block;
             let Some(place_x) = x.checked_add(hit.normal[0]) else {
                 return;
@@ -578,6 +667,7 @@ fn process_single_block_interaction_request(
             if chunk_streamer.block_at_world(place_x, place_y, place_z) == Some(AIR_BLOCK_ID)
                 && chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id)
             {
+                hotbar_inventory.try_consume_from_slot(slot);
                 edit_latency_tracker.record_block_edit(place_x, place_z);
             }
         }
@@ -827,7 +917,8 @@ mod tests {
 
     use super::{
         affected_chunks_for_block_edit, has_target_directive, hotbar_slot_for_key, parse_env_u32,
-        raycast_first_solid_block, BlockRayHit, AIR_BLOCK_ID, HOTBAR_BLOCK_IDS,
+        raycast_first_solid_block, BlockRayHit, HotbarInventory, AIR_BLOCK_ID, HOTBAR_BLOCK_IDS,
+        HOTBAR_STACK_LIMIT,
     };
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
 
@@ -884,6 +975,51 @@ mod tests {
         for block_id in HOTBAR_BLOCK_IDS {
             assert!(registry.is_defined_block(block_id));
         }
+    }
+
+    #[test]
+    fn hotbar_defaults_start_full_stacks() {
+        let hotbar = HotbarInventory::alpha_defaults();
+        for (slot_index, slot) in hotbar.slots.iter().enumerate() {
+            assert_eq!(slot.block_id, HOTBAR_BLOCK_IDS[slot_index]);
+            assert_eq!(slot.count, HOTBAR_STACK_LIMIT);
+        }
+    }
+
+    #[test]
+    fn hotbar_consume_stops_at_zero() {
+        let mut hotbar = HotbarInventory::alpha_defaults();
+        let slot = 0;
+        for _ in 0..HOTBAR_STACK_LIMIT {
+            assert!(hotbar.try_consume_from_slot(slot));
+        }
+        assert!(!hotbar.try_consume_from_slot(slot));
+        assert_eq!(hotbar.slot(slot).map(|state| state.count), Some(0));
+    }
+
+    #[test]
+    fn hotbar_pickup_requires_matching_slot_and_stack_space() {
+        let mut hotbar = HotbarInventory::alpha_defaults();
+        let dirt_slot = 0;
+        assert!(hotbar.try_consume_from_slot(dirt_slot));
+        assert_eq!(
+            hotbar.slot(dirt_slot),
+            Some(super::HotbarSlot {
+                block_id: HOTBAR_BLOCK_IDS[dirt_slot],
+                count: HOTBAR_STACK_LIMIT - 1,
+            })
+        );
+
+        assert!(hotbar.try_pickup_block(HOTBAR_BLOCK_IDS[dirt_slot]));
+        assert_eq!(
+            hotbar.slot(dirt_slot),
+            Some(super::HotbarSlot {
+                block_id: HOTBAR_BLOCK_IDS[dirt_slot],
+                count: HOTBAR_STACK_LIMIT,
+            })
+        );
+        assert!(!hotbar.try_pickup_block(HOTBAR_BLOCK_IDS[dirt_slot]));
+        assert!(!hotbar.try_pickup_block(2));
     }
 
     #[test]

@@ -31,6 +31,7 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Incremental streaming meshing now includes cardinal neighbor context and neighbor remesh triggers (prevents interior seam faces between loaded chunks).
 - [x] Dirty/remesh propagation groundwork added: geometry dirty tracking per chunk, edge-propagated neighbor remesh marking, and remesh counters in runtime metrics.
 - [x] Block interaction vertical slice added: camera voxel raycast emits break/place requests, fixed-tick world mutation applies them, and edited chunks trigger boundary-safe remesh propagation.
+- [x] Hotbar inventory state scaffold added: slots `1..9` now maintain finite stacks (64 max), successful placement consumes stack counts, and break actions refill matching slots.
 - [x] Block edits now refresh per-column height/sky and emitted-light seeds (including touched boundary-neighbor columns) to keep chunk metadata coherent after runtime world mutation.
 - [x] Edit-path scheduling now has urgent lighting/meshing lanes, preserving near-player block update responsiveness under large view radii while background generation queues are full.
 - [x] Meshing dispatch now waits for neighboring lighting stabilization to reduce transient chunk-border seam artifacts during asynchronous relight churn.

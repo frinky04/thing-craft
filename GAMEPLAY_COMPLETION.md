@@ -19,7 +19,8 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [x] Light Spread: Sunlight and block light both spread with 1-level attenuation per step, including cross-chunk boundary seeding/propagation.
 
 ## Blocks and Items
-- [~] Placement Controls: Hotbar slot selection (`1..9`) now drives right-click block placement (torch included); inventory stack/state rules remain pending.
+- [x] Placement Controls: Hotbar slot selection (`1..9`) drives right-click block placement (torch included), with finite slot stacks (64 max) that consume on successful placement and refill on matching-block pickup from break actions.
+- [~] Inventory Model: Runtime supports hotbar slot stack state only; broader Alpha survival inventory/crafting container behavior remains pending.
 - [ ] Core Blocks: Stone, Cobblestone, Dirt, Grass, Wood (only Oak native, Birch/Pine data values only), Planks, Leaves, Glass, Sand, Gravel, Bedrock.
 - [ ] Mechanics Blocks: TNT, Doors, Ladders, Torches, Signs, Furnaces, Crafting Tables, Chests.
 - [ ] Liquids: Flowing and stationary Water and Lava.
