@@ -728,6 +728,7 @@ where
                             tint,
                             face_sky,
                             face_block_light,
+                            registry.is_leaves(block_id),
                             FaceAdjust::OPAQUE,
                         );
                     }
@@ -1189,6 +1190,7 @@ fn append_face(
     tint_rgb: [u8; 3],
     neighbor_sky_light: u8,
     neighbor_block_light: u8,
+    is_leaves: bool,
     adjust: FaceAdjust,
 ) {
     let atlas_tile = 1.0 / 16.0;
@@ -1217,7 +1219,12 @@ fn append_face(
             position: [base_pos[0] + corner[0], pos_y, base_pos[2] + corner[2]],
             uv: *tex,
             tint_rgba: [tint_rgb[0], tint_rgb[1], tint_rgb[2], adjust.vertex_alpha],
-            light_data: [neighbor_sky_light, neighbor_block_light, face_scale, 0],
+            light_data: [
+                neighbor_sky_light,
+                neighbor_block_light,
+                face_scale,
+                u8::from(is_leaves),
+            ],
         });
     }
 
@@ -1539,6 +1546,7 @@ mod tests {
                 .round()
                 .clamp(0.0, 255.0) as u8;
             assert_eq!(vertex.light_data[2], expected_scale);
+            assert_eq!(vertex.light_data[3], 0);
         }
 
         block[ChunkData::index(2, 1, 1)] = 14;
@@ -1548,5 +1556,16 @@ mod tests {
         let east = mesh.vertices[4];
         assert_eq!(east.light_data[0], 2);
         assert_eq!(east.light_data[1], 14);
+    }
+
+    #[test]
+    fn leaves_faces_encode_leaf_marker_for_shader_mode_switching() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        chunk.set_block(1, 1, 1, 18);
+
+        let mesh = build_chunk_mesh(&chunk, &registry);
+        assert!(!mesh.vertices.is_empty());
+        assert!(mesh.vertices.iter().all(|vertex| vertex.light_data[3] == 1));
     }
 }

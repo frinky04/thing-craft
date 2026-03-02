@@ -577,6 +577,11 @@ impl BlockRegistry {
     }
 
     #[must_use]
+    pub fn is_leaves(&self, block_id: u8) -> bool {
+        block_id == OAK_LEAVES_ID
+    }
+
+    #[must_use]
     pub fn is_water(&self, block_id: u8) -> bool {
         matches!(block_id, FLOWING_WATER_ID | WATER_ID)
     }

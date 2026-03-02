@@ -21,6 +21,7 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [x] Distance Fog: Linear distance fog blending is active, and clear-fog color now uses Alpha-style player-brightness modulation (`fogBrightness` smoothing/interpolation with view-distance bias).
 - [~] Sky/Cloud Atmosphere: Alpha fog clear-color mixing, far/normal sky-color pass, and non-fancy moving cloud layer are implemented; sun/moon/stars/sunrise disc rendering is still pending.
 - [x] Alpha Test: Terrain shader now discards low-alpha texels (Alpha-style cutout behavior).
+- [x] Leaf Graphics Modes: Runtime now supports fancy cutout leaves and fast opaque leaves (via `THINGCRAFT_FANCY_GRAPHICS`), matching Alpha's visual mode split.
 
 ## Blocks and Items
 - [x] Placement Controls: Hotbar slot selection (`1..9`) drives right-click block placement (torch included), with finite slot stacks (64 max) that consume on successful placement and refill on matching-block pickup from break actions.

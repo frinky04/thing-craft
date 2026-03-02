@@ -6,6 +6,8 @@ This report compares the rendering pipeline of the original Minecraft Alpha v1.2
 
 Overall, the core terrain rendering — lighting model, face shading, fog formula, biome tinting, and water texture animation — is faithfully reproduced. The main visual discrepancies stem from **missing atmospheric passes** (sky dome, celestial bodies, sunrise/sunset) and **missing HUD elements** (held item, health bar, item icons in hotbar).
 
+> Post-report implementation update: leaf rendering now supports both Alpha-style fancy cutout and fast opaque modes (`THINGCRAFT_FANCY_GRAPHICS`), so item #2 in recommendations has been addressed.
+
 ---
 
 ## 1. Render Pass Order
@@ -481,7 +483,7 @@ The hotbar in Thingcraft is placeholder-quality — gray boxes with no item icon
 
 1. **Implement block-in-hand rendering** — Highest visual impact. Requires item mesh generation, separate depth space, and swing animation. Reference: `ItemInHandRenderer.java:40–204`.
 
-2. **Add fast-mode opaque leaves** — Add a graphics toggle that renders leaf blocks without alpha discard, matching MC Alpha's fast-mode appearance. Simple: skip the `discard` in the fragment shader when the block ID is a leaf type and fast graphics is enabled.
+2. **Add fast-mode opaque leaves** — **Done**. Thingcraft now exposes a graphics toggle (`THINGCRAFT_FANCY_GRAPHICS`) and switches leaves between fancy cutout and fast opaque behavior.
 
 3. **Implement sky dome with horizon gradient** — Replace flat sky triangle with a vertex-colored hemisphere. Apply the existing fog formula to the dome vertices to get natural horizon blending. Reference: `WorldRenderer.java:532–624`.
 

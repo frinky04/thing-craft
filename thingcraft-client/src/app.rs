@@ -345,6 +345,8 @@ pub fn run() -> Result<()> {
     // with winit's long-lived event loop closure.
     let window: &'static Window = Box::leak(Box::new(window));
     let mut renderer = pollster::block_on(Renderer::new(window))?;
+    let fancy_graphics = resolve_fancy_graphics();
+    renderer.set_leaf_cutout_enabled(fancy_graphics);
 
     let mut ecs_runtime = EcsRuntime::new();
     let fixed_config = ecs_runtime.fixed_tick_config();
@@ -411,6 +413,7 @@ pub fn run() -> Result<()> {
         fluid_tick_budget = base_fluid_tick_budget,
         fluid_tick_budget_min = adaptive_fluid_budget.min(),
         fluid_tick_budget_max = adaptive_fluid_budget.max(),
+        fancy_graphics,
         selected_hotbar_slot = 1,
         selected_place_block = selected_slot.block_id,
         selected_place_count = selected_slot.count,
@@ -1175,12 +1178,28 @@ fn resolve_fluid_tick_budget() -> usize {
         .clamp(1, FLUID_TICK_BUDGET_HARD_MAX)
 }
 
+fn resolve_fancy_graphics() -> bool {
+    parse_env_bool("THINGCRAFT_FANCY_GRAPHICS").unwrap_or(true)
+}
+
 fn parse_env_u32(key: &str) -> Option<u32> {
     let raw = std::env::var(key).ok()?;
     match raw.parse::<u32>() {
         Ok(value) => Some(value),
         Err(err) => {
             warn!(env = key, value = %raw, ?err, "invalid env override; using default");
+            None
+        }
+    }
+}
+
+fn parse_env_bool(key: &str) -> Option<bool> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            warn!(env = key, value = %raw, "invalid bool env override; using default");
             None
         }
     }
@@ -1597,9 +1616,9 @@ mod tests {
     use super::{
         affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
         alpha_brightness_from_light_level, alpha_fog_brightness_target, alpha_time_of_day,
-        has_target_directive, hotbar_slot_for_key, parse_env_u32, raycast_first_solid_block,
-        resolve_axis, AdaptiveFluidBudget, BlockRayHit, HotbarInventory, AIR_BLOCK_ID,
-        HOTBAR_BLOCK_IDS, HOTBAR_STACK_LIMIT,
+        has_target_directive, hotbar_slot_for_key, parse_env_bool, parse_env_u32,
+        raycast_first_solid_block, resolve_axis, AdaptiveFluidBudget, BlockRayHit, HotbarInventory,
+        AIR_BLOCK_ID, HOTBAR_BLOCK_IDS, HOTBAR_STACK_LIMIT,
     };
     use crate::streaming::{ChunkStreamer, ResidencyConfig};
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
@@ -1620,6 +1639,17 @@ mod tests {
     #[test]
     fn env_u32_parser_handles_valid_and_invalid_values() {
         assert_eq!(parse_env_u32("THINGCRAFT_TEST_MISSING"), None);
+    }
+
+    #[test]
+    fn env_bool_parser_accepts_common_true_false_forms() {
+        std::env::set_var("THINGCRAFT_TEST_BOOL", "true");
+        assert_eq!(parse_env_bool("THINGCRAFT_TEST_BOOL"), Some(true));
+        std::env::set_var("THINGCRAFT_TEST_BOOL", "0");
+        assert_eq!(parse_env_bool("THINGCRAFT_TEST_BOOL"), Some(false));
+        std::env::set_var("THINGCRAFT_TEST_BOOL", "nope");
+        assert_eq!(parse_env_bool("THINGCRAFT_TEST_BOOL"), None);
+        std::env::remove_var("THINGCRAFT_TEST_BOOL");
     }
 
     #[test]

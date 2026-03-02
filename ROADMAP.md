@@ -16,6 +16,7 @@
 - Liquid rendering parity follow-up landed during M7: per-frame Alpha-style `WaterSprite`/`WaterSideSprite` texture simulation is now applied to atlas tiles (including side-sprite 2x2 replication), and liquid top faces use Alpha flow-angle UV mapping with side-sprite selection when flow exists.
 - Atmosphere parity follow-up landed during M7: fog clear color now follows Alpha sky/fog biome blending rules, far/normal view distances now render a dedicated sky pass (Alpha-like blue daytime sky), and a non-fancy Alpha cloud layer (`environment/clouds.png`, Y=120.33, 0.03 scroll speed, day-tinted cloud color) is rendered with depth-aware blending + fog.
 - Fog parity follow-up landed during M7: clear-fog color is now multiplied by Alpha-style smoothed player-position fog brightness (`world.getBrightness` + view-distance bias + tick smoothing/interpolation), restoring underground/shadow fog darkening behavior.
+- Leaf rendering parity follow-up landed during M7: leaf vertices now carry a dedicated material marker and runtime `THINGCRAFT_FANCY_GRAPHICS` controls fancy cutout leaves (`true`) vs fast opaque leaves (`false`, with Alpha tile `+1` remap).
 
 ## M0 - Repository Foundation
 

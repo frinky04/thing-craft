@@ -61,7 +61,7 @@ pub struct Renderer<'w> {
     cloud_color: [f32; 3],
     cloud_scroll: f32,
     ambient_darkness: f32,
-    daylight_factor: f32,
+    leaf_cutout_enabled: f32,
     camera_pos: [f32; 3],
     mesh_buffer_pool: MeshBufferPool,
 }
@@ -140,7 +140,7 @@ struct CameraUniform {
     fog_color: [f32; 3],
     fog_end: f32,
     ambient_darkness: f32,
-    daylight_factor: f32,
+    leaf_cutout_enabled: f32,
     _pad: [f32; 2],
 }
 
@@ -469,7 +469,7 @@ impl<'w> Renderer<'w> {
             fog_color: DEFAULT_FOG_COLOR,
             fog_end: 1.0,
             ambient_darkness: 0.0,
-            daylight_factor: 1.0,
+            leaf_cutout_enabled: 1.0,
             _pad: [0.0; 2],
         };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -991,7 +991,7 @@ impl<'w> Renderer<'w> {
             cloud_color: [1.0, 1.0, 1.0],
             cloud_scroll: 0.0,
             ambient_darkness: 0.0,
-            daylight_factor: 1.0,
+            leaf_cutout_enabled: 1.0,
             camera_pos: [0.0; 3],
             mesh_buffer_pool: MeshBufferPool::default(),
         })
@@ -1019,7 +1019,7 @@ impl<'w> Renderer<'w> {
             fog_color: self.fog_color,
             fog_end: fog_end.max(fog_start + 0.001),
             ambient_darkness: self.ambient_darkness,
-            daylight_factor: self.daylight_factor,
+            leaf_cutout_enabled: self.leaf_cutout_enabled,
             _pad: [0.0; 2],
         };
         self.queue
@@ -1040,13 +1040,16 @@ impl<'w> Renderer<'w> {
         self.sky_color = sky_color;
         self.render_sky = render_sky;
         self.ambient_darkness = f32::from(ambient_darkness.min(11));
-        self.daylight_factor = (15.0 - self.ambient_darkness).clamp(0.0, 15.0) / 15.0;
         let uniform = SkyUniform {
             color: self.sky_color,
             _pad: 0.0,
         };
         self.queue
             .write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    pub fn set_leaf_cutout_enabled(&mut self, enabled: bool) {
+        self.leaf_cutout_enabled = if enabled { 1.0 } else { 0.0 };
     }
 
     pub fn set_cloud_state(&mut self, cloud_color: [f32; 3], cloud_scroll: f32) {
@@ -2248,7 +2251,7 @@ struct Camera {
     fog_color: vec3<f32>,
     fog_end: f32,
     ambient_darkness: f32,
-    daylight_factor: f32,
+    leaf_cutout_enabled: f32,
     _pad: vec2<f32>,
 };
 
@@ -2276,6 +2279,7 @@ struct VertexOut {
     @location(3) block_light: f32,
     @location(4) face_scale: f32,
     @location(5) world_pos: vec3<f32>,
+    @location(6) leaf_marker: f32,
 };
 
 @vertex
@@ -2287,6 +2291,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.sky_light = f32(input.light_data.x);
     out.block_light = f32(input.light_data.y);
     out.face_scale = f32(input.light_data.z) / 255.0;
+    out.leaf_marker = f32(input.light_data.w);
     out.world_pos = input.position;
     return out;
 }
@@ -2300,8 +2305,14 @@ fn alpha_brightness(level: f32) -> f32 {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-    let texel = textureSample(terrain_atlas, terrain_sampler, input.uv);
-    if (texel.a <= 0.1) {
+    let leaf_fast = input.leaf_marker > 0.5 && camera.leaf_cutout_enabled < 0.5;
+    let uv = if (leaf_fast) {
+        input.uv + vec2<f32>(1.0 / 16.0, 0.0)
+    } else {
+        input.uv
+    };
+    let texel = textureSample(terrain_atlas, terrain_sampler, uv);
+    if (texel.a <= 0.1 && !leaf_fast) {
         discard;
     }
     let day_sky = max(input.sky_light - camera.ambient_darkness, 0.0);
@@ -2309,7 +2320,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let brightness = alpha_brightness(effective);
     let shade = input.face_scale * brightness;
     let lit = texel.rgb * input.tint.rgb * shade;
-    let alpha = texel.a * input.tint.a;
+    let alpha = select(texel.a * input.tint.a, input.tint.a, leaf_fast);
     let distance_to_camera = distance(input.world_pos, camera.camera_pos);
     let fog_span = max(camera.fog_end - camera.fog_start, 0.0001);
     let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
@@ -2351,7 +2362,7 @@ struct Camera {
     fog_color: vec3<f32>,
     fog_end: f32,
     ambient_darkness: f32,
-    daylight_factor: f32,
+    leaf_cutout_enabled: f32,
     _pad: vec2<f32>,
 };
 
