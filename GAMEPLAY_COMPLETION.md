@@ -14,9 +14,9 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [~] Structures: Dungeon rooms with mob spawner blocks placed (chest inventory and spawner entity config require M7 entity/inventory systems).
 
 ## Graphics and Lighting
-- [~] Lighting Engine: Async queue-based propagation foundation is in place; strict parity validation and full rendered-light usage remain.
-- [ ] Light Levels: 16 levels of light (0 to 15).
-- [ ] Light Spread: Sunlight drops by 1 per block horizontally and vertically. Block light (torches, glowstone) spreads identically.
+- [x] Lighting Engine: Async queue propagation and rendered-light sampling are integrated with boundary-aware neighbor relight/remesh invalidation and stale-result dropping.
+- [x] Light Levels: 16 levels (0..15) are represented in data + render mapping.
+- [x] Light Spread: Sunlight and block light both spread with 1-level attenuation per step, including cross-chunk boundary seeding/propagation.
 
 ## Blocks and Items
 - [ ] Core Blocks: Stone, Cobblestone, Dirt, Grass, Wood (only Oak native, Birch/Pine data values only), Planks, Leaves, Glass, Sand, Gravel, Bedrock.

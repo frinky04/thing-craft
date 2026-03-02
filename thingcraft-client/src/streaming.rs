@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -13,6 +12,9 @@ use crate::world::{
     CHUNK_WIDTH,
 };
 
+const MAX_IN_FLIGHT_MULTIPLIER: usize = 4;
+const MAX_URGENT_DISPATCH_BURST: usize = 4;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ChunkResidencyState {
     Requested,
@@ -20,6 +22,12 @@ pub enum ChunkResidencyState {
     Meshing,
     Ready,
     Evicting,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WorkPriority {
+    Background,
+    Urgent,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,12 +64,25 @@ pub struct ResidencyMetrics {
     pub in_flight_generation: usize,
     pub in_flight_lighting: usize,
     pub in_flight_meshing: usize,
+    pub urgent_lighting: usize,
+    pub urgent_meshing: usize,
 }
 
 #[derive(Debug, Clone)]
 pub enum RenderMeshUpdate {
     Upsert { pos: ChunkPos, mesh: ChunkMesh },
     Remove { pos: ChunkPos },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ChunkDebugState {
+    pub pos: ChunkPos,
+    pub residency_state: ChunkResidencyState,
+    pub dirty_geometry: bool,
+    pub dirty_lighting: bool,
+    pub in_flight_generation: bool,
+    pub in_flight_lighting: bool,
+    pub in_flight_meshing: bool,
 }
 
 #[derive(Debug)]
@@ -95,6 +116,7 @@ struct LightingJob {
     revision: u64,
     chunk: ChunkData,
     neighbors: CardinalChunkNeighborsOwned,
+    priority: WorkPriority,
 }
 
 #[derive(Debug)]
@@ -102,6 +124,7 @@ struct LightingResult {
     pos: ChunkPos,
     revision: u64,
     lighting: LightingOutput,
+    priority: WorkPriority,
 }
 
 #[derive(Debug)]
@@ -127,6 +150,10 @@ pub struct ChunkStreamer {
     generation_in_flight: HashSet<ChunkPos>,
     lighting_in_flight: HashSet<ChunkPos>,
     meshing_in_flight: HashSet<ChunkPos>,
+    urgent_lighting: HashSet<ChunkPos>,
+    urgent_meshing: HashSet<ChunkPos>,
+    pending_render_upload: HashSet<ChunkPos>,
+    coherence_pending: HashSet<ChunkPos>,
     generation_tx: Option<Sender<GenerationJob>>,
     generation_rx: Receiver<GenerationResult>,
     lighting_tx: Option<Sender<LightingJob>>,
@@ -181,6 +208,7 @@ impl ChunkStreamer {
                             pos: job.pos,
                             revision: job.revision,
                             lighting,
+                            priority: job.priority,
                         })
                         .is_err()
                     {
@@ -219,6 +247,10 @@ impl ChunkStreamer {
             generation_in_flight: HashSet::new(),
             lighting_in_flight: HashSet::new(),
             meshing_in_flight: HashSet::new(),
+            urgent_lighting: HashSet::new(),
+            urgent_meshing: HashSet::new(),
+            pending_render_upload: HashSet::new(),
+            coherence_pending: HashSet::new(),
             generation_tx: Some(generation_tx),
             generation_rx,
             lighting_tx: Some(lighting_tx),
@@ -246,9 +278,10 @@ impl ChunkStreamer {
         self.poll_generation_results();
         self.poll_lighting_results();
         self.poll_meshing_results();
-        self.dispatch_generation(center_chunk);
         self.dispatch_lighting(center_chunk);
         self.dispatch_meshing(center_chunk);
+        self.dispatch_generation(center_chunk);
+        self.flush_render_uploads();
         self.cleanup_evicted();
     }
 
@@ -257,11 +290,19 @@ impl ChunkStreamer {
     }
 
     pub fn mark_chunk_geometry_dirty(&mut self, pos: ChunkPos) {
-        self.enqueue_geometry_remesh(pos);
+        self.enqueue_geometry_remesh(pos, WorkPriority::Background);
     }
 
     pub fn mark_chunk_lighting_dirty(&mut self, pos: ChunkPos) {
-        self.enqueue_lighting_relight(pos);
+        self.enqueue_lighting_relight(pos, WorkPriority::Background);
+    }
+
+    pub fn mark_chunk_geometry_dirty_urgent(&mut self, pos: ChunkPos) {
+        self.enqueue_geometry_remesh(pos, WorkPriority::Urgent);
+    }
+
+    pub fn mark_chunk_lighting_dirty_urgent(&mut self, pos: ChunkPos) {
+        self.enqueue_lighting_relight(pos, WorkPriority::Urgent);
     }
 
     pub fn mark_block_geometry_dirty(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
@@ -269,30 +310,45 @@ impl ChunkStreamer {
             return;
         }
 
-        self.enqueue_geometry_remesh(pos);
+        let mut edge_coherence_targets = vec![pos];
+        self.enqueue_geometry_remesh(pos, WorkPriority::Urgent);
         if local_x == 0 {
-            self.enqueue_geometry_remesh(ChunkPos {
+            let west = ChunkPos {
                 x: pos.x - 1,
                 z: pos.z,
-            });
+            };
+            self.enqueue_geometry_remesh(west, WorkPriority::Urgent);
+            edge_coherence_targets.push(west);
         }
         if local_x == (CHUNK_WIDTH as u8 - 1) {
-            self.enqueue_geometry_remesh(ChunkPos {
+            let east = ChunkPos {
                 x: pos.x + 1,
                 z: pos.z,
-            });
+            };
+            self.enqueue_geometry_remesh(east, WorkPriority::Urgent);
+            edge_coherence_targets.push(east);
         }
         if local_z == 0 {
-            self.enqueue_geometry_remesh(ChunkPos {
+            let north = ChunkPos {
                 x: pos.x,
                 z: pos.z - 1,
-            });
+            };
+            self.enqueue_geometry_remesh(north, WorkPriority::Urgent);
+            edge_coherence_targets.push(north);
         }
         if local_z == (CHUNK_DEPTH as u8 - 1) {
-            self.enqueue_geometry_remesh(ChunkPos {
+            let south = ChunkPos {
                 x: pos.x,
                 z: pos.z + 1,
-            });
+            };
+            self.enqueue_geometry_remesh(south, WorkPriority::Urgent);
+            edge_coherence_targets.push(south);
+        }
+
+        if edge_coherence_targets.len() > 1 {
+            for chunk in edge_coherence_targets {
+                self.coherence_pending.insert(chunk);
+            }
         }
     }
 
@@ -301,31 +357,64 @@ impl ChunkStreamer {
             return;
         }
 
-        self.enqueue_lighting_relight(pos);
+        self.enqueue_lighting_relight(pos, WorkPriority::Urgent);
         if local_x == 0 {
-            self.enqueue_lighting_relight(ChunkPos {
-                x: pos.x - 1,
-                z: pos.z,
-            });
+            self.enqueue_lighting_relight(
+                ChunkPos {
+                    x: pos.x - 1,
+                    z: pos.z,
+                },
+                WorkPriority::Urgent,
+            );
         }
         if local_x == (CHUNK_WIDTH as u8 - 1) {
-            self.enqueue_lighting_relight(ChunkPos {
-                x: pos.x + 1,
-                z: pos.z,
-            });
+            self.enqueue_lighting_relight(
+                ChunkPos {
+                    x: pos.x + 1,
+                    z: pos.z,
+                },
+                WorkPriority::Urgent,
+            );
         }
         if local_z == 0 {
-            self.enqueue_lighting_relight(ChunkPos {
-                x: pos.x,
-                z: pos.z - 1,
-            });
+            self.enqueue_lighting_relight(
+                ChunkPos {
+                    x: pos.x,
+                    z: pos.z - 1,
+                },
+                WorkPriority::Urgent,
+            );
         }
         if local_z == (CHUNK_DEPTH as u8 - 1) {
-            self.enqueue_lighting_relight(ChunkPos {
-                x: pos.x,
-                z: pos.z + 1,
+            self.enqueue_lighting_relight(
+                ChunkPos {
+                    x: pos.x,
+                    z: pos.z + 1,
+                },
+                WorkPriority::Urgent,
+            );
+        }
+    }
+
+    pub fn debug_chunk_states(&self) -> Vec<ChunkDebugState> {
+        let mut states = Vec::with_capacity(self.slots.len());
+        for (pos, slot) in &self.slots {
+            if !self.required.contains(pos) {
+                continue;
+            }
+
+            states.push(ChunkDebugState {
+                pos: *pos,
+                residency_state: slot.state,
+                dirty_geometry: slot.dirty.geometry,
+                dirty_lighting: slot.dirty.lighting,
+                in_flight_generation: self.generation_in_flight.contains(pos),
+                in_flight_lighting: self.lighting_in_flight.contains(pos),
+                in_flight_meshing: self.meshing_in_flight.contains(pos),
             });
         }
+        states.sort_by_key(|state| (state.pos.x, state.pos.z));
+        states
     }
 
     #[must_use]
@@ -391,6 +480,8 @@ impl ChunkStreamer {
             in_flight_generation: self.generation_in_flight.len(),
             in_flight_lighting: self.lighting_in_flight.len(),
             in_flight_meshing: self.meshing_in_flight.len(),
+            urgent_lighting: self.urgent_lighting.len(),
+            urgent_meshing: self.urgent_meshing.len(),
             remesh_enqueued: self.remesh_enqueued_total,
             relight_enqueued: self.relight_enqueued_total,
             relight_dropped_stale: self.relight_dropped_stale_total,
@@ -457,6 +548,13 @@ impl ChunkStreamer {
         let Some(tx) = &self.generation_tx else {
             return;
         };
+        let dispatch_budget = lane_dispatch_budget(
+            self.config.max_generation_dispatch,
+            self.generation_in_flight.len(),
+        );
+        if dispatch_budget == 0 {
+            return;
+        }
 
         let mut candidates: Vec<_> = self
             .slots
@@ -473,13 +571,9 @@ impl ChunkStreamer {
             })
             .collect();
 
-        candidates.sort_by_key(|pos| Reverse(chunk_distance_sq(*pos, center_chunk)));
-        candidates.reverse();
+        sort_candidates_by_distance(&mut candidates, center_chunk);
 
-        for pos in candidates
-            .into_iter()
-            .take(self.config.max_generation_dispatch)
-        {
+        for pos in candidates.into_iter().take(dispatch_budget) {
             if tx.send(GenerationJob { pos }).is_err() {
                 break;
             }
@@ -494,29 +588,54 @@ impl ChunkStreamer {
         let Some(tx) = &self.lighting_tx else {
             return;
         };
+        let dispatch_budget = lane_dispatch_budget(
+            self.config.max_lighting_dispatch,
+            self.lighting_in_flight.len(),
+        );
+        if dispatch_budget == 0 {
+            return;
+        }
 
-        let mut candidates: Vec<_> = self
-            .slots
-            .iter()
-            .filter_map(|(pos, entry)| {
-                if entry.chunk.is_some()
+        self.urgent_lighting.retain(|pos| {
+            self.slots.get(pos).is_some_and(|entry| {
+                entry.chunk.is_some()
                     && entry.dirty.lighting
-                    && !self.lighting_in_flight.contains(pos)
+                    && entry.state != ChunkResidencyState::Evicting
                     && self.required.contains(pos)
-                {
-                    Some(*pos)
-                } else {
-                    None
-                }
             })
-            .collect();
+        });
 
-        candidates.sort_by_key(|pos| Reverse(chunk_distance_sq(*pos, center_chunk)));
-        candidates.reverse();
+        let mut urgent_candidates = Vec::new();
+        let mut regular_candidates = Vec::new();
+        for (pos, entry) in &self.slots {
+            if entry.chunk.is_some()
+                && entry.dirty.lighting
+                && !self.lighting_in_flight.contains(pos)
+                && self.required.contains(pos)
+            {
+                if self.urgent_lighting.contains(pos) {
+                    urgent_candidates.push(*pos);
+                } else {
+                    regular_candidates.push(*pos);
+                }
+            }
+        }
 
-        for pos in candidates
+        sort_candidates_by_distance(&mut urgent_candidates, center_chunk);
+        sort_candidates_by_distance(&mut regular_candidates, center_chunk);
+        let total_dispatch_budget = boosted_dispatch_budget(
+            self.config.max_lighting_dispatch,
+            self.lighting_in_flight.len(),
+            urgent_candidates.len(),
+        );
+        if total_dispatch_budget == 0 {
+            return;
+        }
+
+        for pos in urgent_candidates
             .into_iter()
-            .take(self.config.max_lighting_dispatch)
+            .chain(regular_candidates)
+            .take(total_dispatch_budget)
         {
             let Some(slot) = self.slots.get(&pos) else {
                 continue;
@@ -525,6 +644,11 @@ impl ChunkStreamer {
                 continue;
             };
             let revision = slot.lighting_revision;
+            let priority = if self.urgent_lighting.contains(&pos) {
+                WorkPriority::Urgent
+            } else {
+                WorkPriority::Background
+            };
 
             let neighbors = CardinalChunkNeighborsOwned {
                 neg_x: self.chunk_data_at(ChunkPos {
@@ -551,6 +675,7 @@ impl ChunkStreamer {
                     revision,
                     chunk,
                     neighbors,
+                    priority,
                 })
                 .is_err()
             {
@@ -561,6 +686,7 @@ impl ChunkStreamer {
                 slot.dirty.lighting = false;
             }
             self.lighting_in_flight.insert(pos);
+            self.urgent_lighting.remove(&pos);
             self.relight_enqueued_total = self.relight_enqueued_total.saturating_add(1);
         }
     }
@@ -569,32 +695,61 @@ impl ChunkStreamer {
         let Some(tx) = &self.meshing_tx else {
             return;
         };
+        let dispatch_budget = lane_dispatch_budget(
+            self.config.max_meshing_dispatch,
+            self.meshing_in_flight.len(),
+        );
+        if dispatch_budget == 0 {
+            return;
+        }
 
-        let mut candidates: Vec<_> = self
-            .slots
-            .iter()
-            .filter_map(|(pos, entry)| {
-                if entry.state == ChunkResidencyState::Meshing
+        self.urgent_meshing.retain(|pos| {
+            self.slots.get(pos).is_some_and(|entry| {
+                entry.state == ChunkResidencyState::Meshing
                     && entry.chunk.is_some()
                     && entry.dirty.geometry
                     && !entry.dirty.lighting
                     && !self.lighting_in_flight.contains(pos)
                     && !self.meshing_in_flight.contains(pos)
                     && self.required.contains(pos)
-                {
-                    Some(*pos)
-                } else {
-                    None
-                }
             })
-            .collect();
+        });
 
-        candidates.sort_by_key(|pos| Reverse(chunk_distance_sq(*pos, center_chunk)));
-        candidates.reverse();
+        let mut urgent_candidates = Vec::new();
+        let mut regular_candidates = Vec::new();
+        for (pos, entry) in &self.slots {
+            if entry.state == ChunkResidencyState::Meshing
+                && entry.chunk.is_some()
+                && entry.dirty.geometry
+                && !entry.dirty.lighting
+                && !self.lighting_in_flight.contains(pos)
+                && !self.meshing_in_flight.contains(pos)
+                && self.required.contains(pos)
+                && self.neighbor_lighting_ready(*pos)
+            {
+                if self.urgent_meshing.contains(pos) {
+                    urgent_candidates.push(*pos);
+                } else {
+                    regular_candidates.push(*pos);
+                }
+            }
+        }
 
-        for pos in candidates
+        sort_candidates_by_distance(&mut urgent_candidates, center_chunk);
+        sort_candidates_by_distance(&mut regular_candidates, center_chunk);
+        let total_dispatch_budget = boosted_dispatch_budget(
+            self.config.max_meshing_dispatch,
+            self.meshing_in_flight.len(),
+            urgent_candidates.len(),
+        );
+        if total_dispatch_budget == 0 {
+            return;
+        }
+
+        for pos in urgent_candidates
             .into_iter()
-            .take(self.config.max_meshing_dispatch)
+            .chain(regular_candidates)
+            .take(total_dispatch_budget)
         {
             let Some(slot) = self.slots.get(&pos) else {
                 continue;
@@ -636,6 +791,7 @@ impl ChunkStreamer {
                 slot.dirty.geometry = false;
             }
             self.meshing_in_flight.insert(pos);
+            self.urgent_meshing.remove(&pos);
         }
     }
 
@@ -675,6 +831,7 @@ impl ChunkStreamer {
                         continue;
                     }
 
+                    let mut boundary_lighting_changed = false;
                     let mut should_mark_geometry_dirty = false;
                     if let Some(slot) = self.slots.get_mut(&result.pos) {
                         let is_stale =
@@ -690,6 +847,8 @@ impl ChunkStreamer {
                         let Some(chunk) = slot.chunk.as_mut() else {
                             continue;
                         };
+                        boundary_lighting_changed = result.lighting.changed
+                            && boundary_light_channels_changed(chunk, &result.lighting);
                         if result.lighting.changed {
                             chunk.apply_light_channels(
                                 &result.lighting.sky_light,
@@ -700,7 +859,15 @@ impl ChunkStreamer {
                     }
 
                     if should_mark_geometry_dirty {
-                        self.mark_chunk_geometry_dirty(result.pos);
+                        if result.priority == WorkPriority::Urgent {
+                            self.mark_chunk_geometry_dirty_urgent(result.pos);
+                        } else {
+                            self.mark_chunk_geometry_dirty(result.pos);
+                        }
+                    }
+                    if boundary_lighting_changed {
+                        self.mark_neighbors_for_relight_with_priority(result.pos, result.priority);
+                        self.mark_neighbors_for_remesh_with_priority(result.pos, result.priority);
                     }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
@@ -727,16 +894,54 @@ impl ChunkStreamer {
                         slot.mesh = Some(result.mesh);
                         slot.state = ChunkResidencyState::Ready;
                         self.mesh_dirty = true;
-                        if let Some(mesh) = &slot.mesh {
-                            self.render_updates.push(RenderMeshUpdate::Upsert {
-                                pos: result.pos,
-                                mesh: mesh.clone(),
-                            });
-                        }
+                        self.pending_render_upload.insert(result.pos);
                     }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
+        }
+    }
+
+    fn flush_render_uploads(&mut self) {
+        let pending: Vec<_> = self.pending_render_upload.iter().copied().collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        for pos in pending {
+            if !self.required.contains(&pos) {
+                self.pending_render_upload.remove(&pos);
+                self.coherence_pending.remove(&pos);
+                continue;
+            }
+
+            let Some(slot) = self.slots.get(&pos) else {
+                self.pending_render_upload.remove(&pos);
+                self.coherence_pending.remove(&pos);
+                continue;
+            };
+
+            if slot.state != ChunkResidencyState::Ready
+                || slot.dirty.geometry
+                || slot.dirty.lighting
+            {
+                continue;
+            }
+
+            if self.coherence_pending.contains(&pos) && !self.neighbor_geometry_settled(pos) {
+                continue;
+            }
+
+            let Some(mesh) = &slot.mesh else {
+                continue;
+            };
+
+            self.render_updates.push(RenderMeshUpdate::Upsert {
+                pos,
+                mesh: mesh.clone(),
+            });
+            self.pending_render_upload.remove(&pos);
+            self.coherence_pending.remove(&pos);
         }
     }
 
@@ -766,6 +971,10 @@ impl ChunkStreamer {
             self.generation_in_flight.remove(&pos);
             self.lighting_in_flight.remove(&pos);
             self.meshing_in_flight.remove(&pos);
+            self.urgent_lighting.remove(&pos);
+            self.urgent_meshing.remove(&pos);
+            self.pending_render_upload.remove(&pos);
+            self.coherence_pending.remove(&pos);
         }
 
         self.mesh_dirty = true;
@@ -808,18 +1017,32 @@ impl ChunkStreamer {
     }
 
     fn mark_neighbors_for_remesh(&mut self, pos: ChunkPos) {
+        self.mark_neighbors_for_remesh_with_priority(pos, WorkPriority::Background);
+    }
+
+    fn mark_neighbors_for_remesh_with_priority(&mut self, pos: ChunkPos, priority: WorkPriority) {
         for neighbor in cardinal_neighbors(pos) {
-            self.mark_chunk_geometry_dirty(neighbor);
+            match priority {
+                WorkPriority::Background => self.mark_chunk_geometry_dirty(neighbor),
+                WorkPriority::Urgent => self.mark_chunk_geometry_dirty_urgent(neighbor),
+            }
         }
     }
 
     fn mark_neighbors_for_relight(&mut self, pos: ChunkPos) {
+        self.mark_neighbors_for_relight_with_priority(pos, WorkPriority::Background);
+    }
+
+    fn mark_neighbors_for_relight_with_priority(&mut self, pos: ChunkPos, priority: WorkPriority) {
         for neighbor in cardinal_neighbors(pos) {
-            self.mark_chunk_lighting_dirty(neighbor);
+            match priority {
+                WorkPriority::Background => self.mark_chunk_lighting_dirty(neighbor),
+                WorkPriority::Urgent => self.mark_chunk_lighting_dirty_urgent(neighbor),
+            }
         }
     }
 
-    fn enqueue_lighting_relight(&mut self, pos: ChunkPos) {
+    fn enqueue_lighting_relight(&mut self, pos: ChunkPos, priority: WorkPriority) {
         let Some(slot) = self.slots.get_mut(&pos) else {
             return;
         };
@@ -829,9 +1052,12 @@ impl ChunkStreamer {
 
         slot.dirty.lighting = true;
         slot.lighting_revision = slot.lighting_revision.wrapping_add(1);
+        if priority == WorkPriority::Urgent {
+            self.urgent_lighting.insert(pos);
+        }
     }
 
-    fn enqueue_geometry_remesh(&mut self, pos: ChunkPos) {
+    fn enqueue_geometry_remesh(&mut self, pos: ChunkPos, priority: WorkPriority) {
         let Some(slot) = self.slots.get_mut(&pos) else {
             return;
         };
@@ -840,10 +1066,48 @@ impl ChunkStreamer {
         }
 
         slot.dirty.geometry = true;
+        self.pending_render_upload.insert(pos);
         if slot.state != ChunkResidencyState::Meshing {
             slot.state = ChunkResidencyState::Meshing;
             self.remesh_enqueued_total = self.remesh_enqueued_total.saturating_add(1);
         }
+        if priority == WorkPriority::Urgent {
+            self.urgent_meshing.insert(pos);
+        }
+    }
+
+    fn neighbor_lighting_ready(&self, pos: ChunkPos) -> bool {
+        for neighbor in cardinal_neighbors(pos) {
+            let Some(slot) = self.slots.get(&neighbor) else {
+                continue;
+            };
+            if slot.state == ChunkResidencyState::Evicting || slot.chunk.is_none() {
+                continue;
+            }
+            if slot.dirty.lighting || self.lighting_in_flight.contains(&neighbor) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn neighbor_geometry_settled(&self, pos: ChunkPos) -> bool {
+        for neighbor in cardinal_neighbors(pos) {
+            if !self.required.contains(&neighbor) {
+                continue;
+            }
+
+            let Some(slot) = self.slots.get(&neighbor) else {
+                continue;
+            };
+            if slot.state == ChunkResidencyState::Evicting || slot.chunk.is_none() {
+                continue;
+            }
+            if slot.dirty.geometry || self.meshing_in_flight.contains(&neighbor) {
+                return false;
+            }
+        }
+        true
     }
 
     fn refresh_columns_after_block_edit(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
@@ -960,6 +1224,34 @@ fn chunk_distance_sq(a: ChunkPos, b: ChunkPos) -> i64 {
     dx * dx + dz * dz
 }
 
+fn sort_candidates_by_distance(candidates: &mut [ChunkPos], center_chunk: ChunkPos) {
+    candidates.sort_by_key(|pos| chunk_distance_sq(*pos, center_chunk));
+}
+
+fn lane_dispatch_budget(max_dispatch: usize, in_flight: usize) -> usize {
+    if max_dispatch == 0 {
+        return 0;
+    }
+    let max_in_flight = max_dispatch.saturating_mul(MAX_IN_FLIGHT_MULTIPLIER);
+    max_dispatch.min(max_in_flight.saturating_sub(in_flight))
+}
+
+fn boosted_dispatch_budget(
+    max_dispatch: usize,
+    in_flight: usize,
+    urgent_candidates: usize,
+) -> usize {
+    let base_budget = lane_dispatch_budget(max_dispatch, in_flight);
+    if base_budget == 0 || urgent_candidates == 0 {
+        return base_budget;
+    }
+
+    let urgent_target = urgent_candidates.min(MAX_URGENT_DISPATCH_BURST);
+    let max_in_flight = max_dispatch.saturating_mul(MAX_IN_FLIGHT_MULTIPLIER);
+    let headroom = max_in_flight.saturating_sub(in_flight);
+    base_budget.max(urgent_target).min(headroom)
+}
+
 fn cardinal_neighbors(pos: ChunkPos) -> [ChunkPos; 4] {
     [
         ChunkPos {
@@ -979,6 +1271,43 @@ fn cardinal_neighbors(pos: ChunkPos) -> [ChunkPos; 4] {
             z: pos.z + 1,
         },
     ]
+}
+
+fn boundary_light_channels_changed(chunk: &ChunkData, lighting: &LightingOutput) -> bool {
+    let max_x = (CHUNK_WIDTH as u8) - 1;
+    let max_z = (CHUNK_DEPTH as u8) - 1;
+
+    for y in 0..CHUNK_HEIGHT as u8 {
+        for z in 0..CHUNK_DEPTH as u8 {
+            if boundary_light_cell_changed(chunk, lighting, 0, y, z)
+                || boundary_light_cell_changed(chunk, lighting, max_x, y, z)
+            {
+                return true;
+            }
+        }
+
+        for x in 1..max_x {
+            if boundary_light_cell_changed(chunk, lighting, x, y, 0)
+                || boundary_light_cell_changed(chunk, lighting, x, y, max_z)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn boundary_light_cell_changed(
+    chunk: &ChunkData,
+    lighting: &LightingOutput,
+    local_x: u8,
+    y: u8,
+    local_z: u8,
+) -> bool {
+    let index = ChunkData::index(local_x, y, local_z);
+    chunk.sky_light(local_x, y, local_z) != lighting.sky_light[index]
+        || chunk.block_light(local_x, y, local_z) != lighting.block_light[index]
 }
 
 #[cfg(test)]
@@ -1111,6 +1440,24 @@ mod tests {
         assert_eq!(pos, ChunkPos { x: 1, z: 1 });
         assert_eq!(local_x, 0);
         assert_eq!(local_z, 0);
+    }
+
+    #[test]
+    fn lane_dispatch_budget_caps_in_flight_depth() {
+        assert_eq!(lane_dispatch_budget(0, 0), 0);
+        assert_eq!(lane_dispatch_budget(4, 0), 4);
+        assert_eq!(lane_dispatch_budget(4, 10), 4);
+        assert_eq!(lane_dispatch_budget(4, 16), 0);
+        assert_eq!(lane_dispatch_budget(4, 32), 0);
+    }
+
+    #[test]
+    fn boosted_dispatch_budget_allows_small_urgent_burst() {
+        assert_eq!(boosted_dispatch_budget(0, 0, 2), 0);
+        assert_eq!(boosted_dispatch_budget(1, 0, 0), 1);
+        assert_eq!(boosted_dispatch_budget(1, 0, 2), 2);
+        assert_eq!(boosted_dispatch_budget(1, 3, 4), 1);
+        assert_eq!(boosted_dispatch_budget(1, 4, 2), 0);
     }
 
     #[test]
@@ -1433,5 +1780,397 @@ mod tests {
         }
 
         assert!(streamer.metrics().relight_dropped_stale > 0);
+    }
+
+    #[test]
+    fn lighting_change_marks_neighbor_for_boundary_remesh() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 9,
+                max_lighting_dispatch: 9,
+                max_meshing_dispatch: 9,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready >= 9 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(streamer.metrics().ready >= 9);
+
+        let east = ChunkPos { x: 1, z: 0 };
+        assert_eq!(streamer.slot_state(east), Some(ChunkResidencyState::Ready));
+
+        streamer.config.max_meshing_dispatch = 0;
+        let sky = [0_u8; crate::world::CHUNK_VOLUME];
+        let block = [0_u8; crate::world::CHUNK_VOLUME];
+        let center_slot = streamer
+            .slots
+            .get_mut(&center)
+            .expect("center slot should exist");
+        center_slot
+            .chunk
+            .as_mut()
+            .expect("center chunk should exist")
+            .apply_light_channels(&sky, &block);
+        streamer.mark_chunk_lighting_dirty(center);
+
+        for _ in 0..500 {
+            streamer.tick(center);
+            let east_dirty = streamer
+                .slots
+                .get(&east)
+                .is_some_and(|slot| slot.dirty.geometry);
+            if east_dirty && streamer.metrics().in_flight_lighting == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(streamer
+            .slots
+            .get(&east)
+            .is_some_and(|slot| slot.dirty.geometry));
+        assert_eq!(
+            streamer.slot_state(east),
+            Some(ChunkResidencyState::Meshing)
+        );
+    }
+
+    #[test]
+    fn lighting_change_marks_neighbor_for_boundary_relight() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 9,
+                max_lighting_dispatch: 9,
+                max_meshing_dispatch: 9,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready >= 9 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(streamer.metrics().ready >= 9);
+
+        let east = ChunkPos { x: 1, z: 0 };
+        let east_revision_before = streamer
+            .slots
+            .get(&east)
+            .expect("east slot should exist")
+            .lighting_revision;
+
+        let sky = [0_u8; crate::world::CHUNK_VOLUME];
+        let block = [0_u8; crate::world::CHUNK_VOLUME];
+        let center_slot = streamer
+            .slots
+            .get_mut(&center)
+            .expect("center slot should exist");
+        center_slot
+            .chunk
+            .as_mut()
+            .expect("center chunk should exist")
+            .apply_light_channels(&sky, &block);
+        streamer.mark_chunk_lighting_dirty(center);
+
+        for _ in 0..500 {
+            streamer.tick(center);
+            let east_revision_after = streamer
+                .slots
+                .get(&east)
+                .expect("east slot should exist")
+                .lighting_revision;
+            if east_revision_after > east_revision_before {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let east_revision_after = streamer
+            .slots
+            .get(&east)
+            .expect("east slot should exist")
+            .lighting_revision;
+        assert!(east_revision_after > east_revision_before);
+    }
+
+    #[test]
+    fn interior_lighting_change_does_not_mark_neighbor_for_relight() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 9,
+                max_lighting_dispatch: 9,
+                max_meshing_dispatch: 9,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            let metrics = streamer.metrics();
+            if metrics.ready >= 9
+                && metrics.in_flight_lighting == 0
+                && metrics.in_flight_meshing == 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let metrics = streamer.metrics();
+        assert!(metrics.ready >= 9);
+        assert_eq!(metrics.in_flight_lighting, 0);
+
+        let east = ChunkPos { x: 1, z: 0 };
+        let east_revision_before = streamer
+            .slots
+            .get(&east)
+            .expect("east slot should exist")
+            .lighting_revision;
+
+        assert!(streamer.set_block_at_world(8, 64, 8, 76));
+
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().in_flight_lighting == 0
+                && streamer
+                    .slots
+                    .get(&center)
+                    .is_some_and(|slot| !slot.dirty.lighting)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let east_revision_after = streamer
+            .slots
+            .get(&east)
+            .expect("east slot should exist")
+            .lighting_revision;
+        assert_eq!(east_revision_after, east_revision_before);
+    }
+
+    #[test]
+    fn urgent_lighting_dispatch_preempts_regular_candidates() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 9,
+                max_lighting_dispatch: 1,
+                max_meshing_dispatch: 9,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready >= 9
+                && streamer.metrics().in_flight_lighting == 0
+                && streamer.metrics().in_flight_meshing == 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(streamer.metrics().ready >= 9);
+
+        let regular_near = center;
+        let urgent_far = ChunkPos { x: 1, z: 1 };
+
+        streamer.mark_chunk_lighting_dirty(regular_near);
+        streamer.mark_chunk_lighting_dirty_urgent(urgent_far);
+        streamer.dispatch_lighting(center);
+
+        assert!(streamer.lighting_in_flight.contains(&urgent_far));
+        assert!(!streamer.lighting_in_flight.contains(&regular_near));
+    }
+
+    #[test]
+    fn meshing_waits_for_neighbor_lighting_to_settle() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 9,
+                max_lighting_dispatch: 9,
+                max_meshing_dispatch: 1,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready >= 9
+                && streamer.metrics().in_flight_lighting == 0
+                && streamer.metrics().in_flight_meshing == 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(streamer.metrics().ready >= 9);
+
+        let east = ChunkPos { x: 1, z: 0 };
+        streamer.mark_chunk_geometry_dirty(center);
+        if let Some(east_slot) = streamer.slots.get_mut(&east) {
+            east_slot.dirty.lighting = true;
+        }
+
+        streamer.dispatch_meshing(center);
+        assert!(!streamer.meshing_in_flight.contains(&center));
+
+        if let Some(east_slot) = streamer.slots.get_mut(&east) {
+            east_slot.dirty.lighting = false;
+        }
+        streamer.dispatch_meshing(center);
+        assert!(streamer.meshing_in_flight.contains(&center));
+    }
+
+    #[test]
+    fn urgent_meshing_can_dispatch_pair_when_budget_is_one() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 9,
+                max_lighting_dispatch: 9,
+                max_meshing_dispatch: 1,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready >= 9
+                && streamer.metrics().in_flight_lighting == 0
+                && streamer.metrics().in_flight_meshing == 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(streamer.metrics().ready >= 9);
+
+        let east = ChunkPos { x: 1, z: 0 };
+        streamer.mark_chunk_geometry_dirty_urgent(center);
+        streamer.mark_chunk_geometry_dirty_urgent(east);
+        streamer.dispatch_meshing(center);
+
+        assert!(streamer.meshing_in_flight.contains(&center));
+        assert!(streamer.meshing_in_flight.contains(&east));
+    }
+
+    #[test]
+    fn coherence_barrier_holds_border_upload_until_neighbor_settles() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+
+        let mut center_chunk = ChunkData::new(center, 0);
+        center_chunk.recalculate_height_map(&streamer.registry);
+        center_chunk.seed_emitted_light(&streamer.registry);
+        let mut east_chunk = ChunkData::new(east, 0);
+        east_chunk.recalculate_height_map(&streamer.registry);
+        east_chunk.seed_emitted_light(&streamer.registry);
+
+        streamer.slots.insert(
+            center,
+            ChunkResidencyEntry {
+                state: ChunkResidencyState::Ready,
+                dirty: ChunkDirtyFlags::default(),
+                lighting_revision: 0,
+                chunk: Some(center_chunk),
+                mesh: Some(ChunkMesh::default()),
+            },
+        );
+        streamer.slots.insert(
+            east,
+            ChunkResidencyEntry {
+                state: ChunkResidencyState::Ready,
+                dirty: ChunkDirtyFlags::default(),
+                lighting_revision: 0,
+                chunk: Some(east_chunk),
+                mesh: Some(ChunkMesh::default()),
+            },
+        );
+        streamer.required.insert(center);
+        streamer.required.insert(east);
+        streamer.pending_render_upload.insert(center);
+        streamer.coherence_pending.insert(center);
+
+        if let Some(slot) = streamer.slots.get_mut(&east) {
+            slot.dirty.geometry = true;
+        }
+        streamer.flush_render_uploads();
+        assert!(streamer.render_updates.is_empty());
+        assert!(streamer.pending_render_upload.contains(&center));
+
+        if let Some(slot) = streamer.slots.get_mut(&east) {
+            slot.dirty.geometry = false;
+        }
+        streamer.flush_render_uploads();
+        assert!(streamer.render_updates.iter().any(
+            |update| matches!(update, RenderMeshUpdate::Upsert { pos, .. } if *pos == center)
+        ));
+        assert!(!streamer.pending_render_upload.contains(&center));
+    }
+
+    #[test]
+    fn debug_chunk_states_only_include_required_chunks() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+            },
+        );
+        streamer.tick(ChunkPos { x: 0, z: 0 });
+
+        let states = streamer.debug_chunk_states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].pos, ChunkPos { x: 0, z: 0 });
+        assert_eq!(states[0].residency_state, ChunkResidencyState::Requested);
     }
 }

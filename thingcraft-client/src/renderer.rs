@@ -10,6 +10,7 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::mesh::{ChunkMesh, MeshVertex};
+use crate::streaming::{ChunkDebugState, ChunkResidencyState};
 use crate::world::ChunkPos;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -21,6 +22,7 @@ pub struct Renderer<'w> {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
+    debug_line_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     terrain_bind_group: wgpu::BindGroup,
@@ -28,6 +30,10 @@ pub struct Renderer<'w> {
     depth_view: wgpu::TextureView,
     scene_mesh: Option<SceneMeshGpu>,
     chunk_meshes: HashMap<ChunkPos, SceneMeshGpu>,
+    chunk_debug_states: HashMap<ChunkPos, ChunkDebugState>,
+    chunk_border_mesh: Option<DebugLineMeshGpu>,
+    chunk_border_mesh_dirty: bool,
+    chunk_border_debug_enabled: bool,
     camera_frustum: Option<FrustumPlanes>,
     visible_chunk_meshes: usize,
 }
@@ -38,9 +44,35 @@ struct SceneMeshGpu {
     index_count: u32,
 }
 
+struct DebugLineMeshGpu {
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FrustumPlanes {
     planes: [[f32; 4]; 6],
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct DebugLineVertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+impl DebugLineVertex {
+    const ATTRS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+
+    #[must_use]
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -241,6 +273,61 @@ impl<'w> Renderer<'w> {
             multiview: None,
         });
 
+        let debug_line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-debug-line-shader"),
+            source: wgpu::ShaderSource::Wgsl(DEBUG_LINE_SHADER.into()),
+        });
+
+        let debug_line_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("thingcraft-debug-line-pipeline-layout"),
+                bind_group_layouts: &[&camera_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let debug_line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-debug-line-pipeline"),
+            layout: Some(&debug_line_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &debug_line_shader,
+                entry_point: "vs_main",
+                buffers: &[DebugLineVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &debug_line_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+
         Ok(Self {
             surface,
             device,
@@ -248,6 +335,7 @@ impl<'w> Renderer<'w> {
             config,
             size,
             render_pipeline,
+            debug_line_pipeline,
             camera_buffer,
             camera_bind_group,
             terrain_bind_group,
@@ -255,6 +343,10 @@ impl<'w> Renderer<'w> {
             depth_view,
             scene_mesh: None,
             chunk_meshes: HashMap::new(),
+            chunk_debug_states: HashMap::new(),
+            chunk_border_mesh: None,
+            chunk_border_mesh_dirty: true,
+            chunk_border_debug_enabled: false,
             camera_frustum: None,
             visible_chunk_meshes: 0,
         })
@@ -308,6 +400,7 @@ impl<'w> Renderer<'w> {
     pub fn upsert_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
             self.chunk_meshes.remove(&pos);
+            self.chunk_border_mesh_dirty = true;
             return;
         }
 
@@ -335,10 +428,12 @@ impl<'w> Renderer<'w> {
                 index_count: mesh.indices.len() as u32,
             },
         );
+        self.chunk_border_mesh_dirty = true;
     }
 
     pub fn remove_chunk_mesh(&mut self, pos: ChunkPos) {
         self.chunk_meshes.remove(&pos);
+        self.chunk_border_mesh_dirty = true;
     }
 
     #[must_use]
@@ -349,6 +444,22 @@ impl<'w> Renderer<'w> {
     #[must_use]
     pub fn visible_chunk_count(&self) -> usize {
         self.visible_chunk_meshes
+    }
+
+    pub fn set_chunk_border_debug(&mut self, enabled: bool) {
+        self.chunk_border_debug_enabled = enabled;
+    }
+
+    pub fn set_chunk_debug_states(&mut self, states: Vec<ChunkDebugState>) {
+        self.chunk_debug_states.clear();
+        self.chunk_debug_states
+            .extend(states.into_iter().map(|state| (state.pos, state)));
+        self.chunk_border_mesh_dirty = true;
+    }
+
+    #[must_use]
+    pub fn chunk_border_debug_enabled(&self) -> bool {
+        self.chunk_border_debug_enabled
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -379,6 +490,8 @@ impl<'w> Renderer<'w> {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(());
         }
+
+        self.refresh_chunk_border_mesh_if_dirty();
 
         let output = self
             .surface
@@ -463,12 +576,180 @@ impl<'w> Renderer<'w> {
             } else {
                 self.visible_chunk_meshes = 0;
             }
+
+            if self.chunk_border_debug_enabled {
+                if let Some(chunk_border_mesh) = &self.chunk_border_mesh {
+                    render_pass.set_pipeline(&self.debug_line_pipeline);
+                    render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, chunk_border_mesh.vertex_buffer.slice(..));
+                    render_pass.draw(0..chunk_border_mesh.vertex_count, 0..1);
+                }
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
     }
+
+    fn refresh_chunk_border_mesh_if_dirty(&mut self) {
+        if !self.chunk_border_mesh_dirty {
+            return;
+        }
+        self.chunk_border_mesh_dirty = false;
+
+        if self.chunk_meshes.is_empty() && self.chunk_debug_states.is_empty() {
+            self.chunk_border_mesh = None;
+            return;
+        }
+
+        let mut vertices = build_chunk_border_vertices(self.chunk_meshes.keys().copied());
+        vertices.extend(build_chunk_status_vertices(
+            self.chunk_debug_states.values().copied(),
+        ));
+        if vertices.is_empty() {
+            self.chunk_border_mesh = None;
+            return;
+        }
+
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("thingcraft-chunk-border-vertex-buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        self.chunk_border_mesh = Some(DebugLineMeshGpu {
+            vertex_buffer,
+            vertex_count: vertices.len() as u32,
+        });
+    }
+}
+
+fn build_chunk_border_vertices<I>(chunk_positions: I) -> Vec<DebugLineVertex>
+where
+    I: Iterator<Item = ChunkPos>,
+{
+    let mut vertices = Vec::new();
+    for pos in chunk_positions {
+        let color = if (pos.x + pos.z) & 1 == 0 {
+            [0.1, 1.0, 0.2]
+        } else {
+            [1.0, 0.6, 0.1]
+        };
+        append_chunk_border_box(&mut vertices, pos, color);
+    }
+    vertices
+}
+
+fn build_chunk_status_vertices<I>(states: I) -> Vec<DebugLineVertex>
+where
+    I: Iterator<Item = ChunkDebugState>,
+{
+    let mut vertices = Vec::new();
+    for state in states {
+        append_chunk_status_bars(&mut vertices, state);
+    }
+    vertices
+}
+
+fn append_chunk_status_bars(vertices: &mut Vec<DebugLineVertex>, state: ChunkDebugState) {
+    let base_x = state.pos.x as f32 * 16.0 + 8.0;
+    let base_z = state.pos.z as f32 * 16.0 + 8.0;
+
+    let generation_active =
+        state.in_flight_generation || state.residency_state == ChunkResidencyState::Generating;
+    let lighting_active = state.in_flight_lighting || state.dirty_lighting;
+    let meshing_active = state.in_flight_meshing
+        || state.dirty_geometry
+        || state.residency_state == ChunkResidencyState::Meshing;
+
+    let generation_color = if generation_active {
+        [0.3, 0.55, 1.0]
+    } else {
+        [0.08, 0.12, 0.25]
+    };
+    let lighting_color = if lighting_active {
+        [1.0, 0.25, 0.25]
+    } else {
+        [0.2, 0.1, 0.1]
+    };
+    let meshing_color = if meshing_active {
+        [1.0, 0.75, 0.15]
+    } else {
+        [0.2, 0.12, 0.05]
+    };
+
+    let generation_height = if generation_active { 12.0 } else { 2.5 };
+    let lighting_height = if lighting_active { 12.0 } else { 2.5 };
+    let meshing_height = if meshing_active { 12.0 } else { 2.5 };
+
+    append_vertical_bar(
+        vertices,
+        [base_x - 2.0, 0.2, base_z],
+        generation_height,
+        generation_color,
+    );
+    append_vertical_bar(
+        vertices,
+        [base_x, 0.2, base_z],
+        lighting_height,
+        lighting_color,
+    );
+    append_vertical_bar(
+        vertices,
+        [base_x + 2.0, 0.2, base_z],
+        meshing_height,
+        meshing_color,
+    );
+}
+
+fn append_vertical_bar(
+    vertices: &mut Vec<DebugLineVertex>,
+    base: [f32; 3],
+    height: f32,
+    color: [f32; 3],
+) {
+    append_line(vertices, base, [base[0], base[1] + height, base[2]], color);
+}
+
+fn append_chunk_border_box(vertices: &mut Vec<DebugLineVertex>, pos: ChunkPos, color: [f32; 3]) {
+    let (min, max) = chunk_aabb(pos);
+    let p000 = [min[0], min[1], min[2]];
+    let p100 = [max[0], min[1], min[2]];
+    let p110 = [max[0], min[1], max[2]];
+    let p010 = [min[0], min[1], max[2]];
+    let p001 = [min[0], max[1], min[2]];
+    let p101 = [max[0], max[1], min[2]];
+    let p111 = [max[0], max[1], max[2]];
+    let p011 = [min[0], max[1], max[2]];
+
+    append_line(vertices, p000, p100, color);
+    append_line(vertices, p100, p110, color);
+    append_line(vertices, p110, p010, color);
+    append_line(vertices, p010, p000, color);
+
+    append_line(vertices, p001, p101, color);
+    append_line(vertices, p101, p111, color);
+    append_line(vertices, p111, p011, color);
+    append_line(vertices, p011, p001, color);
+
+    append_line(vertices, p000, p001, color);
+    append_line(vertices, p100, p101, color);
+    append_line(vertices, p110, p111, color);
+    append_line(vertices, p010, p011, color);
+}
+
+fn append_line(vertices: &mut Vec<DebugLineVertex>, from: [f32; 3], to: [f32; 3], color: [f32; 3]) {
+    vertices.push(DebugLineVertex {
+        position: from,
+        color,
+    });
+    vertices.push(DebugLineVertex {
+        position: to,
+        color,
+    });
 }
 
 impl FrustumPlanes {
@@ -698,8 +979,39 @@ fn vs_main(input: VertexIn) -> VertexOut {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let texel = textureSample(terrain_atlas, terrain_sampler, input.uv);
-    let light = max(input.light, vec3<f32>(0.2, 0.2, 0.2));
-    return vec4<f32>(texel.rgb * light, texel.a);
+    return vec4<f32>(texel.rgb * input.light, texel.a);
+}
+"#;
+
+const DEBUG_LINE_SHADER: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec3<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) color: vec3<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
+    out.color = input.color;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 1.0);
 }
 "#;
 
@@ -707,7 +1019,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 mod tests {
     use glam::{Mat4, Vec3};
 
-    use super::{chunk_aabb, FrustumPlanes};
+    use super::{
+        build_chunk_border_vertices, build_chunk_status_vertices, chunk_aabb, FrustumPlanes,
+    };
+    use crate::streaming::{ChunkDebugState, ChunkResidencyState};
     use crate::world::ChunkPos;
 
     #[test]
@@ -725,5 +1040,28 @@ mod tests {
         let (min, max) = chunk_aabb(ChunkPos { x: -2, z: 3 });
         assert_eq!(min, [-32.0, 0.0, 48.0]);
         assert_eq!(max, [-16.0, 128.0, 64.0]);
+    }
+
+    #[test]
+    fn chunk_border_builder_emits_expected_line_vertex_count() {
+        let vertices = build_chunk_border_vertices([ChunkPos { x: 0, z: 0 }].into_iter());
+        assert_eq!(vertices.len(), 24);
+    }
+
+    #[test]
+    fn chunk_status_builder_emits_three_bars_per_chunk() {
+        let vertices = build_chunk_status_vertices(
+            [ChunkDebugState {
+                pos: ChunkPos { x: 0, z: 0 },
+                residency_state: ChunkResidencyState::Meshing,
+                dirty_geometry: true,
+                dirty_lighting: true,
+                in_flight_generation: false,
+                in_flight_lighting: true,
+                in_flight_meshing: false,
+            }]
+            .into_iter(),
+        );
+        assert_eq!(vertices.len(), 6);
     }
 }

@@ -111,7 +111,12 @@ const FACES: [FaceDef; 6] = [
 
 #[must_use]
 pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMesh {
-    build_chunk_mesh_with_neighbor_lookup(chunk, registry, |x, y, z| neighbor_block(chunk, x, y, z))
+    build_chunk_mesh_with_neighbor_lookup(
+        chunk,
+        registry,
+        |x, y, z| neighbor_block(chunk, x, y, z),
+        |x, y, z| neighbor_light(chunk, x, y, z),
+    )
 }
 
 #[must_use]
@@ -120,9 +125,12 @@ pub fn build_chunk_mesh_with_neighbors(
     registry: &BlockRegistry,
     neighbors: &CardinalChunkNeighbors<'_>,
 ) -> ChunkMesh {
-    build_chunk_mesh_with_neighbor_lookup(chunk, registry, |x, y, z| {
-        neighbor_block_with_cardinal_neighbors(chunk, neighbors, x, y, z)
-    })
+    build_chunk_mesh_with_neighbor_lookup(
+        chunk,
+        registry,
+        |x, y, z| neighbor_block_with_cardinal_neighbors(chunk, neighbors, x, y, z),
+        |x, y, z| neighbor_light_with_cardinal_neighbors(chunk, neighbors, x, y, z),
+    )
 }
 
 #[must_use]
@@ -140,21 +148,26 @@ pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> Chun
     let meshes: Vec<_> = chunks
         .iter()
         .map(|chunk| {
-            build_chunk_mesh_with_neighbor_lookup(chunk, registry, |x, y, z| {
-                neighbor_block_from_region(chunks, &index_by_pos, chunk.pos, x, y, z)
-            })
+            build_chunk_mesh_with_neighbor_lookup(
+                chunk,
+                registry,
+                |x, y, z| neighbor_block_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
+                |x, y, z| neighbor_light_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
+            )
         })
         .collect();
     merge_meshes(&meshes)
 }
 
-fn build_chunk_mesh_with_neighbor_lookup<F>(
+fn build_chunk_mesh_with_neighbor_lookup<FB, FL>(
     chunk: &ChunkData,
     registry: &BlockRegistry,
-    mut neighbor_lookup: F,
+    mut neighbor_block_lookup: FB,
+    mut neighbor_light_lookup: FL,
 ) -> ChunkMesh
 where
-    F: FnMut(i32, i32, i32) -> u8,
+    FB: FnMut(i32, i32, i32) -> u8,
+    FL: FnMut(i32, i32, i32) -> u8,
 {
     let mut mesh = ChunkMesh::default();
     let chunk_origin_x = chunk.pos.x as f32 * CHUNK_WIDTH as f32;
@@ -172,16 +185,19 @@ where
                     let nx = local_x + face.offset[0];
                     let ny = y + face.offset[1];
                     let nz = local_z + face.offset[2];
-                    let neighbor_id = neighbor_lookup(nx, ny, nz);
+                    let neighbor_id = neighbor_block_lookup(nx, ny, nz);
                     if neighbor_id == block_id || registry.is_face_occluder(neighbor_id) {
                         continue;
                     }
+                    let neighbor_light = neighbor_light_lookup(nx, ny, nz);
 
                     append_face(
                         &mut mesh,
-                        local_x as f32 + chunk_origin_x,
-                        y as f32,
-                        local_z as f32 + chunk_origin_z,
+                        [
+                            local_x as f32 + chunk_origin_x,
+                            y as f32,
+                            local_z as f32 + chunk_origin_z,
+                        ],
                         face,
                         registry.sprite_index_for_face(block_id, face.offset),
                         resolve_face_tint(
@@ -192,6 +208,7 @@ where
                             local_x as u8,
                             local_z as u8,
                         ),
+                        neighbor_light,
                     );
                 }
             }
@@ -226,6 +243,19 @@ fn neighbor_block(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
     }
 
     chunk.block(x as u8, y as u8, z as u8)
+}
+
+fn neighbor_light(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
+    if y < 0 {
+        return 0;
+    }
+    if y >= CHUNK_HEIGHT as i32 {
+        return 15;
+    }
+
+    let local_x = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
+    let local_z = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
+    raw_light_level(chunk, local_x, y as u8, local_z)
 }
 
 fn neighbor_block_with_cardinal_neighbors(
@@ -265,6 +295,71 @@ fn neighbor_block_with_cardinal_neighbors(
     }
 
     AIR_ID
+}
+
+fn neighbor_light_with_cardinal_neighbors(
+    chunk: &ChunkData,
+    neighbors: &CardinalChunkNeighbors<'_>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    if y < 0 {
+        return 0;
+    }
+    if y >= CHUNK_HEIGHT as i32 {
+        return 15;
+    }
+
+    if (0..CHUNK_WIDTH as i32).contains(&x) && (0..CHUNK_DEPTH as i32).contains(&z) {
+        return raw_light_level(chunk, x as u8, y as u8, z as u8);
+    }
+
+    if x < 0 {
+        return neighbors.neg_x.map_or_else(
+            || raw_light_level(chunk, 0, y as u8, z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8),
+            |neighbor| raw_light_level(neighbor, (CHUNK_WIDTH - 1) as u8, y as u8, z as u8),
+        );
+    }
+    if x >= CHUNK_WIDTH as i32 {
+        return neighbors.pos_x.map_or_else(
+            || {
+                raw_light_level(
+                    chunk,
+                    (CHUNK_WIDTH - 1) as u8,
+                    y as u8,
+                    z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8,
+                )
+            },
+            |neighbor| raw_light_level(neighbor, 0, y as u8, z as u8),
+        );
+    }
+    if z < 0 {
+        return neighbors.neg_z.map_or_else(
+            || raw_light_level(chunk, x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8, y as u8, 0),
+            |neighbor| raw_light_level(neighbor, x as u8, y as u8, (CHUNK_DEPTH - 1) as u8),
+        );
+    }
+    if z >= CHUNK_DEPTH as i32 {
+        return neighbors.pos_z.map_or_else(
+            || {
+                raw_light_level(
+                    chunk,
+                    x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8,
+                    y as u8,
+                    (CHUNK_DEPTH - 1) as u8,
+                )
+            },
+            |neighbor| raw_light_level(neighbor, x as u8, y as u8, 0),
+        );
+    }
+
+    raw_light_level(
+        chunk,
+        x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8,
+        y as u8,
+        z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8,
+    )
 }
 
 fn resolve_face_tint(
@@ -310,14 +405,48 @@ fn neighbor_block_from_region(
         })
 }
 
+fn neighbor_light_from_region(
+    chunks: &[ChunkData],
+    index_by_pos: &HashMap<ChunkPos, usize>,
+    chunk_pos: ChunkPos,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    if y < 0 {
+        return 0;
+    }
+    if y >= CHUNK_HEIGHT as i32 {
+        return 15;
+    }
+
+    let world_x = chunk_pos.x * CHUNK_WIDTH as i32 + x;
+    let world_z = chunk_pos.z * CHUNK_DEPTH as i32 + z;
+    let neighbor_chunk_pos = ChunkPos {
+        x: world_x.div_euclid(CHUNK_WIDTH as i32),
+        z: world_z.div_euclid(CHUNK_DEPTH as i32),
+    };
+    let local_x = world_x.rem_euclid(CHUNK_WIDTH as i32) as u8;
+    let local_z = world_z.rem_euclid(CHUNK_DEPTH as i32) as u8;
+
+    index_by_pos.get(&neighbor_chunk_pos).map_or(15, |index| {
+        raw_light_level(&chunks[*index], local_x, y as u8, local_z)
+    })
+}
+
+fn raw_light_level(chunk: &ChunkData, local_x: u8, y: u8, local_z: u8) -> u8 {
+    chunk
+        .sky_light(local_x, y, local_z)
+        .max(chunk.block_light(local_x, y, local_z))
+}
+
 fn append_face(
     mesh: &mut ChunkMesh,
-    base_x: f32,
-    base_y: f32,
-    base_z: f32,
+    base_pos: [f32; 3],
     face: FaceDef,
     sprite_index: u16,
     tint_rgb: [u8; 3],
+    neighbor_light: u8,
 ) {
     let atlas_tile = 1.0 / 16.0;
     let sprite_x = f32::from(sprite_index % 16) * atlas_tile;
@@ -330,11 +459,14 @@ fn append_face(
     ];
 
     let base_index = mesh.vertices.len() as u32;
-    let shade = face_shade(face.offset);
-    let shaded_tint = apply_shade(tint_rgb, shade);
+    let shaded_tint = apply_alpha_light(tint_rgb, neighbor_light, face.offset);
     for (corner, tex) in face.corners.iter().zip(uv.iter()) {
         mesh.vertices.push(MeshVertex {
-            position: [base_x + corner[0], base_y + corner[1], base_z + corner[2]],
+            position: [
+                base_pos[0] + corner[0],
+                base_pos[1] + corner[1],
+                base_pos[2] + corner[2],
+            ],
             uv: *tex,
             light_rgba: [shaded_tint[0], shaded_tint[1], shaded_tint[2], u8::MAX],
         });
@@ -350,23 +482,30 @@ fn append_face(
     ]);
 }
 
-fn face_shade(face_offset: [i32; 3]) -> u8 {
+fn alpha_face_scale(face_offset: [i32; 3]) -> f32 {
     if face_offset[1] > 0 {
-        255
+        1.0
     } else if face_offset[1] < 0 {
-        128
+        0.5
     } else if face_offset[2] != 0 {
-        204
+        0.8
     } else {
-        153
+        0.6
     }
 }
 
-fn apply_shade(rgb: [u8; 3], shade: u8) -> [u8; 3] {
+fn alpha_brightness(light_level: u8) -> f32 {
+    let min_brightness = 0.05;
+    let g = 1.0 - f32::from(light_level.min(15)) / 15.0;
+    ((1.0 - g) / (g * 3.0 + 1.0)) * (1.0 - min_brightness) + min_brightness
+}
+
+fn apply_alpha_light(rgb: [u8; 3], light_level: u8, face_offset: [i32; 3]) -> [u8; 3] {
+    let shade = alpha_face_scale(face_offset) * alpha_brightness(light_level);
     [
-        ((u16::from(rgb[0]) * u16::from(shade)) / 255) as u8,
-        ((u16::from(rgb[1]) * u16::from(shade)) / 255) as u8,
-        ((u16::from(rgb[2]) * u16::from(shade)) / 255) as u8,
+        (f32::from(rgb[0]) * shade).round().clamp(0.0, 255.0) as u8,
+        (f32::from(rgb[1]) * shade).round().clamp(0.0, 255.0) as u8,
+        (f32::from(rgb[2]) * shade).round().clamp(0.0, 255.0) as u8,
     ]
 }
 
@@ -530,11 +669,60 @@ mod tests {
 
     #[test]
     fn directional_face_shading_matches_alpha_profile() {
-        assert_eq!(face_shade([0, 1, 0]), 255);
-        assert_eq!(face_shade([0, -1, 0]), 128);
-        assert_eq!(face_shade([0, 0, 1]), 204);
-        assert_eq!(face_shade([0, 0, -1]), 204);
-        assert_eq!(face_shade([1, 0, 0]), 153);
-        assert_eq!(face_shade([-1, 0, 0]), 153);
+        assert_eq!(alpha_face_scale([0, 1, 0]), 1.0);
+        assert_eq!(alpha_face_scale([0, -1, 0]), 0.5);
+        assert_eq!(alpha_face_scale([0, 0, 1]), 0.8);
+        assert_eq!(alpha_face_scale([0, 0, -1]), 0.8);
+        assert_eq!(alpha_face_scale([1, 0, 0]), 0.6);
+        assert_eq!(alpha_face_scale([-1, 0, 0]), 0.6);
+    }
+
+    #[test]
+    fn alpha_brightness_curve_matches_dimension_endpoints() {
+        assert!((alpha_brightness(0) - 0.05).abs() < 0.0001);
+        assert!((alpha_brightness(15) - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn face_light_uses_neighbor_raw_light_level() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        chunk.set_block(1, 1, 1, 1);
+
+        let mut sky = [0_u8; CHUNK_VOLUME];
+        let mut block = [0_u8; CHUNK_VOLUME];
+        sky[ChunkData::index(0, 1, 1)] = 5; // -X
+        sky[ChunkData::index(2, 1, 1)] = 15; // +X
+        sky[ChunkData::index(1, 0, 1)] = 8; // -Y
+        sky[ChunkData::index(1, 2, 1)] = 12; // +Y
+        sky[ChunkData::index(1, 1, 0)] = 4; // -Z
+        sky[ChunkData::index(1, 1, 2)] = 10; // +Z
+        chunk.apply_light_channels(&sky, &block);
+
+        let mesh = build_chunk_mesh(&chunk, &registry);
+        assert_eq!(mesh.vertices.len(), 24);
+
+        let expected_levels = [5_u8, 15, 8, 12, 4, 10];
+        for (face_index, level) in expected_levels.into_iter().enumerate() {
+            let vertex = mesh.vertices[face_index * 4];
+            let rgb = [
+                vertex.light_rgba[0],
+                vertex.light_rgba[1],
+                vertex.light_rgba[2],
+            ];
+            let expected = apply_alpha_light([u8::MAX; 3], level, FACES[face_index].offset);
+            assert_eq!(rgb, expected);
+        }
+
+        block[ChunkData::index(2, 1, 1)] = 14;
+        sky[ChunkData::index(2, 1, 1)] = 2;
+        chunk.apply_light_channels(&sky, &block);
+        let mesh = build_chunk_mesh(&chunk, &registry);
+        let east = mesh.vertices[4];
+        let east_rgb = [east.light_rgba[0], east.light_rgba[1], east.light_rgba[2]];
+        assert_eq!(
+            east_rgb,
+            apply_alpha_light([u8::MAX; 3], 14, FACES[1].offset)
+        );
     }
 }

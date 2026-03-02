@@ -31,7 +31,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - A deterministic Overworld generator uses biome climate sampling + terrain noise to create startup chunks.
 - A CPU chunk mesher generates indexed triangle geometry with face-culling and atlas UVs (including face-aware texture selection from the block registry).
 - Vertex color modulation is used as the tint path; grass top tint is generated per column from biome temperature/downfall and sampled through Alpha `misc/grasscolor.png` (with a fallback map when unavailable).
-- The same vertex modulation path currently applies simple Alpha-style directional brightness per face as an interim lighting model.
+- The chunk mesher now samples neighbor-facing raw light (`max(sky, block)`), maps it through Alpha's brightness curve, and applies Alpha face scales (`top=1.0`, `bottom=0.5`, `north/south=0.8`, `west/east=0.6`) before writing vertex color modulation.
 - Region meshing performs neighbor-aware culling across chunk boundaries so interior shared faces are not emitted.
 - Bootstrap startup currently pre-generates a small region (`3x3` chunks) and builds one combined region mesh for first render.
 - The renderer owns GPU buffers/pipeline and draws chunk mesh indices each frame using camera view-projection uniforms and the Alpha terrain atlas texture.
@@ -49,9 +49,12 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
   - consumes async worker results,
   - applies per-chunk render updates (GPU upsert/remove) from worker results.
 - This keeps heavy world build steps off the render path while preserving deterministic state ownership on the main thread.
+- Dispatch now prioritizes local relight/remesh lanes before generation and uses bounded in-flight depth per lane to prevent high-radius generation churn from starving nearby edit updates.
 - Residency entries now track dirty state, and geometry remesh requests can propagate to cardinal neighbors for boundary edits.
 - Lighting dirtiness tracks a per-chunk revision. In-flight lighting results are dropped if the chunk was re-dirtied before apply.
+- Boundary lighting diffs are now scoped to chunk edges, so neighbor relight/remesh is only propagated when edge light channels actually changed.
 - Meshing results are now applied only when the target chunk is still clean; stale in-flight meshes are dropped if new edits arrived while meshing.
+- Meshing dispatch now requires neighboring lighting to be settled (no dirty/in-flight neighbor lighting) to reduce transient chunk-edge seam artifacts.
 
 ## Networking-Ready Input Pattern
 
@@ -69,7 +72,8 @@ This allows future network packets to feed the same command path without forking
 ## Renderer Culling
 
 - Chunk mesh draw calls are frustum-culled on CPU using camera view-projection planes and Alpha chunk AABBs (`16x16x128`).
-- Runtime debug stats now include visible chunk count so GPU-resident vs on-screen chunk pressure can be tracked during exploration.
+- Runtime debug stats include visible chunk count and edit-to-visible mesh latency metrics.
+- Chunk border debug mode now overlays per-chunk generation/lighting/meshing status bars to diagnose queue pressure and lighting churn near seams.
 
 ## Early Pitfalls to Avoid
 

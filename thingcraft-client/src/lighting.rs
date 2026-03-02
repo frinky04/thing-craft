@@ -339,6 +339,30 @@ mod tests {
     }
 
     #[test]
+    fn boundary_sky_light_attenuates_by_one_from_neighbor() {
+        let registry = BlockRegistry::alpha_1_2_6();
+
+        let mut center = ChunkData::new(ChunkPos { x: 0, z: 0 }, 1);
+        center.set_block(0, 64, 8, 0);
+        center.set_block(1, 64, 8, 0);
+
+        let mut west = ChunkData::new(ChunkPos { x: -1, z: 0 }, 0);
+        west.recalculate_height_map(&registry);
+
+        let output = relight_chunk(
+            &center,
+            &CardinalChunkNeighborsOwned {
+                neg_x: Some(west),
+                ..Default::default()
+            },
+            &registry,
+        );
+
+        assert_eq!(output.sky_light[light_index(0, 64, 8)], 14);
+        assert_eq!(output.sky_light[light_index(1, 64, 8)], 13);
+    }
+
+    #[test]
     fn unchanged_chunk_reports_no_lighting_diff() {
         let registry = BlockRegistry::alpha_1_2_6();
         let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, 0);

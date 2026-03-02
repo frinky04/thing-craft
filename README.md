@@ -45,6 +45,7 @@ THINGCRAFT_VIEW_RADIUS=5 THINGCRAFT_GEN_BUDGET=12 THINGCRAFT_LIGHT_BUDGET=12 THI
 - Right click (while captured): Place block on targeted face
 - `Escape`: Release cursor
 - `F`: Toggle fly mode
+- `B`: Toggle chunk border debug overlay
 
 ## Design Constraints
 

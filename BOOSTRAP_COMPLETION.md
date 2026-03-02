@@ -26,11 +26,15 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Chunk residency manager added with lifecycle states (`Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`) around a camera-centered radius.
 - [x] Background generation and meshing workers added (main thread now schedules jobs and applies async results).
 - [x] Background lighting worker added: bounded relight dispatch, queue-based block/sky propagation with cardinal-neighbor snapshots, stale-result dropping, and relight metrics.
+- [x] Chunk vertex lighting now samples propagated neighbor-facing light and maps through Alpha brightness-table + face scale multipliers (removes shader-side minimum-light clamp bias).
 - [x] Renderer now supports incremental per-chunk mesh uploads/removals (avoids full merged scene re-upload on each boundary crossing).
 - [x] Incremental streaming meshing now includes cardinal neighbor context and neighbor remesh triggers (prevents interior seam faces between loaded chunks).
 - [x] Dirty/remesh propagation groundwork added: geometry dirty tracking per chunk, edge-propagated neighbor remesh marking, and remesh counters in runtime metrics.
 - [x] Block interaction vertical slice added: camera voxel raycast emits break/place requests, fixed-tick world mutation applies them, and edited chunks trigger boundary-safe remesh propagation.
 - [x] Block edits now refresh per-column height/sky and emitted-light seeds (including touched boundary-neighbor columns) to keep chunk metadata coherent after runtime world mutation.
+- [x] Edit-path scheduling now has urgent lighting/meshing lanes, preserving near-player block update responsiveness under large view radii while background generation queues are full.
+- [x] Meshing dispatch now waits for neighboring lighting stabilization to reduce transient chunk-border seam artifacts during asynchronous relight churn.
+- [x] Chunk debug overlay now includes border boxes plus per-chunk generation/lighting/meshing status bars, and runtime stats include edit-to-visible mesh latency telemetry.
 - [x] Renderer now frustum-culls chunk draw calls per frame and exposes `visible_chunks` runtime stats for resident-vs-visible perf tracking.
 - [x] Cave carving added: Alpha-faithful worm algorithm with room/tunnel/fork logic, lava below Y=10, water-avoidance, and deterministic per-chunk seeding via Java LCG.
 - [x] Ore vein placement added: dirt, gravel, coal, iron, gold, redstone, and diamond veins using Alpha's parametric ellipsoid sweep with correct per-ore attempt counts and Y-caps.

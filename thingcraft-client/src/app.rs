@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -13,9 +13,12 @@ use winit::window::{CursorGrabMode, Window, WindowBuilder};
 use crate::ecs::EcsRuntime;
 use crate::mesh::{build_region_mesh, ChunkMesh};
 use crate::renderer::{RenderError, Renderer};
-use crate::streaming::{world_pos_to_chunk_pos, ChunkStreamer, RenderMeshUpdate, ResidencyConfig};
+use crate::streaming::{
+    world_block_to_chunk_pos_and_local, world_pos_to_chunk_pos, ChunkStreamer, RenderMeshUpdate,
+    ResidencyConfig,
+};
 use crate::time_step::FixedStepClock;
-use crate::world::{BootstrapWorld, ChunkPos};
+use crate::world::{BootstrapWorld, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
 
 const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
     "wgpu_core=warn",
@@ -28,6 +31,7 @@ const APPLY_STREAM_UPDATES_TO_RENDERER: bool = true;
 const BLOCK_INTERACTION_REACH_BLOCKS: f64 = 5.0;
 const AIR_BLOCK_ID: u8 = 0;
 const DEFAULT_PLACE_BLOCK_ID: u8 = 3;
+const EDIT_LATENCY_SAMPLE_WINDOW: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
 enum BlockInteractionKind {
@@ -63,6 +67,23 @@ struct LoopReport {
     tps: f64,
     avg_frame_ms: f64,
     avg_tick_ms: f64,
+}
+
+#[derive(Debug, Default)]
+struct EditLatencyTracker {
+    pending_by_chunk: HashMap<ChunkPos, Instant>,
+    completed_samples: VecDeque<Duration>,
+    completed_total: u64,
+    latest: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EditLatencyMetrics {
+    pending: usize,
+    completed_total: u64,
+    latest_ms: f64,
+    avg_ms: f64,
+    p95_ms: f64,
 }
 
 impl LoopStats {
@@ -101,6 +122,57 @@ impl LoopStats {
         self.since_last_report = Duration::ZERO;
 
         Some(report)
+    }
+}
+
+impl EditLatencyTracker {
+    fn record_block_edit(&mut self, world_x: i32, world_z: i32) {
+        let now = Instant::now();
+        for chunk in affected_chunks_for_block_edit(world_x, world_z) {
+            self.pending_by_chunk.entry(chunk).or_insert(now);
+        }
+    }
+
+    fn observe_render_update(&mut self, pos: ChunkPos) {
+        let Some(started_at) = self.pending_by_chunk.remove(&pos) else {
+            return;
+        };
+
+        let latency = Instant::now().saturating_duration_since(started_at);
+        self.latest = Some(latency);
+        self.completed_total = self.completed_total.saturating_add(1);
+        self.completed_samples.push_back(latency);
+        if self.completed_samples.len() > EDIT_LATENCY_SAMPLE_WINDOW {
+            self.completed_samples.pop_front();
+        }
+    }
+
+    fn metrics(&self) -> EditLatencyMetrics {
+        let mut metrics = EditLatencyMetrics {
+            pending: self.pending_by_chunk.len(),
+            completed_total: self.completed_total,
+            latest_ms: self
+                .latest
+                .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0),
+            ..Default::default()
+        };
+
+        if self.completed_samples.is_empty() {
+            return metrics;
+        }
+
+        let mut sample_ms = Vec::with_capacity(self.completed_samples.len());
+        let mut total_ms = 0.0_f64;
+        for sample in &self.completed_samples {
+            let value = sample.as_secs_f64() * 1000.0;
+            total_ms += value;
+            sample_ms.push(value);
+        }
+        metrics.avg_ms = total_ms / sample_ms.len() as f64;
+        sample_ms.sort_by(|a, b| a.total_cmp(b));
+        let p95_index = ((sample_ms.len() - 1) as f64 * 0.95).round() as usize;
+        metrics.p95_ms = sample_ms[p95_index.min(sample_ms.len() - 1)];
+        metrics
     }
 }
 
@@ -147,6 +219,7 @@ pub fn run() -> Result<()> {
     let mut loop_stats = LoopStats::default();
     let mut mouse_captured = false;
     let mut block_interaction_requests = VecDeque::new();
+    let mut edit_latency_tracker = EditLatencyTracker::default();
 
     info!(
         tick_hz = fixed_config.tick_hz,
@@ -189,6 +262,7 @@ pub fn run() -> Result<()> {
                         process_block_interaction_requests(
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
+                            &mut edit_latency_tracker,
                         );
                     }
                     let tick_duration = tick_timer_start.elapsed();
@@ -218,12 +292,20 @@ pub fn run() -> Result<()> {
                     }
 
                     chunk_streamer.tick(camera_chunk);
+                    if renderer.chunk_border_debug_enabled() {
+                        renderer.set_chunk_debug_states(chunk_streamer.debug_chunk_states());
+                    }
                     if APPLY_STREAM_UPDATES_TO_RENDERER {
                         for update in chunk_streamer.drain_render_updates() {
+                            let update_pos = match &update {
+                                RenderMeshUpdate::Upsert { pos, .. }
+                                | RenderMeshUpdate::Remove { pos } => *pos,
+                            };
                             if apply_render_update(&mut renderer, update) && bootstrap_mesh_active {
                                 renderer.set_scene_mesh(&ChunkMesh::default());
                                 bootstrap_mesh_active = false;
                             }
+                            edit_latency_tracker.observe_render_update(update_pos);
                         }
                     }
 
@@ -243,6 +325,7 @@ pub fn run() -> Result<()> {
                         loop_stats.record_frame(frame_delta, ticks_to_run, tick_duration)
                     {
                         let residency = chunk_streamer.metrics();
+                        let edit_latency = edit_latency_tracker.metrics();
                         if let Some(snapshot) = frame_camera {
                             debug!(
                                 fps = report.fps,
@@ -266,6 +349,13 @@ pub fn run() -> Result<()> {
                                 in_flight_generation = residency.in_flight_generation,
                                 in_flight_lighting = residency.in_flight_lighting,
                                 in_flight_meshing = residency.in_flight_meshing,
+                                urgent_lighting = residency.urgent_lighting,
+                                urgent_meshing = residency.urgent_meshing,
+                                edit_latency_pending = edit_latency.pending,
+                                edit_latency_completed = edit_latency.completed_total,
+                                edit_latency_latest_ms = edit_latency.latest_ms,
+                                edit_latency_avg_ms = edit_latency.avg_ms,
+                                edit_latency_p95_ms = edit_latency.p95_ms,
                                 visible_chunks = renderer.visible_chunk_count(),
                                 "runtime stats"
                             );
@@ -288,6 +378,13 @@ pub fn run() -> Result<()> {
                                 in_flight_generation = residency.in_flight_generation,
                                 in_flight_lighting = residency.in_flight_lighting,
                                 in_flight_meshing = residency.in_flight_meshing,
+                                urgent_lighting = residency.urgent_lighting,
+                                urgent_meshing = residency.urgent_meshing,
+                                edit_latency_pending = edit_latency.pending,
+                                edit_latency_completed = edit_latency.completed_total,
+                                edit_latency_latest_ms = edit_latency.latest_ms,
+                                edit_latency_avg_ms = edit_latency.avg_ms,
+                                edit_latency_p95_ms = edit_latency.p95_ms,
                                 visible_chunks = renderer.visible_chunk_count(),
                                 "runtime stats"
                             );
@@ -298,6 +395,15 @@ pub fn run() -> Result<()> {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let is_pressed = event.state == ElementState::Pressed;
                         ecs_runtime.handle_key(code, is_pressed);
+
+                        if code == KeyCode::KeyB && is_pressed && !event.repeat {
+                            let enabled = !renderer.chunk_border_debug_enabled();
+                            renderer.set_chunk_border_debug(enabled);
+                            info!(
+                                chunk_border_debug = enabled,
+                                "toggled chunk border debug overlay"
+                            );
+                        }
 
                         if code == KeyCode::Escape && is_pressed {
                             mouse_captured = false;
@@ -394,15 +500,17 @@ fn enqueue_block_interaction_request(
 fn process_block_interaction_requests(
     chunk_streamer: &mut ChunkStreamer,
     queue: &mut VecDeque<BlockInteractionRequest>,
+    edit_latency_tracker: &mut EditLatencyTracker,
 ) {
     while let Some(request) = queue.pop_front() {
-        process_single_block_interaction_request(chunk_streamer, request);
+        process_single_block_interaction_request(chunk_streamer, request, edit_latency_tracker);
     }
 }
 
 fn process_single_block_interaction_request(
     chunk_streamer: &mut ChunkStreamer,
     request: BlockInteractionRequest,
+    edit_latency_tracker: &mut EditLatencyTracker,
 ) {
     let Some(hit) = raycast_first_solid_block(
         request.origin,
@@ -415,12 +523,14 @@ fn process_single_block_interaction_request(
 
     match request.kind {
         BlockInteractionKind::Break => {
-            let _ = chunk_streamer.set_block_at_world(
+            if chunk_streamer.set_block_at_world(
                 hit.block[0],
                 hit.block[1],
                 hit.block[2],
                 AIR_BLOCK_ID,
-            );
+            ) {
+                edit_latency_tracker.record_block_edit(hit.block[0], hit.block[2]);
+            }
         }
         BlockInteractionKind::Place { block_id } => {
             if hit.normal == [0, 0, 0] {
@@ -437,11 +547,45 @@ fn process_single_block_interaction_request(
                 return;
             };
 
-            if chunk_streamer.block_at_world(place_x, place_y, place_z) == Some(AIR_BLOCK_ID) {
-                let _ = chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id);
+            if chunk_streamer.block_at_world(place_x, place_y, place_z) == Some(AIR_BLOCK_ID)
+                && chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id)
+            {
+                edit_latency_tracker.record_block_edit(place_x, place_z);
             }
         }
     }
+}
+
+fn affected_chunks_for_block_edit(world_x: i32, world_z: i32) -> Vec<ChunkPos> {
+    let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
+    let mut affected = vec![pos];
+
+    if local_x == 0 {
+        affected.push(ChunkPos {
+            x: pos.x - 1,
+            z: pos.z,
+        });
+    }
+    if local_x == (CHUNK_WIDTH as u8 - 1) {
+        affected.push(ChunkPos {
+            x: pos.x + 1,
+            z: pos.z,
+        });
+    }
+    if local_z == 0 {
+        affected.push(ChunkPos {
+            x: pos.x,
+            z: pos.z - 1,
+        });
+    }
+    if local_z == (CHUNK_DEPTH as u8 - 1) {
+        affected.push(ChunkPos {
+            x: pos.x,
+            z: pos.z + 1,
+        });
+    }
+
+    affected
 }
 
 fn raycast_first_solid_block<F>(
@@ -638,8 +782,10 @@ mod tests {
     use glam::DVec3;
 
     use super::{
-        has_target_directive, parse_env_u32, raycast_first_solid_block, BlockRayHit, AIR_BLOCK_ID,
+        affected_chunks_for_block_edit, has_target_directive, parse_env_u32,
+        raycast_first_solid_block, BlockRayHit, AIR_BLOCK_ID,
     };
+    use crate::world::{ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
 
     #[test]
     fn detects_target_directives_exactly() {
@@ -657,6 +803,26 @@ mod tests {
     #[test]
     fn env_u32_parser_handles_valid_and_invalid_values() {
         assert_eq!(parse_env_u32("THINGCRAFT_TEST_MISSING"), None);
+    }
+
+    #[test]
+    fn block_edit_chunk_affects_cardinal_neighbors_on_edges() {
+        assert_eq!(
+            affected_chunks_for_block_edit(1, 1),
+            vec![ChunkPos { x: 0, z: 0 }]
+        );
+
+        let edge_x = CHUNK_WIDTH as i32 - 1;
+        assert_eq!(
+            affected_chunks_for_block_edit(edge_x, 2),
+            vec![ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }]
+        );
+
+        let edge_z = CHUNK_DEPTH as i32 - 1;
+        assert_eq!(
+            affected_chunks_for_block_edit(2, edge_z),
+            vec![ChunkPos { x: 0, z: 0 }, ChunkPos { x: 0, z: 1 }]
+        );
     }
 
     #[test]
