@@ -81,20 +81,20 @@ const FACES: [FaceDef; 6] = [
     FaceDef {
         offset: [0, 0, -1],
         corners: [
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
         ],
     },
     // +Z
     FaceDef {
         offset: [0, 0, 1],
         corners: [
-            [0.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 1.0, 1.0],
             [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0],
         ],
     },
 ];
@@ -277,5 +277,21 @@ mod tests {
             .indices
             .iter()
             .any(|index| *index >= mesh_a.vertices.len() as u32));
+    }
+
+    #[test]
+    fn face_corners_follow_outward_winding() {
+        for face in FACES {
+            let a = glam::Vec3::from_array(face.corners[0]);
+            let b = glam::Vec3::from_array(face.corners[1]);
+            let c = glam::Vec3::from_array(face.corners[2]);
+            let normal = (b - a).cross(c - a).normalize_or_zero();
+            let outward = glam::Vec3::new(
+                face.offset[0] as f32,
+                face.offset[1] as f32,
+                face.offset[2] as f32,
+            );
+            assert!(normal.dot(outward) > 0.99);
+        }
     }
 }

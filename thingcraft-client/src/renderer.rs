@@ -487,19 +487,24 @@ fn load_terrain_atlas_rgba(atlas_path: &Path) -> (u32, u32, Vec<u8>) {
         )
     };
 
-    let bytes = match std::fs::read(atlas_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return fallback(),
-    };
+    let candidate_paths = [atlas_path.to_path_buf(), Path::new("..").join(atlas_path)];
+    for candidate in candidate_paths {
+        let bytes = match std::fs::read(&candidate) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
 
-    let image = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) {
-        Ok(image) => image,
-        Err(_) => return fallback(),
-    };
+        let image = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) {
+            Ok(image) => image,
+            Err(_) => continue,
+        };
 
-    let rgba = image.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    (width, height, rgba.into_raw())
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        return (width, height, rgba.into_raw());
+    }
+
+    fallback()
 }
 
 const CHUNK_SHADER: &str = r#"

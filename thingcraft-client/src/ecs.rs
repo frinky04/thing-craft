@@ -270,7 +270,7 @@ fn apply_player_motion_system(
         let forward =
             DVec3::new(yaw_sin * pitch_cos, pitch_sin, yaw_cos * pitch_cos).normalize_or_zero();
         let flat_forward = DVec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
-        let right = DVec3::new(flat_forward.z, 0.0, -flat_forward.x).normalize_or_zero();
+        let right = flat_forward.cross(DVec3::Y).normalize_or_zero();
 
         let mut desired_direction =
             right * f64::from(intent.movement.x) + flat_forward * f64::from(intent.movement.z);
@@ -383,5 +383,26 @@ mod tests {
         assert!((snapshot.interpolated.position.x - 2.5).abs() < 1e-6);
         assert!((snapshot.interpolated.yaw - 0.5).abs() < 1e-6);
         assert!((snapshot.interpolated.pitch - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn strafing_right_moves_negative_x_at_zero_yaw() {
+        let mut runtime = EcsRuntime::new();
+        let before = runtime
+            .camera_snapshot()
+            .expect("expected a player entity")
+            .authoritative
+            .position;
+
+        runtime.handle_key(KeyCode::KeyD, true);
+        runtime.run_input();
+        runtime.run_fixed(1.0);
+
+        let after = runtime
+            .camera_snapshot()
+            .expect("expected a player entity")
+            .authoritative
+            .position;
+        assert!(after.x < before.x);
     }
 }
