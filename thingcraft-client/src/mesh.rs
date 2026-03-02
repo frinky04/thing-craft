@@ -165,7 +165,14 @@ where
                         local_z as f32 + chunk_origin_z,
                         face,
                         registry.sprite_index_for_face(block_id, face.offset),
-                        registry.face_tint_rgb(block_id, face.offset),
+                        resolve_face_tint(
+                            chunk,
+                            registry,
+                            block_id,
+                            face.offset,
+                            local_x as u8,
+                            local_z as u8,
+                        ),
                     );
                 }
             }
@@ -200,6 +207,21 @@ fn neighbor_block(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
     }
 
     chunk.block(x as u8, y as u8, z as u8)
+}
+
+fn resolve_face_tint(
+    chunk: &ChunkData,
+    registry: &BlockRegistry,
+    block_id: u8,
+    face_offset: [i32; 3],
+    local_x: u8,
+    local_z: u8,
+) -> [u8; 3] {
+    if registry.face_uses_biome_tint(block_id, face_offset) {
+        chunk.grass_tint_at(local_x, local_z)
+    } else {
+        registry.face_tint_rgb(block_id, face_offset)
+    }
 }
 
 fn neighbor_block_from_region(

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::Path;
 
 use noise::{Fbm, MultiFractal, NoiseFn, OpenSimplex};
 
@@ -34,6 +35,7 @@ const ALPHA_EXCLUDED_BLOCK_IDS: [u8; 15] = [
     34, // Piston Head
     36, // Moving Block
 ];
+const WHITE_RGB_PACKED: u32 = 0x00FF_FFFF;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MaterialKind {
@@ -494,10 +496,16 @@ impl BlockRegistry {
     #[must_use]
     pub fn face_tint_rgb(&self, block_id: u8, face_offset: [i32; 3]) -> [u8; 3] {
         match (block_id, face_offset[1]) {
-            // Alpha grass-top is biome-tinted in the original client.
-            (GRASS_ID, 1) => [126, 201, 86],
+            // Alpha grass-top is biome-tinted in the original client; the biome tint is provided
+            // by chunk data during meshing.
+            (GRASS_ID, 1) => [0, 0, 0],
             _ => [u8::MAX, u8::MAX, u8::MAX],
         }
+    }
+
+    #[must_use]
+    pub fn face_uses_biome_tint(&self, block_id: u8, face_offset: [i32; 3]) -> bool {
+        matches!((block_id, face_offset[1]), (GRASS_ID, 1))
     }
 
     #[must_use]
@@ -683,6 +691,7 @@ impl BiomeSource {
 pub struct OverworldChunkGenerator {
     biome_source: BiomeSource,
     terrain_noise: Fbm<OpenSimplex>,
+    grass_color_map: GrassColorMap,
 }
 
 impl OverworldChunkGenerator {
@@ -692,10 +701,12 @@ impl OverworldChunkGenerator {
         let mut terrain_noise =
             Fbm::<OpenSimplex>::new((seed.wrapping_mul(341_873_128_712) & 0xFFFF_FFFF) as u32);
         terrain_noise = terrain_noise.set_octaves(8).set_frequency(1.0 / 684.412);
+        let grass_color_map = GrassColorMap::load();
 
         Self {
             biome_source,
             terrain_noise,
+            grass_color_map,
         }
     }
 
@@ -710,6 +721,10 @@ impl OverworldChunkGenerator {
                 let biome_sample = self.biome_source.sample(world_x, world_z);
                 let (surface_block, subsurface_block) =
                     biome_sample.biome.surface_subsurface_blocks();
+                let grass_tint = self
+                    .grass_color_map
+                    .sample(biome_sample.temperature, biome_sample.downfall);
+                chunk.set_grass_tint(local_x, local_z, grass_tint);
 
                 let terrain_base = self
                     .terrain_noise
@@ -797,6 +812,7 @@ pub struct ChunkData {
     sky_light: NibbleStorage,
     block_light: NibbleStorage,
     height_map: [u8; CHUNK_AREA],
+    grass_tint: [u32; CHUNK_AREA],
 }
 
 impl ChunkData {
@@ -808,6 +824,7 @@ impl ChunkData {
             sky_light: NibbleStorage::new(CHUNK_VOLUME),
             block_light: NibbleStorage::new(CHUNK_VOLUME),
             height_map: [0; CHUNK_AREA],
+            grass_tint: [WHITE_RGB_PACKED; CHUNK_AREA],
         }
     }
 
@@ -905,12 +922,85 @@ impl ChunkData {
     }
 
     #[must_use]
+    pub fn grass_tint_at(&self, local_x: u8, local_z: u8) -> [u8; 3] {
+        let packed = self.grass_tint[usize::from(local_z) * CHUNK_WIDTH + usize::from(local_x)];
+        unpack_rgb(packed)
+    }
+
+    fn set_grass_tint(&mut self, local_x: u8, local_z: u8, tint: [u8; 3]) {
+        let index = usize::from(local_z) * CHUNK_WIDTH + usize::from(local_x);
+        self.grass_tint[index] = pack_rgb(tint);
+    }
+
+    #[must_use]
     pub fn index(local_x: u8, y: u8, local_z: u8) -> usize {
         assert!(usize::from(local_x) < CHUNK_WIDTH, "local_x out of range");
         assert!(usize::from(local_z) < CHUNK_DEPTH, "local_z out of range");
         assert!(usize::from(y) < CHUNK_HEIGHT, "y out of range");
         (usize::from(local_x) << 11) | (usize::from(local_z) << 7) | usize::from(y)
     }
+}
+
+#[derive(Debug, Clone)]
+struct GrassColorMap {
+    rgb: Box<[u32; 256 * 256]>,
+}
+
+impl GrassColorMap {
+    fn load() -> Self {
+        let fallback = || Self {
+            rgb: Box::new([pack_rgb([126, 201, 86]); 256 * 256]),
+        };
+
+        let candidates = [
+            Path::new("resources/minecraft-a1.2.6-client/misc/grasscolor.png").to_path_buf(),
+            Path::new("../resources/minecraft-a1.2.6-client/misc/grasscolor.png").to_path_buf(),
+        ];
+
+        for candidate in candidates {
+            let bytes = match std::fs::read(candidate) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let image = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) {
+                Ok(image) => image.to_rgba8(),
+                Err(_) => continue,
+            };
+            let (width, height) = image.dimensions();
+            if width != 256 || height != 256 {
+                continue;
+            }
+
+            let mut rgb = [0_u32; 256 * 256];
+            for (index, pixel) in image.pixels().enumerate() {
+                rgb[index] = pack_rgb([pixel[0], pixel[1], pixel[2]]);
+            }
+            return Self { rgb: Box::new(rgb) };
+        }
+
+        fallback()
+    }
+
+    fn sample(&self, temperature: f64, downfall: f64) -> [u8; 3] {
+        // Alpha uses temperature plus humidity*temperature to index misc/grasscolor.png.
+        let temp = temperature.clamp(0.0, 1.0);
+        let humid = (downfall * temp).clamp(0.0, 1.0);
+        let x = ((1.0 - temp) * 255.0).round() as usize;
+        let y = ((1.0 - humid) * 255.0).round() as usize;
+        unpack_rgb(self.rgb[(y << 8) | x])
+    }
+}
+
+const fn pack_rgb(rgb: [u8; 3]) -> u32 {
+    ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
+}
+
+const fn unpack_rgb(rgb: u32) -> [u8; 3] {
+    [
+        ((rgb >> 16) & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        (rgb & 0xFF) as u8,
+    ]
 }
 
 #[derive(Debug, Clone)]
@@ -1017,13 +1107,23 @@ mod tests {
     }
 
     #[test]
-    fn grass_top_face_has_green_tint() {
+    fn grass_top_face_marks_biome_tint_usage() {
         let registry = BlockRegistry::alpha_1_2_6();
-        assert_eq!(registry.face_tint_rgb(GRASS_ID, [0, 1, 0]), [126, 201, 86]);
+        assert_eq!(registry.face_tint_rgb(GRASS_ID, [0, 1, 0]), [0, 0, 0]);
+        assert!(registry.face_uses_biome_tint(GRASS_ID, [0, 1, 0]));
         assert_eq!(
             registry.face_tint_rgb(STONE_ID, [0, 1, 0]),
             [u8::MAX, u8::MAX, u8::MAX]
         );
+        assert!(!registry.face_uses_biome_tint(STONE_ID, [0, 1, 0]));
+    }
+
+    #[test]
+    fn generated_chunk_has_non_white_grass_tint_samples() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let generator = OverworldChunkGenerator::new(0xA126_0001);
+        let chunk = generator.generate_chunk(ChunkPos { x: 0, z: 0 }, &registry);
+        assert_ne!(chunk.grass_tint_at(8, 8), [u8::MAX, u8::MAX, u8::MAX]);
     }
 
     #[test]
