@@ -41,6 +41,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - Runtime chunk residency is managed with explicit states: `Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`.
 - Residency targets are derived from the camera chunk position with a configurable square radius.
 - Chunk generation and chunk meshing run on dedicated worker threads.
+- Meshing jobs include cardinal neighbor chunk snapshots so chunk-boundary face culling remains correct with incremental uploads.
 - The main thread only:
   - computes residency deltas,
   - dispatches bounded job batches per frame,

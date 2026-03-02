@@ -24,6 +24,7 @@
 - [x] Chunk residency manager added with lifecycle states (`Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`) around a camera-centered radius.
 - [x] Background generation and meshing workers added (main thread now schedules jobs and applies async results).
 - [x] Renderer now supports incremental per-chunk mesh uploads/removals (avoids full merged scene re-upload on each boundary crossing).
+- [x] Incremental streaming meshing now includes cardinal neighbor context and neighbor remesh triggers (prevents interior seam faces between loaded chunks).
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
 
