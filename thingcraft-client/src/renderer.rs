@@ -2306,11 +2306,10 @@ fn alpha_brightness(level: f32) -> f32 {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let leaf_fast = input.leaf_marker > 0.5 && camera.leaf_cutout_enabled < 0.5;
-    let uv = if (leaf_fast) {
-        input.uv + vec2<f32>(1.0 / 16.0, 0.0)
-    } else {
-        input.uv
-    };
+    var uv = input.uv;
+    if (leaf_fast) {
+        uv = input.uv + vec2<f32>(1.0 / 16.0, 0.0);
+    }
     let texel = textureSample(terrain_atlas, terrain_sampler, uv);
     if (texel.a <= 0.1 && !leaf_fast) {
         discard;
