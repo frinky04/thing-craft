@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
@@ -46,6 +47,12 @@ pub struct ResidencyMetrics {
     pub in_flight_meshing: usize,
 }
 
+#[derive(Debug, Clone)]
+pub enum RenderMeshUpdate {
+    Upsert { pos: ChunkPos, mesh: ChunkMesh },
+    Remove { pos: ChunkPos },
+}
+
 #[derive(Debug)]
 struct ChunkResidencyEntry {
     state: ChunkResidencyState,
@@ -88,6 +95,7 @@ pub struct ChunkStreamer {
     generation_thread: Option<thread::JoinHandle<()>>,
     meshing_thread: Option<thread::JoinHandle<()>>,
     mesh_dirty: bool,
+    render_updates: Vec<RenderMeshUpdate>,
 }
 
 impl ChunkStreamer {
@@ -149,17 +157,26 @@ impl ChunkStreamer {
             generation_thread: Some(generation_thread),
             meshing_thread: Some(meshing_thread),
             mesh_dirty: true,
+            render_updates: Vec::new(),
         }
     }
 
     pub fn update_target(&mut self, center_chunk: ChunkPos) -> Option<ChunkMesh> {
+        self.tick(center_chunk);
+        self.rebuild_scene_mesh_if_dirty()
+    }
+
+    pub fn tick(&mut self, center_chunk: ChunkPos) {
         self.refresh_required_set(center_chunk);
         self.poll_generation_results();
         self.poll_meshing_results();
         self.dispatch_generation(center_chunk);
         self.dispatch_meshing(center_chunk);
         self.cleanup_evicted();
-        self.rebuild_scene_mesh_if_dirty()
+    }
+
+    pub fn drain_render_updates(&mut self) -> Vec<RenderMeshUpdate> {
+        mem::take(&mut self.render_updates)
     }
 
     #[must_use]
@@ -207,6 +224,8 @@ impl ChunkStreamer {
                 slot.chunk = None;
                 slot.mesh = None;
                 self.mesh_dirty = true;
+                self.render_updates
+                    .push(RenderMeshUpdate::Remove { pos: *pos });
             }
         }
 
@@ -329,6 +348,12 @@ impl ChunkStreamer {
                         slot.mesh = Some(result.mesh);
                         slot.state = ChunkResidencyState::Ready;
                         self.mesh_dirty = true;
+                        if let Some(mesh) = &slot.mesh {
+                            self.render_updates.push(RenderMeshUpdate::Upsert {
+                                pos: result.pos,
+                                mesh: mesh.clone(),
+                            });
+                        }
                     }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
@@ -534,5 +559,40 @@ mod tests {
             world_pos_to_chunk_pos(-16.1, -16.1),
             ChunkPos { x: -2, z: -2 }
         );
+    }
+
+    #[test]
+    fn residency_emits_render_updates_for_ready_and_evict() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 2,
+                max_meshing_dispatch: 2,
+            },
+        );
+
+        let start = ChunkPos { x: 0, z: 0 };
+        let mut saw_upsert = false;
+        for _ in 0..500 {
+            streamer.tick(start);
+            saw_upsert |= streamer
+                .drain_render_updates()
+                .iter()
+                .any(|update| matches!(update, RenderMeshUpdate::Upsert { .. }));
+            if streamer.metrics().ready == 1 && saw_upsert {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(saw_upsert);
+
+        streamer.tick(ChunkPos { x: 3, z: 0 });
+        let updates = streamer.drain_render_updates();
+        assert!(updates
+            .iter()
+            .any(|update| matches!(update, RenderMeshUpdate::Remove { pos } if *pos == start)));
     }
 }

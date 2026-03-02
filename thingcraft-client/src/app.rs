@@ -10,9 +10,9 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
 use crate::ecs::EcsRuntime;
-use crate::mesh::build_region_mesh;
+use crate::mesh::{build_region_mesh, ChunkMesh};
 use crate::renderer::{RenderError, Renderer};
-use crate::streaming::{world_pos_to_chunk_pos, ChunkStreamer, ResidencyConfig};
+use crate::streaming::{world_pos_to_chunk_pos, ChunkStreamer, RenderMeshUpdate, ResidencyConfig};
 use crate::time_step::FixedStepClock;
 use crate::world::{BootstrapWorld, ChunkPos};
 
@@ -23,6 +23,7 @@ const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
     "ash=warn",
     "calloop=warn",
 ];
+const APPLY_STREAM_UPDATES_TO_RENDERER: bool = true;
 
 #[derive(Debug, Default)]
 struct LoopStats {
@@ -103,6 +104,7 @@ pub fn run() -> Result<()> {
     let bootstrap_mesh =
         build_region_mesh(&bootstrap_world.spawn_region, &bootstrap_world.registry);
     renderer.set_scene_mesh(&bootstrap_mesh);
+    let mut bootstrap_mesh_active = true;
 
     let residency_config = ResidencyConfig::default();
     let mut chunk_streamer = ChunkStreamer::new(
@@ -110,8 +112,12 @@ pub fn run() -> Result<()> {
         bootstrap_world.registry.clone(),
         residency_config,
     );
-    if let Some(scene_mesh) = chunk_streamer.update_target(ChunkPos { x: 0, z: 0 }) {
-        renderer.set_scene_mesh(&scene_mesh);
+    let _ = chunk_streamer.update_target(ChunkPos { x: 0, z: 0 });
+    for update in chunk_streamer.drain_render_updates() {
+        if apply_render_update(&mut renderer, update) && bootstrap_mesh_active {
+            renderer.set_scene_mesh(&ChunkMesh::default());
+            bootstrap_mesh_active = false;
+        }
     }
 
     let mut last_frame_start = Instant::now();
@@ -182,8 +188,14 @@ pub fn run() -> Result<()> {
                         frame_camera = Some(snapshot);
                     }
 
-                    if let Some(scene_mesh) = chunk_streamer.update_target(camera_chunk) {
-                        renderer.set_scene_mesh(&scene_mesh);
+                    chunk_streamer.tick(camera_chunk);
+                    if APPLY_STREAM_UPDATES_TO_RENDERER {
+                        for update in chunk_streamer.drain_render_updates() {
+                            if apply_render_update(&mut renderer, update) && bootstrap_mesh_active {
+                                renderer.set_scene_mesh(&ChunkMesh::default());
+                                bootstrap_mesh_active = false;
+                            }
+                        }
                     }
 
                     match renderer.render() {
@@ -219,6 +231,7 @@ pub fn run() -> Result<()> {
                                 evicting_chunks = residency.evicting,
                                 in_flight_generation = residency.in_flight_generation,
                                 in_flight_meshing = residency.in_flight_meshing,
+                                gpu_chunk_meshes = renderer.chunk_mesh_count(),
                                 "runtime stats"
                             );
                         } else {
@@ -234,6 +247,7 @@ pub fn run() -> Result<()> {
                                 evicting_chunks = residency.evicting,
                                 in_flight_generation = residency.in_flight_generation,
                                 in_flight_meshing = residency.in_flight_meshing,
+                                gpu_chunk_meshes = renderer.chunk_mesh_count(),
                                 "runtime stats"
                             );
                         }
@@ -298,6 +312,19 @@ fn set_mouse_capture(window: &Window, captured: bool) {
         }
     } else if let Err(err) = window.set_cursor_grab(CursorGrabMode::None) {
         warn!(?err, "failed to release cursor");
+    }
+}
+
+fn apply_render_update(renderer: &mut Renderer<'_>, update: RenderMeshUpdate) -> bool {
+    match update {
+        RenderMeshUpdate::Upsert { pos, mesh } => {
+            renderer.upsert_chunk_mesh(pos, &mesh);
+            true
+        }
+        RenderMeshUpdate::Remove { pos } => {
+            renderer.remove_chunk_mesh(pos);
+            false
+        }
     }
 }
 

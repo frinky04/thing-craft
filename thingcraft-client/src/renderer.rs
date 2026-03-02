@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -8,6 +9,7 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::mesh::{ChunkMesh, MeshVertex};
+use crate::world::ChunkPos;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -24,6 +26,7 @@ pub struct Renderer<'w> {
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     scene_mesh: Option<SceneMeshGpu>,
+    chunk_meshes: HashMap<ChunkPos, SceneMeshGpu>,
 }
 
 struct SceneMeshGpu {
@@ -243,6 +246,7 @@ impl<'w> Renderer<'w> {
             depth_texture,
             depth_view,
             scene_mesh: None,
+            chunk_meshes: HashMap::new(),
         })
     }
 
@@ -287,6 +291,47 @@ impl<'w> Renderer<'w> {
             index_buffer,
             index_count: mesh.indices.len() as u32,
         });
+    }
+
+    pub fn upsert_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            self.chunk_meshes.remove(&pos);
+            return;
+        }
+
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("thingcraft-chunk-vertex-buffer"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("thingcraft-chunk-index-buffer"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+        self.chunk_meshes.insert(
+            pos,
+            SceneMeshGpu {
+                vertex_buffer,
+                index_buffer,
+                index_count: mesh.indices.len() as u32,
+            },
+        );
+    }
+
+    pub fn remove_chunk_mesh(&mut self, pos: ChunkPos) {
+        self.chunk_meshes.remove(&pos);
+    }
+
+    #[must_use]
+    pub fn chunk_mesh_count(&self) -> usize {
+        self.chunk_meshes.len()
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -376,6 +421,20 @@ impl<'w> Renderer<'w> {
                 render_pass
                     .set_index_buffer(scene_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..scene_mesh.index_count, 0, 0..1);
+            }
+
+            if !self.chunk_meshes.is_empty() {
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.terrain_bind_group, &[]);
+                for chunk_mesh in self.chunk_meshes.values() {
+                    render_pass.set_vertex_buffer(0, chunk_mesh.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        chunk_mesh.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
+                }
             }
         }
 
