@@ -8,3 +8,4 @@
 - **Resources:** Check the resources folder for anything you need. The original textures, resource pack, and 498 decompiled Java files with human-readable names are now in resources/decomp/src/. 
 - **Source Code Note:** Steal the numbers, not the structure. Use the decompiled source to verify exact values and behaviors, then reimplement them using our modern ECS architecture and data-driven design.
 - **What to Read:** WHAT.md is our north-star! Read it if you are lost.
+- **Completion Docs Split:** Keep both `BOOSTRAP_COMPLETION.md` (bootstrap/implementation) and `GAMEPLAY_COMPLETION.md` (Alpha gameplay parity) updated.

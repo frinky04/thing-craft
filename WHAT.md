@@ -30,4 +30,6 @@ The Rust Fix: Treat lighting as a queue-based cellular automaton. When a block c
 Since we are using bevy_ecs, a great way to "build smart" for future networking is to strictly separate your inputs/commands from your state execution. If a player clicks to place a block, don't have the input system place the block directly. Have it emit a PlaceBlockRequest event. Your game logic then processes that event. When you add multiplayer later, an incoming network packet just emits that exact same PlaceBlockRequest event.
 
 # Checklist
-Check and update COMPLETION.md for a full list of features in Alpha 1.2.6.
+Check and update both completion docs:
+- `BOOSTRAP_COMPLETION.md` for implementation/bootstrap milestones.
+- `GAMEPLAY_COMPLETION.md` for Alpha 1.2.6 gameplay parity.

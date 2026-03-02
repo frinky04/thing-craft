@@ -160,5 +160,6 @@ Reach functional feature parity in controlled waves.
 - Multiplayer transport layer
 
 ### Exit Criteria
-- `COMPLETION.md` reflects validated parity progress
+- `GAMEPLAY_COMPLETION.md` reflects validated gameplay parity progress
+- `BOOSTRAP_COMPLETION.md` reflects validated bootstrap/implementation progress
 - Regressions covered by targeted tests and playtest checklists
