@@ -31,12 +31,16 @@ pub struct Renderer<'w> {
     render_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     debug_line_pipeline: wgpu::RenderPipeline,
+    block_outline_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     cloud_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     sky_uniform_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
+    sky_dome: SkyDome,
+    celestial_pipeline: wgpu::RenderPipeline,
+    celestial_bodies: CelestialBodies,
     terrain_atlas: TerrainAtlas,
     cloud_layer: CloudLayer,
     depth_texture: wgpu::Texture,
@@ -48,7 +52,11 @@ pub struct Renderer<'w> {
     chunk_border_mesh: Option<DebugLineMeshGpu>,
     chunk_border_mesh_dirty: bool,
     chunk_border_debug_enabled: bool,
+    block_outline_mesh: Option<OutlineMeshGpu>,
     camera_frustum: Option<FrustumPlanes>,
+    cached_view_proj: [[f32; 4]; 4],
+    /// View-proj with translation stripped — for sky dome and celestial bodies (infinite distance).
+    cached_sky_view_proj: [[f32; 4]; 4],
     visible_chunk_meshes: usize,
     hud_pipeline: wgpu::RenderPipeline,
     hud_uniform_buffer: wgpu::Buffer,
@@ -56,6 +64,7 @@ pub struct Renderer<'w> {
     hud_vertex_buffer: Option<wgpu::Buffer>,
     hud_vertex_count: u32,
     fog_color: [f32; 3],
+    fog_end: f32,
     sky_color: [f32; 3],
     render_sky: bool,
     cloud_color: [f32; 3],
@@ -63,6 +72,7 @@ pub struct Renderer<'w> {
     ambient_darkness: f32,
     leaf_cutout_enabled: f32,
     camera_pos: [f32; 3],
+    time_of_day: f32,
     mesh_buffer_pool: MeshBufferPool,
 }
 
@@ -131,6 +141,33 @@ impl DebugLineVertex {
     }
 }
 
+/// Vertex for block outline rendering: position + RGBA color (supports alpha).
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct OutlineVertex {
+    position: [f32; 3],
+    color: [f32; 4],
+}
+
+impl OutlineVertex {
+    const ATTRS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+
+    #[must_use]
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
+struct OutlineMeshGpu {
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
+}
+
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct CameraUniform {
@@ -147,8 +184,90 @@ struct CameraUniform {
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct SkyUniform {
+    /// Rotation-only view-proj (no translation — sky at infinite distance).
+    sky_view_proj: [[f32; 4]; 4],
     color: [f32; 3],
-    _pad: f32,
+    fog_end: f32,
+    fog_color: [f32; 3],
+    _pad0: f32,
+    dark_color: [f32; 3],
+    _pad1: f32,
+}
+
+/// Vertex for the sky dome meshes: world-space position only (color is uniform).
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct SkyDomeVertex {
+    position: [f32; 3],
+}
+
+impl SkyDomeVertex {
+    const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+
+    #[must_use]
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
+struct SkyDome {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    light_index_count: u32,
+    dark_index_offset: u32,
+    dark_index_count: u32,
+}
+
+/// Celestial bodies (sun + moon): textured quads rotated by time of day.
+struct CelestialBodies {
+    uniform_bind_group: wgpu::BindGroup,
+    texture_bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
+    vertex_buffer: wgpu::Buffer,
+    sun_index_offset: u32,
+    sun_index_count: u32,
+    moon_index_offset: u32,
+    moon_index_count: u32,
+    index_buffer: wgpu::Buffer,
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct CelestialUniform {
+    view_proj: [[f32; 4]; 4],
+    /// Rotation angle in radians: timeOfDay * 2π
+    time_angle: f32,
+    _pad0: f32,
+    /// Camera XZ position (celestial bodies follow camera with no parallax).
+    camera_xz: [f32; 2],
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct CelestialVertex {
+    /// Local position before rotation (x, y, z)
+    position: [f32; 3],
+    uv: [f32; 2],
+    /// 0.0 = sun, 1.0 = moon (used to flip rotation in shader)
+    body_id: f32,
+}
+
+impl CelestialVertex {
+    const ATTRS: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32];
+
+    #[must_use]
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -419,6 +538,9 @@ impl<'w> Renderer<'w> {
             .context("failed to request logical device")?;
 
         let surface_caps = surface.get_capabilities(&adapter);
+        // Prefer non-sRGB surface: our gamma-space pipeline (matching MC Alpha's OpenGL)
+        // writes already sRGB-encoded values. A non-sRGB swapchain writes them byte-for-byte
+        // without any additional gamma curve.
         let surface_format = surface_caps
             .formats
             .iter()
@@ -432,6 +554,13 @@ impl<'w> Renderer<'w> {
                     .find(wgpu::TextureFormat::is_srgb)
             })
             .unwrap_or(surface_caps.formats[0]);
+
+        tracing::info!(
+            "Selected surface format: {:?} (is_srgb: {}, available: {:?})",
+            surface_format,
+            surface_format.is_srgb(),
+            surface_caps.formats,
+        );
 
         let present_mode = surface_caps
             .present_modes
@@ -503,8 +632,13 @@ impl<'w> Renderer<'w> {
         });
 
         let sky_uniform = SkyUniform {
+            sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             color: DEFAULT_FOG_COLOR,
-            _pad: 0.0,
+            fog_end: 128.0,
+            fog_color: DEFAULT_FOG_COLOR,
+            _pad0: 0.0,
+            dark_color: [0.0; 3],
+            _pad1: 0.0,
         };
         let sky_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("thingcraft-sky-uniform-buffer"),
@@ -516,7 +650,7 @@ impl<'w> Renderer<'w> {
                 label: Some("thingcraft-sky-bind-group-layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -533,6 +667,134 @@ impl<'w> Renderer<'w> {
                 resource: sky_uniform_buffer.as_entire_binding(),
             }],
         });
+
+        let sky_dome = create_sky_dome(&device);
+
+        // Celestial body texture bind group layout (shared with cloud-style layout).
+        let celestial_tex_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-celestial-tex-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let celestial_uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-celestial-uniform-bind-group-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let celestial_bodies = create_celestial_bodies(
+            &device,
+            &queue,
+            &celestial_tex_bind_group_layout,
+            &celestial_uniform_bind_group_layout,
+            Path::new("resources/minecraft-a1.2.6-client/terrain/sun.png"),
+            Path::new("resources/minecraft-a1.2.6-client/terrain/moon.png"),
+        );
+
+        let celestial_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-celestial-shader"),
+            source: wgpu::ShaderSource::Wgsl(CELESTIAL_SHADER.into()),
+        });
+        let celestial_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("thingcraft-celestial-pipeline-layout"),
+                bind_group_layouts: &[
+                    &celestial_uniform_bind_group_layout,
+                    &celestial_tex_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+        let celestial_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("thingcraft-celestial-pipeline"),
+                layout: Some(&celestial_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &celestial_shader,
+                    entry_point: "vs_main",
+                    buffers: &[CelestialVertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &celestial_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        // Additive blending: GL_ONE, GL_ONE (MC Alpha)
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview: None,
+            });
 
         let terrain_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -712,7 +974,7 @@ impl<'w> Renderer<'w> {
             vertex: wgpu::VertexState {
                 module: &sky_shader,
                 entry_point: "vs_main",
-                buffers: &[],
+                buffers: &[SkyDomeVertex::layout()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             primitive: wgpu::PrimitiveState {
@@ -868,6 +1130,61 @@ impl<'w> Renderer<'w> {
             multiview: None,
         });
 
+        // Block outline pipeline: line list with alpha blending for selection wireframe.
+        let outline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-outline-shader"),
+            source: wgpu::ShaderSource::Wgsl(BLOCK_OUTLINE_SHADER.into()),
+        });
+        let block_outline_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("thingcraft-outline-pipeline-layout"),
+                bind_group_layouts: &[&camera_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let block_outline_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("thingcraft-outline-pipeline"),
+                layout: Some(&block_outline_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &outline_shader,
+                    entry_point: "vs_main",
+                    buffers: &[OutlineVertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &outline_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview: None,
+            });
+
         // HUD pipeline: 2D overlay with orthographic projection, no depth test.
         let hud_uniform = HudUniform {
             screen_width: config.width as f32,
@@ -961,12 +1278,16 @@ impl<'w> Renderer<'w> {
             render_pipeline,
             transparent_pipeline,
             debug_line_pipeline,
+            block_outline_pipeline,
             sky_pipeline,
             cloud_pipeline,
             camera_buffer,
             camera_bind_group,
             sky_uniform_buffer,
             sky_bind_group,
+            sky_dome,
+            celestial_pipeline,
+            celestial_bodies,
             terrain_atlas,
             cloud_layer,
             depth_texture,
@@ -978,7 +1299,10 @@ impl<'w> Renderer<'w> {
             chunk_border_mesh: None,
             chunk_border_mesh_dirty: true,
             chunk_border_debug_enabled: false,
+            block_outline_mesh: None,
             camera_frustum: None,
+            cached_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            cached_sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             visible_chunk_meshes: 0,
             hud_pipeline,
             hud_uniform_buffer,
@@ -986,6 +1310,7 @@ impl<'w> Renderer<'w> {
             hud_vertex_buffer: None,
             hud_vertex_count: 0,
             fog_color: DEFAULT_FOG_COLOR,
+            fog_end: 128.0,
             sky_color: DEFAULT_FOG_COLOR,
             render_sky: false,
             cloud_color: [1.0, 1.0, 1.0],
@@ -993,6 +1318,7 @@ impl<'w> Renderer<'w> {
             ambient_darkness: 0.0,
             leaf_cutout_enabled: 1.0,
             camera_pos: [0.0; 3],
+            time_of_day: 0.0,
             mesh_buffer_pool: MeshBufferPool::default(),
         })
     }
@@ -1008,16 +1334,18 @@ impl<'w> Renderer<'w> {
     pub fn update_camera(
         &mut self,
         view_proj: [[f32; 4]; 4],
+        sky_view_proj: [[f32; 4]; 4],
         camera_pos: [f32; 3],
         fog_start: f32,
         fog_end: f32,
     ) {
+        let fog_end_clamped = fog_end.max(fog_start + 0.001);
         let uniform = CameraUniform {
             view_proj,
             camera_pos,
             fog_start,
             fog_color: self.fog_color,
-            fog_end: fog_end.max(fog_start + 0.001),
+            fog_end: fog_end_clamped,
             ambient_darkness: self.ambient_darkness,
             leaf_cutout_enabled: self.leaf_cutout_enabled,
             _pad: [0.0; 2],
@@ -1027,6 +1355,9 @@ impl<'w> Renderer<'w> {
         let matrix = Mat4::from_cols_array_2d(&view_proj);
         self.camera_frustum = Some(FrustumPlanes::from_view_proj(matrix));
         self.camera_pos = camera_pos;
+        self.fog_end = fog_end_clamped;
+        self.cached_view_proj = view_proj;
+        self.cached_sky_view_proj = sky_view_proj;
     }
 
     pub fn set_day_night(
@@ -1040,16 +1371,14 @@ impl<'w> Renderer<'w> {
         self.sky_color = sky_color;
         self.render_sky = render_sky;
         self.ambient_darkness = f32::from(ambient_darkness.min(11));
-        let uniform = SkyUniform {
-            color: self.sky_color,
-            _pad: 0.0,
-        };
-        self.queue
-            .write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
     pub fn set_leaf_cutout_enabled(&mut self, enabled: bool) {
         self.leaf_cutout_enabled = if enabled { 1.0 } else { 0.0 };
+    }
+
+    pub fn set_time_of_day(&mut self, time_of_day: f32) {
+        self.time_of_day = time_of_day;
     }
 
     pub fn set_cloud_state(&mut self, cloud_color: [f32; 3], cloud_scroll: f32) {
@@ -1216,6 +1545,27 @@ impl<'w> Renderer<'w> {
         self.chunk_border_debug_enabled
     }
 
+    /// Set the block outline wireframe. Pass `None` to hide the outline.
+    /// Coordinates are the world-space integer block position of the targeted block.
+    pub fn set_block_outline(&mut self, target_block: Option<[i32; 3]>) {
+        let Some(pos) = target_block else {
+            self.block_outline_mesh = None;
+            return;
+        };
+        let vertices = build_block_outline_vertices(pos);
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("thingcraft-block-outline-vertex-buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.block_outline_mesh = Some(OutlineMeshGpu {
+            vertex_buffer,
+            vertex_count: vertices.len() as u32,
+        });
+    }
+
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         self.size = new_size;
         if self.size.width == 0 || self.size.height == 0 {
@@ -1263,6 +1613,39 @@ impl<'w> Renderer<'w> {
         };
         self.queue
             .write_buffer(&self.hud_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn update_sky_uniform(&mut self) {
+        let dark_color = [
+            self.sky_color[0] * 0.2 + 0.04,
+            self.sky_color[1] * 0.2 + 0.04,
+            self.sky_color[2] * 0.6 + 0.1,
+        ];
+        let uniform = SkyUniform {
+            sky_view_proj: self.cached_sky_view_proj,
+            color: self.sky_color,
+            fog_end: self.fog_end,
+            fog_color: self.fog_color,
+            _pad0: 0.0,
+            dark_color,
+            _pad1: 0.0,
+        };
+        self.queue
+            .write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn update_celestial_uniform(&mut self) {
+        let uniform = CelestialUniform {
+            view_proj: self.cached_sky_view_proj,
+            time_angle: self.time_of_day * std::f32::consts::TAU,
+            _pad0: 0.0,
+            camera_xz: [0.0, 0.0], // not needed — sky_view_proj has no translation
+        };
+        self.queue.write_buffer(
+            &self.celestial_bodies.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
     }
 
     fn update_cloud_uniform(&mut self) {
@@ -1325,6 +1708,8 @@ impl<'w> Renderer<'w> {
         }
 
         self.refresh_chunk_border_mesh_if_dirty();
+        self.update_sky_uniform();
+        self.update_celestial_uniform();
 
         let output = self
             .surface
@@ -1380,7 +1765,47 @@ impl<'w> Renderer<'w> {
             if self.render_sky {
                 render_pass.set_pipeline(&self.sky_pipeline);
                 render_pass.set_bind_group(0, &self.sky_bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
+                render_pass.set_vertex_buffer(0, self.sky_dome.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    self.sky_dome.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                // Light dome (upper hemisphere)
+                render_pass.draw_indexed(0..self.sky_dome.light_index_count, 0, 0..1);
+                // Dark dome (lower hemisphere)
+                render_pass.draw_indexed(
+                    self.sky_dome.dark_index_offset..self.sky_dome.dark_index_offset + self.sky_dome.dark_index_count,
+                    0,
+                    0..1,
+                );
+            }
+
+            // Celestial bodies (sun + moon) — after sky dome, before terrain.
+            if self.render_sky {
+                render_pass.set_pipeline(&self.celestial_pipeline);
+                render_pass.set_bind_group(0, &self.celestial_bodies.uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.celestial_bodies.texture_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.celestial_bodies.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    self.celestial_bodies.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                // Sun
+                render_pass.draw_indexed(
+                    self.celestial_bodies.sun_index_offset
+                        ..self.celestial_bodies.sun_index_offset
+                            + self.celestial_bodies.sun_index_count,
+                    0,
+                    0..1,
+                );
+                // Moon
+                render_pass.draw_indexed(
+                    self.celestial_bodies.moon_index_offset
+                        ..self.celestial_bodies.moon_index_offset
+                            + self.celestial_bodies.moon_index_count,
+                    0,
+                    0..1,
+                );
             }
 
             if let Some(scene_mesh) = &self.scene_mesh {
@@ -1453,6 +1878,14 @@ impl<'w> Renderer<'w> {
                         render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
                     }
                 }
+            }
+
+            // Block outline: wireframe around targeted block.
+            if let Some(outline) = &self.block_outline_mesh {
+                render_pass.set_pipeline(&self.block_outline_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, outline.vertex_buffer.slice(..));
+                render_pass.draw(0..outline.vertex_count, 0..1);
             }
 
             render_pass.set_pipeline(&self.cloud_pipeline);
@@ -1537,6 +1970,322 @@ impl<'w> Renderer<'w> {
             vertex_count: vertices.len() as u32,
         });
     }
+}
+
+/// Create celestial body (sun + moon) GPU resources.
+/// Sun: 30×30 quad at Y=+100. Moon: 20×20 quad at Y=-100 (opposite sun).
+/// Both are rotated by `timeOfDay × 360°` around X in the vertex shader.
+fn create_celestial_bodies(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex_bind_group_layout: &wgpu::BindGroupLayout,
+    uniform_bind_group_layout: &wgpu::BindGroupLayout,
+    sun_path: &Path,
+    moon_path: &Path,
+) -> CelestialBodies {
+    // Load sun texture
+    let sun_img = image::open(sun_path)
+        .unwrap_or_else(|_| {
+            // Fallback: bright yellow 32×32
+            let mut img = image::RgbaImage::new(32, 32);
+            for p in img.pixels_mut() {
+                *p = image::Rgba([255, 255, 200, 255]);
+            }
+            image::DynamicImage::ImageRgba8(img)
+        })
+        .into_rgba8();
+    let sun_tex = create_texture_from_rgba(device, queue, &sun_img, "thingcraft-sun-texture");
+
+    // Load moon texture
+    let moon_img = image::open(moon_path)
+        .unwrap_or_else(|_| {
+            let mut img = image::RgbaImage::new(32, 32);
+            for p in img.pixels_mut() {
+                *p = image::Rgba([200, 200, 220, 255]);
+            }
+            image::DynamicImage::ImageRgba8(img)
+        })
+        .into_rgba8();
+    let moon_tex = create_texture_from_rgba(device, queue, &moon_img, "thingcraft-moon-texture");
+
+    // MC Alpha uses GL default (nearest) for celestial textures — crisp pixel art.
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("thingcraft-celestial-sampler"),
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let sun_view = sun_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let moon_view = moon_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("thingcraft-celestial-tex-bind-group"),
+        layout: tex_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&sun_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&moon_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    let uniform = CelestialUniform {
+        view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        time_angle: 0.0,
+        _pad0: 0.0,
+        camera_xz: [0.0; 2],
+    };
+    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-celestial-uniform-buffer"),
+        contents: bytemuck::bytes_of(&uniform),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("thingcraft-celestial-uniform-bind-group"),
+        layout: uniform_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    // Build quad geometry for sun (body_id=0) and moon (body_id=1).
+    // Sun: 30×30 at Y=+100, Moon: 20×20 at Y=-100 (MC Alpha WorldRenderer.java:584–607).
+    let mut vertices = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    // Sun quad: centered at (0, +100, 0), size 30×30 in XZ plane
+    let r = 30.0_f32;
+    let sun_base = vertices.len() as u32;
+    vertices.push(CelestialVertex { position: [-r, 100.0, -r], uv: [0.0, 0.0], body_id: 0.0 });
+    vertices.push(CelestialVertex { position: [r, 100.0, -r], uv: [1.0, 0.0], body_id: 0.0 });
+    vertices.push(CelestialVertex { position: [r, 100.0, r], uv: [1.0, 1.0], body_id: 0.0 });
+    vertices.push(CelestialVertex { position: [-r, 100.0, r], uv: [0.0, 1.0], body_id: 0.0 });
+    let sun_index_offset = indices.len() as u32;
+    indices.extend_from_slice(&[sun_base, sun_base + 1, sun_base + 2, sun_base + 2, sun_base + 3, sun_base]);
+    let sun_index_count = 6;
+
+    // Moon quad: centered at (0, -100, 0), size 20×20, reversed winding (viewed from below)
+    let r = 20.0_f32;
+    let moon_base = vertices.len() as u32;
+    // MC Alpha: vertex order is reversed for moon (WorldRenderer.java:601-606)
+    vertices.push(CelestialVertex { position: [-r, -100.0, r], uv: [1.0, 1.0], body_id: 1.0 });
+    vertices.push(CelestialVertex { position: [r, -100.0, r], uv: [0.0, 1.0], body_id: 1.0 });
+    vertices.push(CelestialVertex { position: [r, -100.0, -r], uv: [0.0, 0.0], body_id: 1.0 });
+    vertices.push(CelestialVertex { position: [-r, -100.0, -r], uv: [1.0, 0.0], body_id: 1.0 });
+    let moon_index_offset = indices.len() as u32;
+    indices.extend_from_slice(&[moon_base, moon_base + 1, moon_base + 2, moon_base + 2, moon_base + 3, moon_base]);
+    let moon_index_count = 6;
+
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-celestial-vertex-buffer"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-celestial-index-buffer"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+
+    CelestialBodies {
+        uniform_bind_group,
+        texture_bind_group,
+        uniform_buffer,
+        vertex_buffer,
+        sun_index_offset,
+        sun_index_count,
+        moon_index_offset,
+        moon_index_count,
+        index_buffer,
+    }
+}
+
+/// Create a wgpu texture from an RGBA image.
+fn create_texture_from_rgba(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &image::RgbaImage,
+    label: &str,
+) -> wgpu::Texture {
+    let (width, height) = img.dimensions();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        img.as_raw(),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    texture
+}
+
+/// Create the sky dome geometry: a flat grid at Y=+16 (light dome) and Y=-16 (dark dome).
+/// MC Alpha `WorldRenderer.java:129–160`: tiles are 64×64 blocks, grid extends ±384 blocks.
+fn create_sky_dome(device: &wgpu::Device) -> SkyDome {
+    let tile = 64.0_f32;
+    let extent = 6; // tiles in each direction → ±384 blocks
+    let mut vertices = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    // Light dome at Y = +16
+    let y_light = 16.0_f32;
+    for iz in -extent..=extent {
+        for ix in -extent..=extent {
+            vertices.push(SkyDomeVertex {
+                position: [ix as f32 * tile, y_light, iz as f32 * tile],
+            });
+        }
+    }
+    let cols = (extent * 2 + 1) as u32;
+    for iz in 0..(cols - 1) {
+        for ix in 0..(cols - 1) {
+            let tl = iz * cols + ix;
+            let tr = tl + 1;
+            let bl = tl + cols;
+            let br = bl + 1;
+            indices.push(tl);
+            indices.push(bl);
+            indices.push(tr);
+            indices.push(tr);
+            indices.push(bl);
+            indices.push(br);
+        }
+    }
+    let light_index_count = indices.len() as u32;
+
+    // Dark dome at Y = -16
+    let y_dark = -16.0_f32;
+    let dark_vertex_offset = vertices.len() as u32;
+    for iz in -extent..=extent {
+        for ix in -extent..=extent {
+            vertices.push(SkyDomeVertex {
+                position: [ix as f32 * tile, y_dark, iz as f32 * tile],
+            });
+        }
+    }
+    let dark_index_offset = indices.len() as u32;
+    for iz in 0..(cols - 1) {
+        for ix in 0..(cols - 1) {
+            let tl = dark_vertex_offset + iz * cols + ix;
+            let tr = tl + 1;
+            let bl = tl + cols;
+            let br = bl + 1;
+            // Wind opposite direction (viewed from below)
+            indices.push(tl);
+            indices.push(tr);
+            indices.push(bl);
+            indices.push(tr);
+            indices.push(br);
+            indices.push(bl);
+        }
+    }
+    let dark_index_count = indices.len() as u32 - dark_index_offset;
+
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-sky-dome-vertex-buffer"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-sky-dome-index-buffer"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+
+    SkyDome {
+        vertex_buffer,
+        index_buffer,
+        light_index_count,
+        dark_index_offset,
+        dark_index_count,
+    }
+}
+
+/// Build the 12-edge wireframe for a block outline, inflated by 0.002 to prevent z-fighting.
+/// Color: black at 40% opacity, matching MC Alpha's `renderBlockOutline`.
+fn build_block_outline_vertices(block: [i32; 3]) -> Vec<OutlineVertex> {
+    const INFLATE: f32 = 0.002;
+    const COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.4];
+
+    let min = [
+        block[0] as f32 - INFLATE,
+        block[1] as f32 - INFLATE,
+        block[2] as f32 - INFLATE,
+    ];
+    let max = [
+        block[0] as f32 + 1.0 + INFLATE,
+        block[1] as f32 + 1.0 + INFLATE,
+        block[2] as f32 + 1.0 + INFLATE,
+    ];
+
+    let p000 = [min[0], min[1], min[2]];
+    let p100 = [max[0], min[1], min[2]];
+    let p110 = [max[0], min[1], max[2]];
+    let p010 = [min[0], min[1], max[2]];
+    let p001 = [min[0], max[1], min[2]];
+    let p101 = [max[0], max[1], min[2]];
+    let p111 = [max[0], max[1], max[2]];
+    let p011 = [min[0], max[1], max[2]];
+
+    let mut verts = Vec::with_capacity(24);
+    let mut line = |a: [f32; 3], b: [f32; 3]| {
+        verts.push(OutlineVertex { position: a, color: COLOR });
+        verts.push(OutlineVertex { position: b, color: COLOR });
+    };
+
+    // Bottom ring
+    line(p000, p100);
+    line(p100, p110);
+    line(p110, p010);
+    line(p010, p000);
+    // Top ring
+    line(p001, p101);
+    line(p101, p111);
+    line(p111, p011);
+    line(p011, p001);
+    // Vertical edges
+    line(p000, p001);
+    line(p100, p101);
+    line(p110, p111);
+    line(p010, p011);
+
+    verts
 }
 
 fn build_chunk_border_vertices<I>(chunk_positions: I) -> Vec<DebugLineVertex>
@@ -2330,26 +3079,117 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 
 const SKY_SHADER: &str = r#"
 struct Sky {
+    sky_view_proj: mat4x4<f32>,
     color: vec3<f32>,
-    _pad: f32,
+    fog_end: f32,
+    fog_color: vec3<f32>,
+    _pad0: f32,
+    dark_color: vec3<f32>,
+    _pad1: f32,
 };
 
 @group(0) @binding(0)
 var<uniform> sky: Sky;
 
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) local_pos: vec3<f32>,
+    @location(1) dome_y: f32,
+};
+
 @vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
-    var pos = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0),
-    );
-    return vec4<f32>(pos[vertex_index], 0.0, 1.0);
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    // Rotation-only view-proj: dome stays at infinite distance, no camera offset needed.
+    out.clip_pos = sky.sky_view_proj * vec4<f32>(input.position, 1.0);
+    out.local_pos = input.position;
+    out.dome_y = input.position.y;
+    return out;
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(sky.color, 1.0);
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    // Horizontal distance from dome center to this fragment.
+    let dist = sqrt(input.local_pos.x * input.local_pos.x + input.local_pos.z * input.local_pos.z);
+
+    // MC Alpha sky fog: start=0, end=renderDistance*0.8
+    let sky_fog_end = sky.fog_end * 0.8;
+    let fog_t = clamp(dist / max(sky_fog_end, 0.001), 0.0, 1.0);
+
+    // Select dome color based on whether this is light or dark dome.
+    let dome_color = select(sky.dark_color, sky.color, input.dome_y > 0.0);
+    let color = mix(dome_color, sky.fog_color, fog_t);
+    return vec4<f32>(color, 1.0);
+}
+"#;
+
+const CELESTIAL_SHADER: &str = r#"
+struct CelestialUniforms {
+    view_proj: mat4x4<f32>,
+    time_angle: f32,
+    _pad0: f32,
+    camera_pos: vec2<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> uniforms: CelestialUniforms;
+
+@group(1) @binding(0)
+var sun_texture: texture_2d<f32>;
+
+@group(1) @binding(1)
+var moon_texture: texture_2d<f32>;
+
+@group(1) @binding(2)
+var celestial_sampler: sampler;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) body_id: f32,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) body_id: f32,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    // Rotate around X axis by time_angle (MC Alpha: timeOfDay * 360°).
+    let angle = uniforms.time_angle;
+    let ca = cos(angle);
+    let sa = sin(angle);
+    let rotated = vec3<f32>(
+        input.position.x,
+        input.position.y * ca - input.position.z * sa,
+        input.position.y * sa + input.position.z * ca,
+    );
+
+    var out: VertexOut;
+    // view_proj has no translation — celestial bodies are at infinite distance.
+    out.clip_pos = uniforms.view_proj * vec4<f32>(rotated, 1.0);
+    out.uv = input.uv;
+    out.body_id = input.body_id;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    // Sample the correct texture based on body_id (0 = sun, 1 = moon).
+    let sun_color = textureSample(sun_texture, celestial_sampler, input.uv);
+    let moon_color = textureSample(moon_texture, celestial_sampler, input.uv);
+    let color = select(sun_color, moon_color, input.body_id > 0.5);
+    // Discard fully transparent pixels to avoid additive blending artifacts.
+    if (color.a < 0.01) {
+        discard;
+    }
+    return color;
 }
 "#;
 
@@ -2448,6 +3288,38 @@ fn vs_main(input: VertexIn) -> VertexOut {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(input.color, 1.0);
+}
+"#;
+
+const BLOCK_OUTLINE_SHADER: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
+    out.color = input.color;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    return input.color;
 }
 "#;
 

@@ -43,8 +43,8 @@ Overall, the core terrain rendering — lighting model, face shading, fog formul
 
 ### Differences
 
-- **Missing passes in Thingcraft:** Entities, particles, block outline, mining progress, held item, screen overlays (fire/underwater/hurt).
-- **Sky pass is simplified:** Flat color quad vs multi-component sky dome. See §2.
+- **Missing passes in Thingcraft:** Entities, particles, block outline, mining progress, held item, screen overlays (fire/underwater/hurt). See §13 for block outline detail, §9 for held item.
+- **Sky pass is simplified:** Flat color quad vs multi-component sky dome (light dome + dark dome + sunrise fan + sun/moon + stars). See §2.
 - **No depth-only pre-pass** for transparent geometry in fancy mode.
 - **Transparent pass does not disable face culling.** MC Alpha sets `glDisable(GL_CULL_FACE)` for the transparent pass so water faces are visible from both sides. Thingcraft's transparent pipeline *also* disables culling — verified in `renderer.rs` pipeline descriptor.
 
@@ -439,18 +439,19 @@ The hotbar in Thingcraft is placeholder-quality — gray boxes with no item icon
 
 ### Confirmed Differences
 
-| # | Feature | Impact | Notes |
-|---|---------|--------|-------|
-| 1 | **No sky dome / horizon gradient** | Moderate | Sky is uniform vs graded in MC Alpha |
-| 2 | **No sun/moon** | Moderate | Missing celestial bodies |
-| 3 | **No stars** | Low | Only visible at night |
-| 4 | **No sunrise/sunset colors** | Moderate | No warm gradient at dawn/dusk |
-| 5 | **Always-cutout leaves** | Moderate | Leaves look holey vs MC Alpha's opaque fast-mode leaves |
-| 6 | **No block-in-hand** | High | Most immediately noticeable missing feature |
-| 7 | **No health hearts** | Moderate | Missing survival HUD |
-| 8 | **No item textures in hotbar** | Moderate | Gray rectangles instead of item icons |
-| 9 | **No fog brightness modulation** | Low | Subtle darkening in shadow areas missing |
-| 10 | **No underwater/lava fog** | Low | Different fog mode when submerged |
+| # | Feature | Impact | Status | Notes |
+|---|---------|--------|--------|-------|
+| 1 | **No sky dome / horizon gradient** | Moderate | TODO | Sky is uniform vs graded in MC Alpha |
+| 2 | **No sun/moon** | Moderate | TODO | Missing celestial bodies |
+| 3 | **No stars** | Low | TODO | Only visible at night |
+| 4 | **No sunrise/sunset colors** | Moderate | TODO | No warm gradient at dawn/dusk |
+| 5 | ~~Always-cutout leaves~~ | ~~Moderate~~ | **DONE** | `THINGCRAFT_FANCY_GRAPHICS` toggle added |
+| 6 | **No block-in-hand** | High | TODO | Most immediately noticeable missing feature |
+| 7 | **No health hearts** | Moderate | TODO | Missing survival HUD |
+| 8 | **No item textures in hotbar** | Moderate | TODO | Gray rectangles instead of item icons |
+| 9 | ~~No fog brightness modulation~~ | ~~Low~~ | **DONE** | `alpha_fog_brightness_target()` + `alpha_apply_fog_brightness()` |
+| 10 | **No underwater/lava fog** | Low | TODO | Different fog mode when submerged |
+| 11 | **No block outline** | Moderate | TODO | No wireframe on targeted block |
 
 ### Correctly Implemented (Matching MC Alpha)
 
@@ -479,20 +480,183 @@ The hotbar in Thingcraft is placeholder-quality — gray boxes with no item icon
 
 ---
 
-## 13. Recommendations (Priority Order)
+## 13. Block Outline Rendering
 
-1. **Implement block-in-hand rendering** — Highest visual impact. Requires item mesh generation, separate depth space, and swing animation. Reference: `ItemInHandRenderer.java:40–204`.
+### MC Alpha (WorldRenderer.java:879–938)
 
-2. **Add fast-mode opaque leaves** — **Done**. Thingcraft now exposes a graphics toggle (`THINGCRAFT_FANCY_GRAPHICS`) and switches leaves between fancy cutout and fast opaque behavior.
+When the player looks at a block, MC Alpha draws a **wireframe outline** around it:
 
-3. **Implement sky dome with horizon gradient** — Replace flat sky triangle with a vertex-colored hemisphere. Apply the existing fog formula to the dome vertices to get natural horizon blending. Reference: `WorldRenderer.java:532–624`.
+- **Color:** `rgba(0.0, 0.0, 0.0, 0.4)` — black at 40% opacity
+- **Line width:** 2.0 pixels
+- **Inflation:** The block shape is grown by `0.002` in each axis to prevent z-fighting
+- **Blend mode:** `SRC_ALPHA, ONE_MINUS_SRC_ALPHA`
+- **Depth write:** Disabled during outline rendering
+- **Geometry:** Two horizontal loops (bottom face ring + top face ring) drawn as `GL_LINE_STRIP`, plus 4 vertical edges drawn as `GL_LINES`
 
-4. **Add sun and moon** — Two textured quads rotated by `timeOfDay × 360°`. Reference: `WorldRenderer.java:584–607`.
+The outline uses the block's collision/outline shape (`Block.getOutlineShape()`), translated relative to camera position.
 
-5. **Render item textures in hotbar slots** — Sample from the terrain atlas to draw 2D item icons in each hotbar slot.
+### Thingcraft
 
-6. **Add health bar** — Render heart textures above the hotbar using the same HUD pipeline.
+**Not implemented.** Thingcraft has a `debug_line_pipeline` (renderer.rs) used for chunk border debug visualization, which could be extended for block outlines. The raycast system already computes the targeted block (`raycast_first_solid_block` in app.rs:875), so the hit position data is available.
 
-7. **Add sunrise/sunset gradient** — Gradient fan primitive at the horizon during dawn/dusk. Reference: `WorldRenderer.java:559–581`.
+### Implementation Spec
 
-8. **Fog brightness modulation** — Sample light level at player position and modulate fog color. Low priority since the effect is subtle.
+1. **Reuse `debug_line_pipeline`** — Same vertex format (position + color), same blend mode
+2. **Generate 12-edge wireframe** from the targeted block's AABB, inflated by `0.002`
+3. **Vertex color:** `[0.0, 0.0, 0.0, 0.4]`
+4. **Draw after transparent pass**, before clouds (matching MC Alpha pass order)
+5. **Depth write OFF**, depth test ON (so outline is hidden behind solid geometry but doesn't write to depth)
+
+**Severity: MODERATE** — The block outline is critical gameplay feedback for knowing which block you're targeting.
+
+---
+
+## 14. Recommendations (Priority Order)
+
+### Completed
+
+| # | Feature | Status |
+|---|---------|--------|
+| ~~2~~ | **Fast-mode opaque leaves** | **Done** — `THINGCRAFT_FANCY_GRAPHICS` toggle switches leaves between fancy cutout and fast opaque. |
+| ~~8~~ | **Fog brightness modulation** | **Done** — `alpha_fog_brightness_target()` samples light at player position, smoothly interpolates via `last_fog_brightness` / `fog_brightness`, and `alpha_apply_fog_brightness()` modulates fog color per frame (app.rs:386–583). |
+
+### Remaining (with implementation detail)
+
+#### 1. Block-in-Hand Rendering *(HIGH priority)*
+
+Highest visual impact single missing feature.
+
+**MC Alpha reference:** `ItemInHandRenderer.java:40–344`
+
+**Required components:**
+- **Separate depth space:** Clear depth buffer before hand rendering (MC Alpha: `glClear(GL_DEPTH_BUFFER_BIT)`)
+- **3D block mesh:** For block items, render a small cube via `blockRenderer.renderAsItem()` using the terrain atlas
+- **Transform chain:**
+  ```
+  translate(-swing_n * 0.4, sin(sqrt(swing) * PI * 2.0) * 0.2, -swing_l * 0.2)
+  translate(0.7 * scale, -0.65 * scale - (1.0 - hand_height) * 0.6, -0.9 * scale)
+  rotate_y(45°)
+  // attack animation:
+  rotate_y(-sin(swing² * PI) * 20°)
+  rotate_z(-sin(sqrt(swing) * PI) * 20°)
+  rotate_x(-sin(sqrt(swing) * PI) * 80°)
+  scale(0.4)
+  ```
+  Where `swing = player.getAttackAnimationProgress(tickDelta)`, `scale = 0.8`, `hand_height` lerps 0→1 on item change
+- **Lighting:** `world.getBrightness(floor(player.x), floor(player.y), floor(player.z))` applied as vertex color tint
+- **Swing trigger:** `hand_height = 0.0` on block use/break, lerps back toward 1.0 at rate 0.4/tick
+- **Item change animation:** When held item changes, `hand_height` drops toward 0.0, item swaps at `hand_height < 0.1`, then rises back
+
+**Thingcraft approach:** Add a new render pass after clouds with its own depth clear. Generate a small indexed cube mesh from the selected hotbar block's atlas UVs. Apply the transform chain as a separate view-projection matrix uniform. The existing `terrain_atlas` bind group can be reused.
+
+#### 3. Sky Dome with Horizon Gradient *(MODERATE priority)*
+
+**MC Alpha reference:** `WorldRenderer.java:120–160, 532–624`
+
+**Light sky dome geometry:**
+- Flat grid of quads at `Y = +16.0`, tiled from `-64*k` to `+64*k` where `k = 256/64 + 2 = 6` → extends ±384 blocks
+- Single uniform color (biome sky color) — the **horizon gradient comes from GL fog**, not vertex coloring
+- GL fog settings for sky: `fog_start = 0.0`, `fog_end = renderDistance × 0.8`
+- This causes far dome vertices to blend toward `fogColor`, while overhead vertices remain sky color → natural gradient
+
+**Dark sky dome:**
+- Same grid geometry but at `Y = -16.0`
+- Color: `(skyR × 0.2 + 0.04, skyG × 0.2 + 0.04, skyB × 0.6 + 0.1)`
+- Also has fog applied (same settings)
+
+**Thingcraft approach:** Replace the full-screen triangle with two dome meshes (flat grids at Y=+16 and Y=-16, centered on camera). In the sky shader, apply per-fragment fog: `fog_t = clamp(distance / (render_dist * 0.8), 0.0, 1.0)`, mix dome color → fog color. The sky color and dark dome color are already computed on CPU.
+
+#### 4. Sun and Moon *(MODERATE priority)*
+
+**MC Alpha reference:** `WorldRenderer.java:584–607`
+
+**Sun:**
+- Textured quad, 30×30 units, centered at `(0, +100, 0)` relative to player
+- Rotated by `timeOfDay × 360°` around X axis (east-west arc)
+- Texture: `/terrain/sun.png` (32×32 PNG)
+- Blend mode: `GL_ONE, GL_ONE` (additive)
+- UV: full `(0,0)→(1,1)`
+
+**Moon:**
+- Textured quad, 20×20 units, centered at `(0, -100, 0)` relative to player (opposite sun)
+- Same rotation as sun (they share the push/pop matrix)
+- Texture: `/terrain/moon.png` (32×32 PNG)
+- Blend mode: `GL_ONE, GL_ONE` (additive)
+
+**Thingcraft approach:** Load sun/moon textures as separate GPU textures. Create a small 4-vertex quad pipeline with additive blending. Compute rotation matrix from `timeOfDay * 2π` around X, translate by ±100 on Y. Render after sky dome, before terrain. Disable depth write.
+
+#### 5. Stars *(LOW priority)*
+
+**MC Alpha reference:** `WorldRenderer.java:161–200, 609–613`
+
+**Star generation (deterministic, seed `10842`):**
+- 1500 star candidates; reject if `d²+e²+f² >= 1.0` or `< 0.01`
+- Normalize position, scale to radius 100
+- Each star is a 4-vertex quad oriented via `atan2` spherical coordinates, rotated by random angle
+- Star size: `0.25 + random * 0.25` (in world units at distance 100)
+
+**Star brightness:** `getStarBrightness(tickDelta)`:
+```
+g = 1.0 - (cos(timeOfDay * 2π) * 2.0 + 0.75)
+g = clamp(g, 0.0, 1.0)
+brightness = g² * 0.5
+```
+Stars are invisible during daytime (`brightness ≈ 0`), fully visible at midnight (`brightness ≈ 0.5`).
+
+**Color:** `glColor4f(brightness, brightness, brightness, brightness)` — uniform white, alpha-faded
+
+**Thingcraft approach:** Generate star vertex buffer once at init from seed `10842`. Render with alpha blending, same rotation as sun/moon. Pass `star_brightness` as a uniform to the fragment shader.
+
+#### 6. Sunrise/Sunset Gradient *(MODERATE priority)*
+
+**MC Alpha reference:** `WorldRenderer.java:559–581`, `Dimension.java:82–98`
+
+**Visibility condition:** `getSunriseColor()` returns non-null when:
+```
+g = cos(timeOfDay * 2π)
+|g| < 0.4  (i.e. near dawn/dusk)
+```
+
+**Color computation:**
+```
+i = (g / 0.4) * 0.5 + 0.5     // 0→1 fade
+j = 1.0 - (1.0 - sin(i * π)) * 0.99
+j = j²
+R = i * 0.3 + 0.7              // warm orange-red
+G = i² * 0.7 + 0.2
+B = i² * 0.0 + 0.2
+A = j                           // strong near center, fades at edges
+```
+
+**Geometry:** 16-vertex fan (`GL_TRIANGLE_FAN`) at the horizon:
+- Center vertex at `(0, 100, 0)`, color = `(R, G, B, A)`
+- 16 rim vertices at `(sin(θ) × 120, cos(θ) × 120, -cos(θ) × 40 × A)`, color = `(R, G, B, 0.0)` (alpha 0 at rim → smooth fade)
+- Rotated 90° around X, then 0° or 180° around Z depending on whether `timeOfDay > 0.5`
+
+**Thingcraft approach:** Add a small fan mesh (17 vertices: 1 center + 16 rim). Update vertex colors each frame from `getSunriseColor()` computation. Render after sky dome, before sun/moon, with alpha blending and depth write off.
+
+#### 7. Block Outline Rendering *(MODERATE priority)*
+
+Already detailed in §13 above. Reuse existing `debug_line_pipeline`. Generate 12-edge wireframe from targeted block AABB inflated by 0.002. Color `[0, 0, 0, 0.4]`.
+
+#### 8. Item Textures in Hotbar *(MODERATE priority)*
+
+**MC Alpha:** Each hotbar slot shows the item's sprite sampled from `/terrain.png` (for blocks) or `/gui/items.png` (for items).
+
+**Thingcraft approach:** Extend the HUD pipeline to support textured quads. Sample the terrain atlas at the correct UV coordinates for each block in the hotbar. For block items, the sprite is the block's face texture (typically the front/side face). The terrain atlas is already loaded; add a second HUD pipeline variant that binds the atlas texture and uses UV coordinates instead of solid color.
+
+#### 9. Health Bar *(MODERATE priority)*
+
+**MC Alpha:** 10 heart icons rendered from `/gui/icons.png` above the hotbar. Each heart is 9×9 pixels. Full hearts, half hearts, and empty heart outlines are separate sprites.
+
+**Thingcraft approach:** Load the GUI icons texture. Render 10 heart-sized quads above the hotbar using the textured HUD pipeline. Track player health as an ECS component. Bounce animation: when damaged, each heart offset Y by `random * 2` for a few frames.
+
+#### 10. Underwater/Lava Fog *(LOW priority)*
+
+**MC Alpha reference:** `GameRenderer.java:452–490`
+
+When player head is submerged:
+- **Water:** Fog mode = `GL_EXP` (exponential), density = `0.1`, color = `(0.02, 0.02, 0.2)`
+- **Lava:** Fog mode = `GL_EXP`, density = `2.0`, color = `(0.6, 0.1, 0.0)`
+
+**Thingcraft approach:** Check if camera Y is below water surface in the current chunk. Switch fog formula in the terrain shader from linear to exponential: `fog_t = 1.0 - exp(-density * distance)`. Pass fog mode + density as uniforms alongside existing fog start/end.

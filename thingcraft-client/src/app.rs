@@ -383,6 +383,8 @@ pub fn run() -> Result<()> {
     let mut selected_hotbar_slot = 0_usize;
     let mut hud_dirty = true;
     let mut sim_ticks: u64 = 0;
+    let mut time_offset_ticks: u64 = 0; // debug: accelerated by T key
+    let mut time_accel_held = false;
     let mut last_fog_brightness = 1.0_f32;
     let mut fog_brightness = 1.0_f32;
     let base_fluid_tick_budget = resolve_fluid_tick_budget();
@@ -450,6 +452,9 @@ pub fn run() -> Result<()> {
                     let mut urgent_fluid_processed_this_frame = 0_usize;
                     for tick_index in 0..ticks_to_run {
                         sim_ticks = sim_ticks.wrapping_add(1);
+                        if time_accel_held {
+                            time_offset_ticks = time_offset_ticks.wrapping_add(200);
+                        }
                         chunk_streamer.begin_sim_tick(sim_ticks);
                         ecs_runtime.run_fixed(fixed_dt_seconds);
                         let fly_mode = ecs_runtime.is_fly_mode();
@@ -497,7 +502,7 @@ pub fn run() -> Result<()> {
 
                         // Alpha GameRenderer.tick(): smooth fog brightness toward sampled player
                         // brightness, biased by view-distance setting.
-                        let tick_time_of_day = alpha_time_of_day(sim_ticks, 0.0);
+                        let tick_time_of_day = alpha_time_of_day(sim_ticks.wrapping_add(time_offset_ticks), 0.0);
                         let tick_ambient_darkness = alpha_ambient_darkness(tick_time_of_day);
                         let player_pos = ecs_runtime
                             .camera_snapshot()
@@ -527,12 +532,13 @@ pub fn run() -> Result<()> {
                     ecs_runtime.run_render_prep(render_alpha);
                     let mut frame_camera: Option<crate::ecs::CameraSnapshot> = None;
                     let mut camera_chunk = ChunkPos { x: 0, z: 0 };
-                    let time_of_day = alpha_time_of_day(sim_ticks, render_alpha);
+                    let time_of_day = alpha_time_of_day(sim_ticks.wrapping_add(time_offset_ticks), render_alpha);
                     let ambient_darkness = alpha_ambient_darkness(time_of_day);
                     let cloud_color = alpha_cloud_color(time_of_day);
                     let cloud_scroll = (sim_ticks as f32 + render_alpha) * 0.03;
                     let render_sky = alpha_view_distance < 2;
                     renderer.set_cloud_state(cloud_color, cloud_scroll);
+                    renderer.set_time_of_day(time_of_day);
                     if let Some(snapshot) = ecs_runtime.camera_snapshot() {
                         let biome_sample = biome_source.sample(
                             snapshot.authoritative.position.x.floor() as i32,
@@ -560,8 +566,11 @@ pub fn run() -> Result<()> {
                             0.05,
                             render_distance_blocks,
                         );
+                        // Rotation-only view for sky/celestial (strips translation → infinite distance).
+                        let sky_view = Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Y);
                         renderer.update_camera(
                             (projection * view).to_cols_array_2d(),
+                            (projection * sky_view).to_cols_array_2d(),
                             snapshot.interpolated.position.to_array(),
                             render_distance_blocks * 0.25,
                             render_distance_blocks,
@@ -570,6 +579,25 @@ pub fn run() -> Result<()> {
                             snapshot.authoritative.position.x,
                             snapshot.authoritative.position.z,
                         );
+                        // Per-frame raycast for block outline wireframe.
+                        let ray_dir = DVec3::new(
+                            direction.x as f64,
+                            direction.y as f64,
+                            direction.z as f64,
+                        );
+                        let ray_origin = DVec3::new(
+                            snapshot.interpolated.position.x as f64,
+                            snapshot.interpolated.position.y as f64,
+                            snapshot.interpolated.position.z as f64,
+                        );
+                        let outline_hit = raycast_first_solid_block(
+                            ray_origin,
+                            ray_dir,
+                            BLOCK_INTERACTION_REACH_BLOCKS,
+                            |x, y, z| chunk_streamer.block_at_world(x, y, z),
+                        );
+                        renderer.set_block_outline(outline_hit.map(|h| h.block));
+
                         frame_camera = Some(snapshot);
                     } else {
                         let biome_sample = biome_source.sample(0, 0);
@@ -582,6 +610,7 @@ pub fn run() -> Result<()> {
                         let fog_color =
                             alpha_apply_fog_brightness(fog_color, frame_fog_brightness);
                         renderer.set_day_night(fog_color, sky_color, ambient_darkness, render_sky);
+                        renderer.set_block_outline(None);
                     }
 
                     chunk_streamer.tick(camera_chunk);
@@ -750,6 +779,11 @@ pub fn run() -> Result<()> {
                                 chunk_border_debug = enabled,
                                 "toggled chunk border debug overlay"
                             );
+                        }
+
+                        // T key: hold to accelerate time of day (debug).
+                        if code == KeyCode::KeyT {
+                            time_accel_held = is_pressed;
                         }
 
                         if code == KeyCode::Escape && is_pressed {
