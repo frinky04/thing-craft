@@ -5,9 +5,9 @@
 - M0 complete: project scaffold, CI, docs baseline.
 - M1 complete: fixed simulation schedule separated from frame loop.
 - M2 complete: fly camera, interpolation, and screen-space strafe controls are functioning.
-- M3 in progress: chunk residency manager now tracks requested/generating/meshing/ready/evicting plus dirty/remesh propagation states around the camera.
-- M4 started: deterministic biome/climate and startup overworld generation scaffold implemented.
-- M5 in progress: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, fixed-tick block interaction requests (raycast break/place + dirty remesh propagation), per-edit column height/light refresh, and renderer frustum culling are implemented.
+- M3 complete: chunk residency manager tracks requested/generating/meshing/ready/evicting plus dirty/remesh propagation states around the camera.
+- M4 complete: deterministic biome/climate fields, surface terrain, cave carving (Alpha worm algorithm), ore vein placement (7 ore types), and dungeon stubs implemented.
+- M5 complete: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, fixed-tick block interaction requests (raycast break/place + dirty remesh propagation), per-edit column height/light refresh, and renderer frustum culling are implemented.
 
 ## M0 - Repository Foundation
 

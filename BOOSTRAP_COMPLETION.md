@@ -31,3 +31,6 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Block interaction vertical slice added: camera voxel raycast emits break/place requests, fixed-tick world mutation applies them, and edited chunks trigger boundary-safe remesh propagation.
 - [x] Block edits now refresh per-column height/sky and emitted-light seeds (including touched boundary-neighbor columns) to keep chunk metadata coherent after runtime world mutation.
 - [x] Renderer now frustum-culls chunk draw calls per frame and exposes `visible_chunks` runtime stats for resident-vs-visible perf tracking.
+- [x] Cave carving added: Alpha-faithful worm algorithm with room/tunnel/fork logic, lava below Y=10, water-avoidance, and deterministic per-chunk seeding via Java LCG.
+- [x] Ore vein placement added: dirt, gravel, coal, iron, gold, redstone, and diamond veins using Alpha's parametric ellipsoid sweep with correct per-ore attempt counts and Y-caps.
+- [x] Dungeon stubs added: cobblestone/mossy-cobblestone rooms with mob spawner placement (8 attempts/chunk, wall-opening validation). Chest inventory and spawner entity config deferred to M7.

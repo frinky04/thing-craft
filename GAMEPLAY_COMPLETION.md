@@ -9,9 +9,9 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [ ] Biome Types: Rainforest, Swampland, Seasonal Forest, Forest, Savanna, Shrubland, Taiga, Desert, Plains, Tundra, Hell.
 - [ ] Dynamic Colors: Grass and leaf colors shift dynamically based on biome temperature and humidity values.
 - [ ] Terrain: 3D Perlin noise generation.
-- [ ] Caves: Standard cave tunnels only (no ravines).
-- [ ] Underground Generation: Dirt, gravel, coal, iron, gold, diamond, and redstone veins.
-- [ ] Structures: Dungeons with mob spawners.
+- [x] Caves: Standard cave tunnels only (no ravines).
+- [x] Underground Generation: Dirt, gravel, coal, iron, gold, diamond, and redstone veins.
+- [~] Structures: Dungeon rooms with mob spawner blocks placed (chest inventory and spawner entity config require M7 entity/inventory systems).
 
 ## Graphics and Lighting
 - [ ] Lighting Engine: Strict, blocky, per-block lighting (no Smooth Lighting/Ambient Occlusion).

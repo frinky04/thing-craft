@@ -1,7 +1,10 @@
+use std::f64::consts::PI;
 use std::fmt;
 use std::path::Path;
 
 use noise::{Fbm, MultiFractal, NoiseFn, OpenSimplex};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 pub const CHUNK_WIDTH: usize = 16;
 pub const CHUNK_DEPTH: usize = 16;
@@ -15,7 +18,18 @@ const GRASS_ID: u8 = 2;
 const DIRT_ID: u8 = 3;
 const SAND_ID: u8 = 12;
 const BEDROCK_ID: u8 = 7;
+const FLOWING_WATER_ID: u8 = 8;
 const WATER_ID: u8 = 9;
+const FLOWING_LAVA_ID: u8 = 10;
+const GRAVEL_ID: u8 = 13;
+const GOLD_ORE_ID: u8 = 14;
+const IRON_ORE_ID: u8 = 15;
+const COAL_ORE_ID: u8 = 16;
+const COBBLESTONE_ID: u8 = 4;
+const MOSSY_COBBLESTONE_ID: u8 = 48;
+const MOB_SPAWNER_ID: u8 = 52;
+const DIAMOND_ORE_ID: u8 = 56;
+const REDSTONE_ORE_ID: u8 = 73;
 const ICE_ID: u8 = 79;
 
 const ALPHA_EXCLUDED_BLOCK_IDS: [u8; 15] = [
@@ -259,6 +273,16 @@ impl BlockRegistry {
         add(&mut by_id, 20, "glass", 49, MaterialKind::Glass, true, 0, 0);
         add(&mut by_id, 35, "wool", 64, MaterialKind::Wool, true, 255, 0);
         add(&mut by_id, 46, "tnt", 8, MaterialKind::Wood, true, 255, 0);
+        add(
+            &mut by_id,
+            48,
+            "mossy_cobblestone",
+            36,
+            MaterialKind::Stone,
+            true,
+            255,
+            0,
+        );
         add(
             &mut by_id,
             50,
@@ -690,6 +714,7 @@ impl BiomeSource {
 
 #[derive(Debug, Clone)]
 pub struct OverworldChunkGenerator {
+    seed: u64,
     biome_source: BiomeSource,
     terrain_noise: Fbm<OpenSimplex>,
     grass_color_map: GrassColorMap,
@@ -705,6 +730,7 @@ impl OverworldChunkGenerator {
         let grass_color_map = GrassColorMap::load();
 
         Self {
+            seed,
             biome_source,
             terrain_noise,
             grass_color_map,
@@ -768,6 +794,10 @@ impl OverworldChunkGenerator {
             }
         }
 
+        carve_caves(&mut chunk, self.seed);
+        populate_ores(&mut chunk, self.seed);
+        place_dungeon_stubs(&mut chunk, self.seed);
+
         chunk.recalculate_height_map(registry);
         chunk.seed_emitted_light(registry);
         chunk
@@ -793,6 +823,505 @@ impl OverworldChunkGenerator {
             }
         }
         chunks
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cave carving  (translated from CaveWorldCarver.java / Generator.java)
+// ---------------------------------------------------------------------------
+
+/// Derive the two seed multipliers exactly as Alpha does in Generator.java:
+///   rng.setSeed(worldSeed); l = rng.nextLong()/2*2+1; m = rng.nextLong()/2*2+1;
+/// Java's `Random.nextLong()` is two calls to `next(32)` glued together.
+fn alpha_seed_multipliers(world_seed: u64) -> (i64, i64) {
+    let mut s = java_random_seed(world_seed as i64);
+    let l = java_next_long(&mut s) / 2 * 2 + 1;
+    let m = java_next_long(&mut s) / 2 * 2 + 1;
+    (l, m)
+}
+
+/// Minimal Java LCG state — just enough to replicate `java.util.Random`.
+fn java_random_seed(seed: i64) -> i64 {
+    (seed ^ 0x5DEECE66D) & ((1_i64 << 48) - 1)
+}
+
+fn java_next(state: &mut i64, bits: u32) -> i32 {
+    *state = (state.wrapping_mul(0x5DEECE66D).wrapping_add(0xB)) & ((1_i64 << 48) - 1);
+    (*state >> (48 - bits)) as i32
+}
+
+fn java_next_int(state: &mut i64, bound: i32) -> i32 {
+    assert!(bound > 0);
+    // Simplified: power-of-two fast path not needed for correctness here.
+    loop {
+        let bits = java_next(state, 31);
+        let val = bits % bound;
+        if bits.wrapping_sub(val).wrapping_add(bound - 1) >= 0 {
+            return val;
+        }
+    }
+}
+
+fn java_next_long(state: &mut i64) -> i64 {
+    let hi = java_next(state, 32) as i64;
+    let lo = java_next(state, 32) as i64;
+    (hi << 32).wrapping_add(lo)
+}
+
+fn java_next_float(state: &mut i64) -> f32 {
+    java_next(state, 24) as f32 / (1_i32 << 24) as f32
+}
+
+fn carve_caves(chunk: &mut ChunkData, world_seed: u64) {
+    let (mul_l, mul_m) = alpha_seed_multipliers(world_seed);
+    let cx = chunk.pos.x;
+    let cz = chunk.pos.z;
+
+    for source_cx in (cx - 8)..=(cx + 8) {
+        for source_cz in (cz - 8)..=(cz + 8) {
+            // Per-source-chunk seed: (long)j * l + (long)k * m ^ worldSeed
+            let combined = (source_cx as i64)
+                .wrapping_mul(mul_l)
+                .wrapping_add((source_cz as i64).wrapping_mul(mul_m))
+                ^ (world_seed as i64);
+            let mut rng = java_random_seed(combined);
+
+            // Triple-nested random for cave count, skip 14/15 chunks
+            let inner = java_next_int(&mut rng, 40) + 1;
+            let mid = java_next_int(&mut rng, inner) + 1;
+            let cave_count = java_next_int(&mut rng, mid);
+            if java_next_int(&mut rng, 15) != 0 {
+                continue;
+            }
+
+            for _ in 0..cave_count {
+                let start_x = source_cx as f64 * 16.0 + java_next_int(&mut rng, 16) as f64;
+                let inner_y = java_next_int(&mut rng, 120) + 8;
+                let start_y = java_next_int(&mut rng, inner_y) as f64;
+                let start_z = source_cz as f64 * 16.0 + java_next_int(&mut rng, 16) as f64;
+
+                let mut k = 1;
+                if java_next_int(&mut rng, 4) == 0 {
+                    // Carve a room
+                    let room_width = 1.0 + java_next_float(&mut rng) as f64 * 6.0;
+                    carve_tunnel(
+                        &mut rng, chunk, cx, cz, start_x, start_y, start_z,
+                        room_width as f32, 0.0, 0.0, -1, -1, 0.5,
+                    );
+                    k += java_next_int(&mut rng, 4);
+                }
+                for _ in 0..k {
+                    let yaw = java_next_float(&mut rng) * PI as f32 * 2.0;
+                    let pitch = (java_next_float(&mut rng) - 0.5) * 2.0 / 8.0;
+                    let base_width =
+                        java_next_float(&mut rng) * 2.0 + java_next_float(&mut rng);
+                    carve_tunnel(
+                        &mut rng, chunk, cx, cz, start_x, start_y, start_z,
+                        base_width, yaw, pitch, 0, 0, 1.0,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn carve_tunnel(
+    parent_rng: &mut i64,
+    chunk: &mut ChunkData,
+    chunk_x: i32,
+    chunk_z: i32,
+    mut x: f64,
+    mut y: f64,
+    mut z: f64,
+    base_width: f32,
+    mut yaw: f32,
+    mut pitch: f32,
+    mut tunnel: i32,
+    mut tunnel_count: i32,
+    width_height_ratio: f64,
+) {
+    let center_x = chunk_x as f64 * 16.0 + 8.0;
+    let center_z = chunk_z as f64 * 16.0 + 8.0;
+    let mut f = 0.0_f32;
+    let mut g = 0.0_f32;
+    let mut rng = java_random_seed(java_next_long(parent_rng));
+
+    if tunnel_count <= 0 {
+        let range_blocks = 8 * 16 - 16;
+        tunnel_count = range_blocks - java_next_int(&mut rng, range_blocks / 4);
+    }
+
+    let mut is_room = false;
+    if tunnel == -1 {
+        tunnel = tunnel_count / 2;
+        is_room = true;
+    }
+
+    let fork_point = java_next_int(&mut rng, tunnel_count / 2) + tunnel_count / 4;
+    let gradual_pitch = java_next_int(&mut rng, 6) == 0;
+
+    while tunnel < tunnel_count {
+        let h = 1.5
+            + ((tunnel as f32 * PI as f32 / tunnel_count as f32).sin() * base_width * 1.0)
+                as f64;
+        let m = h * width_height_ratio;
+
+        let cos_pitch = pitch.cos();
+        let sin_pitch = pitch.sin();
+        x += (yaw.cos() * cos_pitch) as f64;
+        y += sin_pitch as f64;
+        z += (yaw.sin() * cos_pitch) as f64;
+
+        pitch = if gradual_pitch {
+            pitch * 0.92
+        } else {
+            pitch * 0.7
+        };
+        pitch += g * 0.1;
+        yaw += f * 0.1;
+
+        g *= 0.9;
+        f *= 0.75;
+        g += (java_next_float(&mut rng) - java_next_float(&mut rng)) * java_next_float(&mut rng) * 2.0;
+        f += (java_next_float(&mut rng) - java_next_float(&mut rng)) * java_next_float(&mut rng) * 4.0;
+
+        // Fork at midpoint
+        if !is_room && tunnel == fork_point && base_width > 1.0 {
+            let w1 = java_next_float(&mut rng) * 0.5 + 0.5;
+            carve_tunnel(
+                &mut rng, chunk, chunk_x, chunk_z, x, y, z,
+                w1,
+                yaw - PI as f32 / 2.0,
+                pitch / 3.0,
+                tunnel, tunnel_count, 1.0,
+            );
+            let w2 = java_next_float(&mut rng) * 0.5 + 0.5;
+            carve_tunnel(
+                &mut rng, chunk, chunk_x, chunk_z, x, y, z,
+                w2,
+                yaw + PI as f32 / 2.0,
+                pitch / 3.0,
+                tunnel, tunnel_count, 1.0,
+            );
+            return;
+        }
+
+        if is_room || java_next_int(&mut rng, 4) != 0 {
+            let dx = x - center_x;
+            let dz = z - center_z;
+            let remaining = (tunnel_count - tunnel) as f64;
+            let max_reach = (base_width + 2.0 + 16.0) as f64;
+            if dx * dx + dz * dz - remaining * remaining > max_reach * max_reach {
+                return;
+            }
+
+            if x >= center_x - 16.0 - h * 2.0
+                && z >= center_z - 16.0 - h * 2.0
+                && x <= center_x + 16.0 + h * 2.0
+                && z <= center_z + 16.0 + h * 2.0
+            {
+                carve_ellipsoid(chunk, chunk_x, chunk_z, x, y, z, h, m);
+            }
+        }
+
+        tunnel += 1;
+    }
+}
+
+/// Carve an ellipsoidal region within the target chunk bounds.
+#[allow(clippy::too_many_arguments)]
+fn carve_ellipsoid(
+    chunk: &mut ChunkData,
+    chunk_x: i32,
+    chunk_z: i32,
+    cx: f64,
+    cy: f64,
+    cz: f64,
+    h: f64,
+    m: f64,
+) {
+    let min_x = ((cx - h).floor() as i32 - chunk_x * 16 - 1).max(0);
+    let max_x = ((cx + h).floor() as i32 - chunk_x * 16 + 1).min(16);
+    let min_y = ((cy - m).floor() as i32 - 1).max(1);
+    let max_y = ((cy + m).floor() as i32 + 1).min(120);
+    let min_z = ((cz - h).floor() as i32 - chunk_z * 16 - 1).max(0);
+    let max_z = ((cz + h).floor() as i32 - chunk_z * 16 + 1).min(16);
+
+    // Check for water — abort if any water in bounding box
+    for lx in min_x..max_x {
+        for lz in min_z..max_z {
+            for ly in (min_y.saturating_sub(1))..=(max_y + 1).min(CHUNK_HEIGHT as i32 - 1) {
+                let b = chunk.block(lx as u8, ly as u8, lz as u8);
+                if b == FLOWING_WATER_ID || b == WATER_ID {
+                    return;
+                }
+            }
+        }
+    }
+
+    for lx in min_x..max_x {
+        let fx = ((lx + chunk_x * 16) as f64 + 0.5 - cx) / h;
+        for lz in min_z..max_z {
+            let fz = ((lz + chunk_z * 16) as f64 + 0.5 - cz) / h;
+            let mut was_grass = false;
+            for ly in (min_y..max_y).rev() {
+                let fy = (ly as f64 + 0.5 - cy) / m;
+                if fy > -0.7 && fx * fx + fy * fy + fz * fz < 1.0 {
+                    let b = chunk.block(lx as u8, ly as u8, lz as u8);
+                    if b == GRASS_ID {
+                        was_grass = true;
+                    }
+                    if b == STONE_ID || b == DIRT_ID || b == GRASS_ID {
+                        if ly < 10 {
+                            chunk.set_block(lx as u8, ly as u8, lz as u8, FLOWING_LAVA_ID);
+                        } else {
+                            chunk.set_block(lx as u8, ly as u8, lz as u8, AIR_ID);
+                            // If we carved grass, turn dirt below into grass
+                            if was_grass && ly > 0 {
+                                let below = chunk.block(lx as u8, (ly - 1) as u8, lz as u8);
+                                if below == DIRT_ID {
+                                    chunk.set_block(
+                                        lx as u8,
+                                        (ly - 1) as u8,
+                                        lz as u8,
+                                        GRASS_ID,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// Ore vein placement  (translated from VeinFeature.java / OverworldChunkGenerator.java)
+// ---------------------------------------------------------------------------
+
+struct OreConfig {
+    block_id: u8,
+    vein_size: i32,
+    attempts: i32,
+    max_y: i32,
+}
+
+const ORE_TABLE: &[OreConfig] = &[
+    OreConfig { block_id: DIRT_ID,         vein_size: 32, attempts: 20, max_y: 128 },
+    OreConfig { block_id: GRAVEL_ID,       vein_size: 32, attempts: 10, max_y: 128 },
+    OreConfig { block_id: COAL_ORE_ID,     vein_size: 16, attempts: 20, max_y: 128 },
+    OreConfig { block_id: IRON_ORE_ID,     vein_size: 8,  attempts: 20, max_y: 64 },
+    OreConfig { block_id: GOLD_ORE_ID,     vein_size: 8,  attempts: 2,  max_y: 32 },
+    OreConfig { block_id: REDSTONE_ORE_ID, vein_size: 7,  attempts: 8,  max_y: 16 },
+    OreConfig { block_id: DIAMOND_ORE_ID,  vein_size: 7,  attempts: 1,  max_y: 16 },
+];
+
+fn populate_ores(chunk: &mut ChunkData, world_seed: u64) {
+    let (mul_l, mul_m) = alpha_seed_multipliers(world_seed);
+    let cx = chunk.pos.x;
+    let cz = chunk.pos.z;
+
+    // Derive per-chunk RNG using the same Alpha multiplier pattern
+    let combined = (cx as i64)
+        .wrapping_mul(mul_l)
+        .wrapping_add((cz as i64).wrapping_mul(mul_m))
+        ^ (world_seed as i64);
+    // Use SmallRng for ore placement (doesn't need Java-exact RNG)
+    let mut rng = SmallRng::seed_from_u64(combined as u64);
+
+    let base_x = cx * 16;
+    let base_z = cz * 16;
+
+    for ore in ORE_TABLE {
+        for _ in 0..ore.attempts {
+            let x = base_x + rng.gen_range(0..16);
+            let y = rng.gen_range(0..ore.max_y);
+            let z = base_z + rng.gen_range(0..16);
+            place_vein(chunk, &mut rng, ore.block_id, ore.vein_size, x, y, z);
+        }
+    }
+}
+
+fn place_vein(
+    chunk: &mut ChunkData,
+    rng: &mut SmallRng,
+    block_id: u8,
+    size: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+) {
+    let angle: f32 = rng.gen::<f32>() * PI as f32;
+    let size_f = size as f32;
+
+    let d = (x as f32 + 8.0) + angle.sin() * size_f / 8.0;
+    let e = (x as f32 + 8.0) - angle.sin() * size_f / 8.0;
+    let g = (z as f32 + 8.0) + angle.cos() * size_f / 8.0;
+    let h_val = (z as f32 + 8.0) - angle.cos() * size_f / 8.0;
+    let i = (y + rng.gen_range(0..3) + 2) as f64;
+    let j = (y + rng.gen_range(0..3) + 2) as f64;
+
+    let chunk_base_x = chunk.pos.x * 16;
+    let chunk_base_z = chunk.pos.z * 16;
+
+    for k in 0..=size {
+        let t = k as f64 / size as f64;
+        let l = d as f64 + (e as f64 - d as f64) * t;
+        let m = i + (j - i) * t;
+        let n = g as f64 + (h_val as f64 - g as f64) * t;
+
+        let o = rng.gen::<f64>() * size as f64 / 16.0;
+        let sin_val = ((k as f32 * PI as f32 / size_f).sin() + 1.0) as f64;
+        let p = sin_val * o + 1.0;
+        let q = sin_val * o + 1.0;
+
+        let r_min = (l - p / 2.0).floor() as i32;
+        let r_max = (l + p / 2.0).floor() as i32;
+        let s_min = (m - q / 2.0).floor() as i32;
+        let s_max = (m + q / 2.0).floor() as i32;
+        let t_min = (n - p / 2.0).floor() as i32;
+        let t_max = (n + p / 2.0).floor() as i32;
+
+        for r in r_min..=r_max {
+            let local_x = r - chunk_base_x;
+            if !(0..16).contains(&local_x) {
+                continue;
+            }
+            let fu = (r as f64 + 0.5 - l) / (p / 2.0);
+            for s in s_min..=s_max {
+                if s < 1 || s >= CHUNK_HEIGHT as i32 {
+                    continue;
+                }
+                let fv = (s as f64 + 0.5 - m) / (q / 2.0);
+                for tt in t_min..=t_max {
+                    let local_z = tt - chunk_base_z;
+                    if !(0..16).contains(&local_z) {
+                        continue;
+                    }
+                    let fw = (tt as f64 + 0.5 - n) / (p / 2.0);
+                    if fu * fu + fv * fv + fw * fw < 1.0
+                        && chunk.block(local_x as u8, s as u8, local_z as u8) == STONE_ID
+                    {
+                        chunk.set_block(local_x as u8, s as u8, local_z as u8, block_id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dungeon stubs  (translated from DungeonFeature.java / OverworldChunkGenerator.java)
+// ---------------------------------------------------------------------------
+
+fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
+    let (mul_l, mul_m) = alpha_seed_multipliers(world_seed);
+    let cx = chunk.pos.x;
+    let cz = chunk.pos.z;
+
+    // Distinct seed from ores — offset by a constant so caves/ores/dungeons don't share state
+    let combined = (cx as i64)
+        .wrapping_mul(mul_l)
+        .wrapping_add((cz as i64).wrapping_mul(mul_m))
+        ^ (world_seed as i64)
+        ^ 0x5A5A_5A5A;
+    let mut rng = SmallRng::seed_from_u64(combined as u64);
+
+    // 8 attempts per chunk (matching Alpha)
+    for _ in 0..8 {
+        let local_x = rng.gen_range(0..16_i32);
+        let y = rng.gen_range(1..CHUNK_HEIGHT as i32 - 4);
+        let local_z = rng.gen_range(0..16_i32);
+
+        let half_x: i32 = rng.gen_range(2..=4);
+        let half_z: i32 = rng.gen_range(2..=4);
+        let room_height = 3;
+
+        // Bounds check — room must fit within chunk
+        if local_x - half_x - 1 < 0
+            || local_x + half_x + 1 >= 16
+            || local_z - half_z - 1 < 0
+            || local_z + half_z + 1 >= 16
+            || y + room_height + 1 >= CHUNK_HEIGHT as i32
+        {
+            continue;
+        }
+
+        // Validate: floor is solid, ceiling is solid
+        let mut floor_ok = true;
+        let mut ceil_ok = true;
+        for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
+            for vz in (local_z - half_z - 1)..=(local_z + half_z + 1) {
+                let floor_b = chunk.block(vx as u8, (y - 1) as u8, vz as u8);
+                if floor_b == AIR_ID {
+                    floor_ok = false;
+                }
+                let ceil_b = chunk.block(vx as u8, (y + room_height + 1) as u8, vz as u8);
+                if ceil_b == AIR_ID {
+                    ceil_ok = false;
+                }
+            }
+        }
+        if !floor_ok || !ceil_ok {
+            continue;
+        }
+
+        // Count wall openings (adjacent air on walls at floor level)
+        let mut openings = 0;
+        for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
+            for vz in (local_z - half_z - 1)..=(local_z + half_z + 1) {
+                let on_wall = vx == local_x - half_x - 1
+                    || vx == local_x + half_x + 1
+                    || vz == local_z - half_z - 1
+                    || vz == local_z + half_z + 1;
+                if on_wall {
+                    let b = chunk.block(vx as u8, y as u8, vz as u8);
+                    let b_above = chunk.block(vx as u8, (y + 1) as u8, vz as u8);
+                    if b == AIR_ID && b_above == AIR_ID {
+                        openings += 1;
+                    }
+                }
+            }
+        }
+        if !(1..=5).contains(&openings) {
+            continue;
+        }
+
+        // Carve the room and place walls
+        for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
+            for vy in (y - 1)..=(y + room_height + 1) {
+                for vz in (local_z - half_z - 1)..=(local_z + half_z + 1) {
+                    let on_boundary = vx == local_x - half_x - 1
+                        || vx == local_x + half_x + 1
+                        || vy == y - 1
+                        || vy == y + room_height + 1
+                        || vz == local_z - half_z - 1
+                        || vz == local_z + half_z + 1;
+
+                    if on_boundary {
+                        // Walls/floor/ceiling: cobblestone or mossy
+                        let existing = chunk.block(vx as u8, vy as u8, vz as u8);
+                        if existing != AIR_ID {
+                            let wall_block = if vy == y - 1 && rng.gen_range(0..4) != 0 {
+                                MOSSY_COBBLESTONE_ID
+                            } else {
+                                COBBLESTONE_ID
+                            };
+                            chunk.set_block(vx as u8, vy as u8, vz as u8, wall_block);
+                        }
+                    } else {
+                        // Interior: clear to air
+                        chunk.set_block(vx as u8, vy as u8, vz as u8, AIR_ID);
+                    }
+                }
+            }
+        }
+
+        // Place mob spawner at center
+        chunk.set_block(local_x as u8, y as u8, local_z as u8, MOB_SPAWNER_ID);
     }
 }
 
@@ -1209,5 +1738,145 @@ mod tests {
         chunk.set_block(4, 10, 7, AIR_ID);
         chunk.reseed_column_emitted_light(4, 7, &registry);
         assert_eq!(chunk.block_light(4, 10, 7), 0);
+    }
+
+    #[test]
+    fn cave_carving_is_deterministic() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let seed = 42;
+        let gen = OverworldChunkGenerator::new(seed);
+        let pos = ChunkPos { x: 3, z: -2 };
+        let a = gen.generate_chunk(pos, &registry);
+        let b = gen.generate_chunk(pos, &registry);
+        for lx in 0..16_u8 {
+            for lz in 0..16_u8 {
+                for y in 0..128_u8 {
+                    assert_eq!(a.block(lx, y, lz), b.block(lx, y, lz));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caves_create_air_below_surface() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let gen = OverworldChunkGenerator::new(12345);
+        // Check a 5x5 region — caves should appear somewhere
+        let mut found_underground_air = false;
+        'outer: for cx in -2..=2 {
+            for cz in -2..=2 {
+                let chunk = gen.generate_chunk(ChunkPos { x: cx, z: cz }, &registry);
+                for lx in 0..16_u8 {
+                    for lz in 0..16_u8 {
+                        for y in 1..50_u8 {
+                            if chunk.block(lx, y, lz) == AIR_ID {
+                                found_underground_air = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_underground_air, "no underground air found in 5x5 region — caves not working");
+    }
+
+    #[test]
+    fn caves_place_lava_below_y10() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let gen = OverworldChunkGenerator::new(12345);
+        let mut found_lava = false;
+        'outer: for cx in -3..=3 {
+            for cz in -3..=3 {
+                let chunk = gen.generate_chunk(ChunkPos { x: cx, z: cz }, &registry);
+                for lx in 0..16_u8 {
+                    for lz in 0..16_u8 {
+                        for y in 1..10_u8 {
+                            if chunk.block(lx, y, lz) == FLOWING_LAVA_ID {
+                                found_lava = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_lava, "no lava found below y=10 in 7x7 region");
+    }
+
+    #[test]
+    fn ores_are_present_underground() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let gen = OverworldChunkGenerator::new(99999);
+        let chunk = gen.generate_chunk(ChunkPos { x: 0, z: 0 }, &registry);
+        let mut found_coal = false;
+        for lx in 0..16_u8 {
+            for lz in 0..16_u8 {
+                for y in 1..128_u8 {
+                    if chunk.block(lx, y, lz) == COAL_ORE_ID {
+                        found_coal = true;
+                    }
+                }
+            }
+        }
+        assert!(found_coal, "no coal ore found in chunk — ore placement not working");
+    }
+
+    #[test]
+    fn ore_distribution_respects_y_limits() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let gen = OverworldChunkGenerator::new(77777);
+        // Check several chunks
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                let chunk = gen.generate_chunk(ChunkPos { x: cx, z: cz }, &registry);
+                for lx in 0..16_u8 {
+                    for lz in 0..16_u8 {
+                        for y in 0..128_u8 {
+                            let b = chunk.block(lx, y, lz);
+                            // max_y is the starting Y cap; veins spread a few blocks above
+                            if b == DIAMOND_ORE_ID {
+                                assert!(y < 20, "diamond ore found at y={y}, expected < 20");
+                            }
+                            if b == GOLD_ORE_ID {
+                                assert!(y < 36, "gold ore found at y={y}, expected < 36");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dungeon_stub_places_cobblestone() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let gen = OverworldChunkGenerator::new(314159);
+        let mut found_cobble = false;
+        let mut found_spawner = false;
+        // Check a larger area since dungeons are rare
+        'outer: for cx in -5..=5 {
+            for cz in -5..=5 {
+                let chunk = gen.generate_chunk(ChunkPos { x: cx, z: cz }, &registry);
+                for lx in 0..16_u8 {
+                    for lz in 0..16_u8 {
+                        for y in 1..120_u8 {
+                            let b = chunk.block(lx, y, lz);
+                            if b == COBBLESTONE_ID || b == MOSSY_COBBLESTONE_ID {
+                                found_cobble = true;
+                            }
+                            if b == MOB_SPAWNER_ID {
+                                found_spawner = true;
+                            }
+                            if found_cobble && found_spawner {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_cobble, "no cobblestone found — dungeon stubs not placing walls");
+        assert!(found_spawner, "no mob spawner found — dungeon stubs not placing spawners");
     }
 }
