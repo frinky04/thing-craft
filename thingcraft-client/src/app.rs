@@ -18,7 +18,7 @@ use crate::world::{BootstrapWorld, ChunkPos};
 
 const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
     "wgpu_core=warn",
-    "wgpu_hal=warn",
+    "wgpu_hal=error",
     "naga=warn",
     "ash=warn",
     "calloop=warn",
@@ -159,7 +159,7 @@ pub fn run() -> Result<()> {
                     let tick_duration = tick_timer_start.elapsed();
 
                     ecs_runtime.run_render_prep(fixed_clock.alpha() as f32);
-                    let mut frame_camera: Option<(crate::ecs::CameraSnapshot, Mat4)> = None;
+                    let mut frame_camera: Option<crate::ecs::CameraSnapshot> = None;
                     let mut camera_chunk = ChunkPos { x: 0, z: 0 };
                     if let Some(snapshot) = ecs_runtime.camera_snapshot() {
                         let direction = direction_from_angles(
@@ -179,7 +179,7 @@ pub fn run() -> Result<()> {
                             snapshot.authoritative.position.x,
                             snapshot.authoritative.position.z,
                         );
-                        frame_camera = Some((snapshot, view));
+                        frame_camera = Some(snapshot);
                     }
 
                     if let Some(scene_mesh) = chunk_streamer.update_target(camera_chunk) {
@@ -202,7 +202,7 @@ pub fn run() -> Result<()> {
                         loop_stats.record_frame(frame_delta, ticks_to_run, tick_duration)
                     {
                         let residency = chunk_streamer.metrics();
-                        if let Some((snapshot, view)) = frame_camera {
+                        if let Some(snapshot) = frame_camera {
                             debug!(
                                 fps = report.fps,
                                 tps = report.tps,
@@ -219,7 +219,6 @@ pub fn run() -> Result<()> {
                                 evicting_chunks = residency.evicting,
                                 in_flight_generation = residency.in_flight_generation,
                                 in_flight_meshing = residency.in_flight_meshing,
-                                view_matrix = ?view.to_cols_array(),
                                 "runtime stats"
                             );
                         } else {
