@@ -20,7 +20,7 @@ use crate::streaming::{
 };
 use crate::time_step::FixedStepClock;
 use crate::world::{
-    BlockRegistry, BootstrapWorld, ChunkPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH,
+    BiomeSource, BlockRegistry, BootstrapWorld, ChunkPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH,
 };
 
 const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
@@ -33,9 +33,19 @@ const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
 const APPLY_STREAM_UPDATES_TO_RENDERER: bool = true;
 const BLOCK_INTERACTION_REACH_BLOCKS: f64 = 5.0;
 const AIR_BLOCK_ID: u8 = 0;
-const HOTBAR_BLOCK_IDS: [u8; 9] = [3, 1, 4, 12, 13, 17, 5, 20, 50];
+const HOTBAR_BLOCK_IDS: [u8; 9] = [3, 1, 4, 12, 13, 17, 5, 9, 50];
 const HOTBAR_STACK_LIMIT: u8 = 64;
 const EDIT_LATENCY_SAMPLE_WINDOW: usize = 128;
+const FLUID_TICK_BUDGET_DEFAULT: usize = 384;
+const FLUID_TICK_BUDGET_HARD_MAX: usize = 1_000;
+const FLUID_TICK_BUDGET_MIN: usize = 64;
+const FLUID_BUDGET_ADAPT_STEP_MIN: usize = 16;
+const FLUID_BUDGET_FRAME_HEADROOM_MS: f64 = 12.5;
+const FLUID_BUDGET_FRAME_PRESSURE_MS: f64 = 19.0;
+const FLUID_URGENT_SLICE_MIN: usize = 16;
+const FLUID_URGENT_SLICE_DIVISOR: usize = 8;
+const DAY_TICKS: u64 = 24_000;
+const WORLD_SEED: u64 = 0xA126_0001;
 
 #[derive(Debug, Clone, Copy)]
 enum BlockInteractionKind {
@@ -110,6 +120,13 @@ struct EditLatencyMetrics {
     p95_ms: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveFluidBudget {
+    current: usize,
+    min: usize,
+    max: usize,
+}
+
 impl HotbarInventory {
     fn alpha_defaults() -> Self {
         Self {
@@ -155,6 +172,71 @@ impl HotbarInventory {
     /// Lightweight snapshot of all slot counts for dirty-checking.
     fn snapshot_counts(&self) -> [u8; HOTBAR_BLOCK_IDS.len()] {
         std::array::from_fn(|i| self.slots[i].count)
+    }
+}
+
+impl AdaptiveFluidBudget {
+    fn new(base_budget: usize) -> Self {
+        let max = FLUID_TICK_BUDGET_HARD_MAX.max(base_budget);
+        let min = if base_budget <= FLUID_TICK_BUDGET_MIN {
+            1
+        } else {
+            FLUID_TICK_BUDGET_MIN
+        };
+        Self {
+            current: base_budget.clamp(min, max),
+            min,
+            max,
+        }
+    }
+
+    fn current(self) -> usize {
+        self.current
+    }
+
+    fn min(self) -> usize {
+        self.min
+    }
+
+    fn max(self) -> usize {
+        self.max
+    }
+
+    fn urgent_slice_for_tick(self, tick_budget: usize) -> usize {
+        if tick_budget == 0 {
+            return 0;
+        }
+        (tick_budget / FLUID_URGENT_SLICE_DIVISOR)
+            .max(FLUID_URGENT_SLICE_MIN)
+            .min(tick_budget)
+    }
+
+    fn observe_frame(
+        &mut self,
+        frame_delta: Duration,
+        ticks_to_run: u32,
+        processed_this_frame: usize,
+        budget_left: usize,
+    ) {
+        let frame_ms = frame_delta.as_secs_f64() * 1000.0;
+        let budget_used = self.current.saturating_sub(budget_left);
+        let saturated = budget_left == 0 && processed_this_frame > 0;
+        let step = (self.current / 8).max(FLUID_BUDGET_ADAPT_STEP_MIN);
+
+        if frame_ms >= FLUID_BUDGET_FRAME_PRESSURE_MS && budget_used > 0 {
+            self.current = self.current.saturating_sub(step).clamp(self.min, self.max);
+            return;
+        }
+
+        if !saturated {
+            return;
+        }
+
+        if frame_ms <= FLUID_BUDGET_FRAME_HEADROOM_MS
+            || (ticks_to_run > 1 && frame_ms < FLUID_BUDGET_FRAME_PRESSURE_MS)
+        {
+            self.current = self.current.saturating_add(step).clamp(self.min, self.max);
+        }
     }
 }
 
@@ -275,10 +357,13 @@ pub fn run() -> Result<()> {
 
     let residency_config = resolve_residency_config();
     let mut chunk_streamer = ChunkStreamer::new(
-        0xA126_0001,
+        WORLD_SEED,
         bootstrap_world.registry.clone(),
         residency_config,
     );
+    let biome_source = BiomeSource::new(WORLD_SEED);
+    let alpha_view_distance = alpha_view_distance_setting(residency_config.view_radius);
+    let render_distance_blocks = alpha_render_distance_blocks(alpha_view_distance);
     let _ = chunk_streamer.update_target(ChunkPos { x: 0, z: 0 });
     for update in chunk_streamer.drain_render_updates() {
         if apply_render_update(&mut renderer, update) && bootstrap_mesh_active {
@@ -295,6 +380,11 @@ pub fn run() -> Result<()> {
     let mut hotbar_inventory = HotbarInventory::alpha_defaults();
     let mut selected_hotbar_slot = 0_usize;
     let mut hud_dirty = true;
+    let mut sim_ticks: u64 = 0;
+    let mut last_fog_brightness = 1.0_f32;
+    let mut fog_brightness = 1.0_f32;
+    let base_fluid_tick_budget = resolve_fluid_tick_budget();
+    let mut adaptive_fluid_budget = AdaptiveFluidBudget::new(base_fluid_tick_budget);
     let selected_slot = hotbar_inventory
         .slot(selected_hotbar_slot)
         .unwrap_or_default();
@@ -318,6 +408,9 @@ pub fn run() -> Result<()> {
         stream_gen_workers = residency_config.generation_workers,
         stream_light_workers = residency_config.lighting_workers,
         stream_mesh_workers = residency_config.meshing_workers,
+        fluid_tick_budget = base_fluid_tick_budget,
+        fluid_tick_budget_min = adaptive_fluid_budget.min(),
+        fluid_tick_budget_max = adaptive_fluid_budget.max(),
         selected_hotbar_slot = 1,
         selected_place_block = selected_slot.block_id,
         selected_place_count = selected_slot.count,
@@ -333,11 +426,11 @@ pub fn run() -> Result<()> {
                 WindowEvent::Resized(size) => {
                     renderer.resize(size);
                     hud_dirty = true;
-                }
+                },
                 WindowEvent::ScaleFactorChanged { .. } => {
                     renderer.resize(window.inner_size());
                     hud_dirty = true;
-                }
+                },
                 WindowEvent::RedrawRequested => {
                     let now = Instant::now();
                     let frame_delta = now.saturating_duration_since(last_frame_start);
@@ -348,7 +441,13 @@ pub fn run() -> Result<()> {
                     let tick_timer_start = Instant::now();
                     let ticks_to_run = fixed_clock.advance(frame_delta);
                     let fixed_dt_seconds = fixed_clock.tick_dt().as_secs_f64();
-                    for _ in 0..ticks_to_run {
+                    let fluid_tick_budget = adaptive_fluid_budget.current();
+                    let mut fluid_budget_remaining = fluid_tick_budget;
+                    let mut fluid_processed_this_frame = 0_usize;
+                    let mut urgent_fluid_processed_this_frame = 0_usize;
+                    for tick_index in 0..ticks_to_run {
+                        sim_ticks = sim_ticks.wrapping_add(1);
+                        chunk_streamer.begin_sim_tick(sim_ticks);
                         ecs_runtime.run_fixed(fixed_dt_seconds);
                         let fly_mode = ecs_runtime.is_fly_mode();
                         resolve_player_physics(
@@ -367,13 +466,85 @@ pub fn run() -> Result<()> {
                         if hotbar_inventory.snapshot_counts() != pre_inv {
                             hud_dirty = true;
                         }
+                        if fluid_budget_remaining > 0 {
+                            let ticks_left = usize::try_from(ticks_to_run - tick_index).unwrap_or(1);
+                            let tick_budget_slice = fluid_budget_remaining.div_ceil(ticks_left);
+
+                            let urgent_slice_budget = adaptive_fluid_budget
+                                .urgent_slice_for_tick(tick_budget_slice)
+                                .min(fluid_budget_remaining);
+                            if urgent_slice_budget > 0 {
+                                let processed_urgent =
+                                    chunk_streamer.tick_fluids_urgent(sim_ticks, urgent_slice_budget);
+                                urgent_fluid_processed_this_frame += processed_urgent;
+                                fluid_processed_this_frame += processed_urgent;
+                                fluid_budget_remaining =
+                                    fluid_budget_remaining.saturating_sub(processed_urgent);
+                            }
+
+                            let remaining_tick_budget = tick_budget_slice.min(fluid_budget_remaining);
+                            if remaining_tick_budget > 0 {
+                                let processed =
+                                    chunk_streamer.tick_fluids(sim_ticks, remaining_tick_budget);
+                                fluid_processed_this_frame += processed;
+                                fluid_budget_remaining =
+                                    fluid_budget_remaining.saturating_sub(processed);
+                            }
+                        }
+
+                        // Alpha GameRenderer.tick(): smooth fog brightness toward sampled player
+                        // brightness, biased by view-distance setting.
+                        let tick_time_of_day = alpha_time_of_day(sim_ticks, 0.0);
+                        let tick_ambient_darkness = alpha_ambient_darkness(tick_time_of_day);
+                        let player_pos = ecs_runtime
+                            .camera_snapshot()
+                            .map_or(DVec3::ZERO, |snapshot| snapshot.authoritative.position);
+                        last_fog_brightness = fog_brightness;
+                        let target_fog_brightness = alpha_fog_brightness_target(
+                            &chunk_streamer,
+                            player_pos,
+                            tick_ambient_darkness,
+                            alpha_view_distance,
+                        );
+                        fog_brightness += (target_fog_brightness - fog_brightness) * 0.1;
                     }
                     let tick_duration = tick_timer_start.elapsed();
+                    adaptive_fluid_budget.observe_frame(
+                        frame_delta,
+                        ticks_to_run,
+                        fluid_processed_this_frame,
+                        fluid_budget_remaining,
+                    );
+                    renderer.advance_dynamic_liquid_textures(ticks_to_run);
 
-                    ecs_runtime.run_render_prep(fixed_clock.alpha() as f32);
+                    let render_alpha = fixed_clock.alpha() as f32;
+                    let frame_fog_brightness = (last_fog_brightness
+                        + (fog_brightness - last_fog_brightness) * render_alpha)
+                        .clamp(0.0, 1.0);
+                    ecs_runtime.run_render_prep(render_alpha);
                     let mut frame_camera: Option<crate::ecs::CameraSnapshot> = None;
                     let mut camera_chunk = ChunkPos { x: 0, z: 0 };
+                    let time_of_day = alpha_time_of_day(sim_ticks, render_alpha);
+                    let ambient_darkness = alpha_ambient_darkness(time_of_day);
+                    let cloud_color = alpha_cloud_color(time_of_day);
+                    let cloud_scroll = (sim_ticks as f32 + render_alpha) * 0.03;
+                    let render_sky = alpha_view_distance < 2;
+                    renderer.set_cloud_state(cloud_color, cloud_scroll);
                     if let Some(snapshot) = ecs_runtime.camera_snapshot() {
+                        let biome_sample = biome_source.sample(
+                            snapshot.authoritative.position.x.floor() as i32,
+                            snapshot.authoritative.position.z.floor() as i32,
+                        );
+                        let sky_color = alpha_sky_color(time_of_day, biome_sample.temperature as f32);
+                        let fog_color = alpha_clear_fog_color(
+                            alpha_fog_color(time_of_day),
+                            sky_color,
+                            alpha_view_distance,
+                        );
+                        let fog_color =
+                            alpha_apply_fog_brightness(fog_color, frame_fog_brightness);
+                        renderer.set_day_night(fog_color, sky_color, ambient_darkness, render_sky);
+
                         let direction = direction_from_angles(
                             snapshot.interpolated.yaw,
                             snapshot.interpolated.pitch,
@@ -384,20 +555,30 @@ pub fn run() -> Result<()> {
                             70_f32.to_radians(),
                             renderer.viewport_aspect().max(0.001),
                             0.05,
-                            512.0,
+                            render_distance_blocks,
                         );
-                        let fog_end = (residency_config.view_radius as f32 + 1.0) * 16.0;
                         renderer.update_camera(
                             (projection * view).to_cols_array_2d(),
                             snapshot.interpolated.position.to_array(),
-                            fog_end * 0.25,
-                            fog_end,
+                            render_distance_blocks * 0.25,
+                            render_distance_blocks,
                         );
                         camera_chunk = world_pos_to_chunk_pos(
                             snapshot.authoritative.position.x,
                             snapshot.authoritative.position.z,
                         );
                         frame_camera = Some(snapshot);
+                    } else {
+                        let biome_sample = biome_source.sample(0, 0);
+                        let sky_color = alpha_sky_color(time_of_day, biome_sample.temperature as f32);
+                        let fog_color = alpha_clear_fog_color(
+                            alpha_fog_color(time_of_day),
+                            sky_color,
+                            alpha_view_distance,
+                        );
+                        let fog_color =
+                            alpha_apply_fog_brightness(fog_color, frame_fog_brightness);
+                        renderer.set_day_night(fog_color, sky_color, ambient_darkness, render_sky);
                     }
 
                     chunk_streamer.tick(camera_chunk);
@@ -481,6 +662,11 @@ pub fn run() -> Result<()> {
                                 edit_latency_latest_ms = edit_latency.latest_ms,
                                 edit_latency_avg_ms = edit_latency.avg_ms,
                                 edit_latency_p95_ms = edit_latency.p95_ms,
+                                fluid_processed_frame = fluid_processed_this_frame,
+                                fluid_processed_urgent_frame = urgent_fluid_processed_this_frame,
+                                fluid_budget_active = fluid_tick_budget,
+                                fluid_budget_left = fluid_budget_remaining,
+                                ambient_darkness,
                                 visible_chunks = renderer.visible_chunk_count(),
                                 "runtime stats"
                             );
@@ -488,34 +674,38 @@ pub fn run() -> Result<()> {
                             debug!(
                                 fps = report.fps,
                                 tps = report.tps,
-                                avg_frame_ms = report.avg_frame_ms,
-                                avg_tick_ms = report.avg_tick_ms,
-                                resident_chunks = residency.total,
-                                resident_chunks_gpu = renderer.chunk_mesh_count(),
-                                ready_chunks = residency.ready,
-                                generating_chunks = residency.generating,
-                                meshing_chunks = residency.meshing,
-                                evicting_chunks = residency.evicting,
-                                dirty_chunks = residency.dirty_chunks,
-                                remesh_enqueued = residency.remesh_enqueued,
-                                relight_enqueued = residency.relight_enqueued,
-                                relight_dropped_stale = residency.relight_dropped_stale,
-                                in_flight_generation = residency.in_flight_generation,
-                                in_flight_lighting = residency.in_flight_lighting,
-                                in_flight_meshing = residency.in_flight_meshing,
-                                urgent_lighting = residency.urgent_lighting,
-                                urgent_meshing = residency.urgent_meshing,
-                                edit_latency_pending = edit_latency.pending,
-                                edit_latency_completed = edit_latency.completed_total,
-                                edit_latency_latest_ms = edit_latency.latest_ms,
-                                edit_latency_avg_ms = edit_latency.avg_ms,
-                                edit_latency_p95_ms = edit_latency.p95_ms,
-                                visible_chunks = renderer.visible_chunk_count(),
-                                "runtime stats"
-                            );
-                        }
+                            avg_frame_ms = report.avg_frame_ms,
+                            avg_tick_ms = report.avg_tick_ms,
+                            resident_chunks = residency.total,
+                            resident_chunks_gpu = renderer.chunk_mesh_count(),
+                            ready_chunks = residency.ready,
+                            generating_chunks = residency.generating,
+                            meshing_chunks = residency.meshing,
+                            evicting_chunks = residency.evicting,
+                            dirty_chunks = residency.dirty_chunks,
+                            remesh_enqueued = residency.remesh_enqueued,
+                            relight_enqueued = residency.relight_enqueued,
+                            relight_dropped_stale = residency.relight_dropped_stale,
+                            in_flight_generation = residency.in_flight_generation,
+                            in_flight_lighting = residency.in_flight_lighting,
+                            in_flight_meshing = residency.in_flight_meshing,
+                            urgent_lighting = residency.urgent_lighting,
+                            urgent_meshing = residency.urgent_meshing,
+                            edit_latency_pending = edit_latency.pending,
+                            edit_latency_completed = edit_latency.completed_total,
+                            edit_latency_latest_ms = edit_latency.latest_ms,
+                            edit_latency_avg_ms = edit_latency.avg_ms,
+                            edit_latency_p95_ms = edit_latency.p95_ms,
+                            fluid_processed_frame = fluid_processed_this_frame,
+                            fluid_processed_urgent_frame = urgent_fluid_processed_this_frame,
+                            fluid_budget_active = fluid_tick_budget,
+                            fluid_budget_left = fluid_budget_remaining,
+                            ambient_darkness,
+                            visible_chunks = renderer.visible_chunk_count(),
+                            "runtime stats"
+                        );
                     }
-                }
+                }},
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let is_pressed = event.state == ElementState::Pressed;
@@ -564,7 +754,7 @@ pub fn run() -> Result<()> {
                             set_mouse_capture(window, false);
                         }
                     }
-                }
+                },
                 WindowEvent::MouseInput {
                     button: MouseButton::Left,
                     state: ElementState::Pressed,
@@ -580,7 +770,7 @@ pub fn run() -> Result<()> {
                             BlockInteractionKind::Break,
                         );
                     }
-                }
+                },
                 WindowEvent::MouseInput {
                     button: MouseButton::Right,
                     state: ElementState::Pressed,
@@ -593,7 +783,7 @@ pub fn run() -> Result<()> {
                             slot: selected_hotbar_slot,
                         },
                     );
-                }
+                },
                 _ => {}
             },
             Event::DeviceEvent {
@@ -601,10 +791,10 @@ pub fn run() -> Result<()> {
                 ..
             } if mouse_captured => {
                 ecs_runtime.add_mouse_delta(delta.0, delta.1);
-            }
+            },
             Event::AboutToWait => {
                 window.request_redraw();
-            }
+            },
             _ => {}
         }
     })?;
@@ -979,6 +1169,12 @@ fn resolve_residency_config() -> ResidencyConfig {
     config
 }
 
+fn resolve_fluid_tick_budget() -> usize {
+    parse_env_u32("THINGCRAFT_FLUID_BUDGET")
+        .map_or(FLUID_TICK_BUDGET_DEFAULT, |value| value as usize)
+        .clamp(1, FLUID_TICK_BUDGET_HARD_MAX)
+}
+
 fn parse_env_u32(key: &str) -> Option<u32> {
     let raw = std::env::var(key).ok()?;
     match raw.parse::<u32>() {
@@ -987,6 +1183,147 @@ fn parse_env_u32(key: &str) -> Option<u32> {
             warn!(env = key, value = %raw, ?err, "invalid env override; using default");
             None
         }
+    }
+}
+
+fn alpha_time_of_day(time_ticks: u64, tick_delta: f32) -> f32 {
+    let day_tick = (time_ticks % DAY_TICKS) as f32;
+    let mut f = (day_tick + tick_delta) / DAY_TICKS as f32 - 0.25;
+    if f < 0.0 {
+        f += 1.0;
+    }
+    if f > 1.0 {
+        f -= 1.0;
+    }
+    let g = f;
+    f = 1.0 - (((f as f64 * std::f64::consts::PI).cos() + 1.0) as f32 / 2.0);
+    g + (f - g) / 3.0
+}
+
+fn alpha_ambient_darkness(time_of_day: f32) -> u8 {
+    let mut g = 1.0 - ((time_of_day * std::f32::consts::TAU).cos() * 2.0 + 0.5);
+    g = g.clamp(0.0, 1.0);
+    (g * 11.0) as u8
+}
+
+fn alpha_fog_color(time_of_day: f32) -> [f32; 3] {
+    let mut f = (time_of_day * std::f32::consts::TAU).cos() * 2.0 + 0.5;
+    f = f.clamp(0.0, 1.0);
+    [
+        0.752_941_2 * (f * 0.94 + 0.06),
+        0.847_058_83 * (f * 0.94 + 0.06),
+        1.0 * (f * 0.91 + 0.09),
+    ]
+}
+
+fn alpha_cloud_color(time_of_day: f32) -> [f32; 3] {
+    let mut daylight = (time_of_day * std::f32::consts::TAU).cos() * 2.0 + 0.5;
+    daylight = daylight.clamp(0.0, 1.0);
+    [
+        daylight * 0.9 + 0.1,
+        daylight * 0.9 + 0.1,
+        daylight * 0.85 + 0.15,
+    ]
+}
+
+fn alpha_view_distance_setting(view_radius: i32) -> u8 {
+    if view_radius >= 10 {
+        0 // far
+    } else if view_radius >= 5 {
+        1 // normal
+    } else if view_radius >= 3 {
+        2 // short
+    } else {
+        3 // tiny
+    }
+}
+
+fn alpha_render_distance_blocks(view_distance_setting: u8) -> f32 {
+    (256_u32 >> view_distance_setting.min(3)) as f32
+}
+
+fn alpha_clear_fog_color(
+    fog_color: [f32; 3],
+    sky_color: [f32; 3],
+    view_distance_setting: u8,
+) -> [f32; 3] {
+    let vd = view_distance_setting.min(3) as f32;
+    let sky_mix = 1.0 - (1.0 / (4.0 - vd)).powf(0.25);
+    [
+        fog_color[0] + (sky_color[0] - fog_color[0]) * sky_mix,
+        fog_color[1] + (sky_color[1] - fog_color[1]) * sky_mix,
+        fog_color[2] + (sky_color[2] - fog_color[2]) * sky_mix,
+    ]
+}
+
+fn alpha_apply_fog_brightness(fog_color: [f32; 3], brightness: f32) -> [f32; 3] {
+    let clamped = brightness.clamp(0.0, 1.0);
+    [
+        fog_color[0] * clamped,
+        fog_color[1] * clamped,
+        fog_color[2] * clamped,
+    ]
+}
+
+fn alpha_brightness_from_light_level(light_level: u8) -> f32 {
+    let clamped = f32::from(light_level.min(15));
+    let g = 1.0 - clamped / 15.0;
+    ((1.0 - g) / (g * 3.0 + 1.0)) * 0.95 + 0.05
+}
+
+fn alpha_fog_brightness_target(
+    chunk_streamer: &ChunkStreamer,
+    player_pos: DVec3,
+    ambient_darkness: u8,
+    view_distance_setting: u8,
+) -> f32 {
+    let world_x = player_pos.x.floor() as i32;
+    let world_y = player_pos.y.floor() as i32;
+    let world_z = player_pos.z.floor() as i32;
+    let sky_default = 15_u8.saturating_sub(ambient_darkness.min(15));
+    let light_level = chunk_streamer
+        .effective_light_at_world(world_x, world_y, world_z, ambient_darkness)
+        .unwrap_or(sky_default);
+    let brightness = alpha_brightness_from_light_level(light_level);
+    let distance_bias = (3.0 - f32::from(view_distance_setting.min(3))) / 3.0;
+    brightness * (1.0 - distance_bias) + distance_bias
+}
+
+fn alpha_sky_color(time_of_day: f32, temperature: f32) -> [f32; 3] {
+    let mut daylight = (time_of_day * std::f32::consts::TAU).cos() * 2.0 + 0.5;
+    daylight = daylight.clamp(0.0, 1.0);
+    let [r, g, b] = alpha_biome_sky_rgb(temperature);
+    [r * daylight, g * daylight, b * daylight]
+}
+
+fn alpha_biome_sky_rgb(temperature: f32) -> [f32; 3] {
+    let temp = (temperature / 3.0).clamp(-1.0, 1.0);
+    let hue = 0.622_222_24 - temp * 0.05;
+    let saturation = 0.5 + temp * 0.1;
+    hsv_to_rgb(hue, saturation, 1.0)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    if s <= 0.0 {
+        return [v, v, v];
+    }
+
+    let mut hue = h % 1.0;
+    if hue < 0.0 {
+        hue += 1.0;
+    }
+    let sector = (hue * 6.0).floor();
+    let frac = hue * 6.0 - sector;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * frac);
+    let t = v * (1.0 - s * (1.0 - frac));
+    match sector as i32 {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
     }
 }
 
@@ -1252,14 +1589,19 @@ fn resolve_axis(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use glam::DVec3;
     use winit::keyboard::KeyCode;
 
     use super::{
-        affected_chunks_for_block_edit, has_target_directive, hotbar_slot_for_key, parse_env_u32,
-        raycast_first_solid_block, resolve_axis, BlockRayHit, HotbarInventory, AIR_BLOCK_ID,
+        affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
+        alpha_brightness_from_light_level, alpha_fog_brightness_target, alpha_time_of_day,
+        has_target_directive, hotbar_slot_for_key, parse_env_u32, raycast_first_solid_block,
+        resolve_axis, AdaptiveFluidBudget, BlockRayHit, HotbarInventory, AIR_BLOCK_ID,
         HOTBAR_BLOCK_IDS, HOTBAR_STACK_LIMIT,
     };
+    use crate::streaming::{ChunkStreamer, ResidencyConfig};
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
 
     #[test]
@@ -1440,5 +1782,83 @@ mod tests {
         let dz = resolve_axis(pos, half_w, height, 2.0, &[wall], 2);
         // Player front edge at 5.3, wall starts at z=6. Gap = 6.0 - 5.3 = 0.7.
         assert!((dz - 0.7).abs() < 1e-10, "expected dz=0.7, got {dz}");
+    }
+
+    #[test]
+    fn alpha_time_of_day_wraps_into_unit_interval() {
+        let t0 = alpha_time_of_day(0, 0.0);
+        let t1 = alpha_time_of_day(24_000, 0.0);
+        assert!((0.0..=1.0).contains(&t0));
+        assert!((0.0..=1.0).contains(&t1));
+        assert!((t0 - t1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ambient_darkness_stays_within_alpha_bounds() {
+        for tick in [0_u64, 6_000, 12_000, 18_000, 23_999] {
+            let tod = alpha_time_of_day(tick, 0.0);
+            let darkness = alpha_ambient_darkness(tod);
+            assert!(darkness <= 11);
+        }
+    }
+
+    #[test]
+    fn alpha_brightness_curve_matches_dimension_table_endpoints() {
+        assert!((alpha_brightness_from_light_level(0) - 0.05).abs() < 0.0001);
+        assert!((alpha_brightness_from_light_level(15) - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn fog_color_brightness_multiplier_is_componentwise() {
+        let fog = [0.4, 0.2, 1.0];
+        let shaded = alpha_apply_fog_brightness(fog, 0.25);
+        assert!((shaded[0] - 0.1).abs() < 0.0001);
+        assert!((shaded[1] - 0.05).abs() < 0.0001);
+        assert!((shaded[2] - 0.25).abs() < 0.0001);
+    }
+
+    #[test]
+    fn fog_brightness_target_obeys_view_distance_bias() {
+        let streamer = ChunkStreamer::new(
+            123,
+            BlockRegistry::alpha_1_2_6(),
+            ResidencyConfig::default(),
+        );
+        let player_pos = DVec3::new(0.0, 72.0, 0.0);
+        let ambient_darkness = 11;
+        let far = alpha_fog_brightness_target(&streamer, player_pos, ambient_darkness, 0);
+        let tiny = alpha_fog_brightness_target(&streamer, player_pos, ambient_darkness, 3);
+        assert!(far > tiny);
+        assert!((tiny - alpha_brightness_from_light_level(4)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn adaptive_fluid_budget_increases_with_headroom_and_saturation() {
+        let mut budget = AdaptiveFluidBudget::new(384);
+        let before = budget.current();
+        budget.observe_frame(Duration::from_millis(10), 1, before, 0);
+        assert!(budget.current() > before);
+    }
+
+    #[test]
+    fn adaptive_fluid_budget_decreases_under_frame_pressure() {
+        let mut budget = AdaptiveFluidBudget::new(384);
+        let before = budget.current();
+        budget.observe_frame(
+            Duration::from_millis(24),
+            1,
+            100,
+            before.saturating_sub(100),
+        );
+        assert!(budget.current() < before);
+    }
+
+    #[test]
+    fn adaptive_fluid_budget_urgent_slice_is_bounded() {
+        let budget = AdaptiveFluidBudget::new(384);
+        assert_eq!(budget.urgent_slice_for_tick(0), 0);
+        let slice = budget.urgent_slice_for_tick(20);
+        assert!(slice >= 16);
+        assert!(slice <= 20);
     }
 }

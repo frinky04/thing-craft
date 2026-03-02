@@ -1,0 +1,1 @@
+/home/frinky/Dev/Research/thing_craft/AGENTS.md

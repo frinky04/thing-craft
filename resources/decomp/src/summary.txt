@@ -1,0 +1,11 @@
+Summary for /home/frinky/Dev/Research/thing_craft/resources/decomp/feather-mappings/build/ornithe-keratin/gen2/a1.2.6&a0.2.8-processed-named.jar
+Decompiled with CFR 0.0.9 (FabricMC cc05e23f)
+
+
+com.jcraft.jorbis.Drft
+----------------------------
+
+dradfg(int int int int float[] float[] float[] float[] float[] float[] int )
+  Unable to fully structure code
+dradbg(int int int int float[] float[] float[] float[] float[] float[] int )
+  Unable to fully structure code

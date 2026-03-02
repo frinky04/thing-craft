@@ -28,9 +28,19 @@ This project follows the rule from `WHAT.md`: steal numbers, not structure.
 - Fixed tick target:
   - `20 TPS`
   - Source: `resources/decomp/src/net/minecraft/client/TickTimer.java`
+- Day/night and ambient darkness:
+  - day length `24000` ticks
+  - ambient darkness range `0..11` from cosine-based curve
+  - Source: `resources/decomp/src/net/minecraft/world/dimension/Dimension.java`, `resources/decomp/src/net/minecraft/world/World.java`
 - Block light scale:
   - light levels `0..15`
   - Source: `resources/decomp/src/net/minecraft/block/Block.java`
+- Liquid simulation constants:
+  - water tick rate `5`, lava tick rate `30`
+  - downward-state metadata threshold `>= 8`
+  - horizontal flow search depth cap `4`
+  - lava+water conversion: source lava (`meta=0`) -> obsidian, shallow lava (`meta<=4`) -> cobblestone
+  - Source: `resources/decomp/src/net/minecraft/block/LiquidBlock.java`, `resources/decomp/src/net/minecraft/block/FlowingLiquidBlock.java`
 - Biome climate seed multipliers:
   - temperature `seed * 9871`
   - downfall `seed * 39811`

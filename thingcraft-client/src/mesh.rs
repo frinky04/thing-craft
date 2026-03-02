@@ -1,11 +1,194 @@
 use std::collections::HashMap;
+use std::f32::consts::FRAC_PI_2;
 
 use crate::world::{
-    BiomeTintKind, BlockRegistry, ChunkData, ChunkPos, ICE_ID, CHUNK_DEPTH,
-    CHUNK_EDGE_SLICE_VOLUME, CHUNK_HEIGHT, CHUNK_SECTION_COUNT, CHUNK_WIDTH, SECTION_HEIGHT,
+    BiomeTintKind, BlockRegistry, ChunkData, ChunkPos, CHUNK_DEPTH, CHUNK_EDGE_SLICE_VOLUME,
+    CHUNK_HEIGHT, CHUNK_SECTION_COUNT, CHUNK_WIDTH, ICE_ID, SECTION_HEIGHT,
 };
 
 const AIR_ID: u8 = 0;
+
+// ---------------------------------------------------------------------------
+// Liquid height helpers (MC Alpha 1.2.6 formulas)
+// ---------------------------------------------------------------------------
+
+/// Height of a source/falling liquid block: 8/9 ≈ 0.889.
+const SOURCE_HEIGHT: f32 = 8.0 / 9.0;
+
+/// MC formula: height = 1.0 - (effective_meta + 1) / 9.0
+/// Source/falling (meta 0 or ≥8): 8/9 ≈ 0.889
+/// Shallowest (meta 7): 1/9 ≈ 0.111
+fn liquid_height_from_meta(meta: u8) -> f32 {
+    let effective = if meta >= 8 { 0 } else { meta };
+    1.0 - (effective as f32 + 1.0) / 9.0
+}
+
+/// Pre-fetched 3×3 neighborhood at (bx-1..bx+1, bz-1..bz+1) for a liquid block.
+/// Avoids redundant lookups shared between the 4 corner-height computations and
+/// the flow-angle computation.
+struct LiquidNeighborhood {
+    /// Block IDs in row-major [x+1][z+1] layout (9 entries for the 3×3 grid).
+    ids: [u8; 9],
+    /// Block IDs one layer above.
+    above_ids: [u8; 9],
+    /// Metadata values for the 3×3 grid.
+    metas: [u8; 9],
+}
+
+impl LiquidNeighborhood {
+    fn fetch(
+        bx: i32,
+        by: i32,
+        bz: i32,
+        block_lookup: &mut impl FnMut(i32, i32, i32) -> u8,
+        meta_lookup: &mut impl FnMut(i32, i32, i32) -> u8,
+    ) -> Self {
+        let mut ids = [0_u8; 9];
+        let mut above_ids = [0_u8; 9];
+        let mut metas = [0_u8; 9];
+        for dx in -1..=1_i32 {
+            for dz in -1..=1_i32 {
+                let i = ((dx + 1) * 3 + (dz + 1)) as usize;
+                ids[i] = block_lookup(bx + dx, by, bz + dz);
+                above_ids[i] = block_lookup(bx + dx, by + 1, bz + dz);
+                metas[i] = meta_lookup(bx + dx, by, bz + dz);
+            }
+        }
+        Self {
+            ids,
+            above_ids,
+            metas,
+        }
+    }
+
+    #[inline]
+    fn idx(dx: i32, dz: i32) -> usize {
+        ((dx + 1) * 3 + (dz + 1)) as usize
+    }
+}
+
+/// Compute interpolated liquid height at a single corner vertex using pre-cached data.
+/// Corner at block-relative offset (cdx, cdz) where cdx,cdz ∈ {0, 1}.
+fn corner_height_from_cache(
+    cdx: i32,
+    cdz: i32,
+    liquid_id: u8,
+    registry: &BlockRegistry,
+    nh: &LiquidNeighborhood,
+) -> f32 {
+    let mut total = 0.0_f32;
+    let mut count = 0_u32;
+
+    // Sample the 4 blocks sharing this corner: (cdx-1..cdx, cdz-1..cdz)
+    for dx in (cdx - 1)..=cdx {
+        for dz in (cdz - 1)..=cdz {
+            let i = LiquidNeighborhood::idx(dx, dz);
+            if registry.is_same_liquid_kind(liquid_id, nh.above_ids[i]) {
+                return 1.0; // corner is fully submerged
+            }
+
+            let bid = nh.ids[i];
+            if registry.is_same_liquid_kind(liquid_id, bid) {
+                let meta = nh.metas[i];
+                if meta == 0 || meta >= 8 {
+                    total += SOURCE_HEIGHT * 10.0;
+                    count += 10;
+                } else {
+                    total += liquid_height_from_meta(meta);
+                    count += 1;
+                }
+            }
+            // Non-liquid blocks (air, solid) are excluded from the average,
+            // matching MC's getLiquidHeight() returning -1.0 for non-liquid.
+        }
+    }
+
+    if count == 0 {
+        1.0
+    } else {
+        total / count as f32
+    }
+}
+
+/// Compute corner heights for all 4 top-face corners of a liquid block.
+/// Returns [h_00, h_10, h_01, h_11] indexed by (dx, dz) from block origin.
+fn compute_liquid_corner_heights(
+    nh: &LiquidNeighborhood,
+    liquid_id: u8,
+    registry: &BlockRegistry,
+) -> [f32; 4] {
+    [
+        corner_height_from_cache(0, 0, liquid_id, registry, nh),
+        corner_height_from_cache(1, 0, liquid_id, registry, nh),
+        corner_height_from_cache(0, 1, liquid_id, registry, nh),
+        corner_height_from_cache(1, 1, liquid_id, registry, nh),
+    ]
+}
+
+/// Compute the flow direction angle for UV rotation on liquid top faces.
+/// Based on MC's LiquidBlock.getFlow() → atan2(flow.z, flow.x) - PI/2.
+/// Uses the pre-cached neighborhood plus extra below-lookups for edge flow.
+#[allow(clippy::too_many_arguments)]
+fn compute_liquid_flow_angle(
+    nh: &LiquidNeighborhood,
+    liquid_id: u8,
+    registry: &BlockRegistry,
+    bx: i32,
+    by: i32,
+    bz: i32,
+    block_lookup: &mut impl FnMut(i32, i32, i32) -> u8,
+    meta_lookup: &mut impl FnMut(i32, i32, i32) -> u8,
+) -> Option<f32> {
+    let self_meta = nh.metas[LiquidNeighborhood::idx(0, 0)];
+    let self_level = if self_meta >= 8 {
+        0
+    } else {
+        i32::from(self_meta)
+    };
+
+    let mut flow_x = 0.0_f32;
+    let mut flow_z = 0.0_f32;
+
+    let offsets: [(i32, i32, f32, f32); 4] = [
+        (-1, 0, -1.0, 0.0), // -X
+        (1, 0, 1.0, 0.0),   // +X
+        (0, -1, 0.0, -1.0), // -Z
+        (0, 1, 0.0, 1.0),   // +Z
+    ];
+
+    for (dx, dz, fx, fz) in offsets {
+        let i = LiquidNeighborhood::idx(dx, dz);
+        let nid = nh.ids[i];
+
+        if registry.is_same_liquid_kind(liquid_id, nid) {
+            let n_meta = nh.metas[i];
+            let n_level = if n_meta >= 8 { 0 } else { i32::from(n_meta) };
+            let diff = (n_level - self_level) as f32;
+            flow_x += fx * diff;
+            flow_z += fz * diff;
+        } else if !registry.is_solid(nid) {
+            // Check block below for downward flow (not in the 3×3 cache)
+            let below_id = block_lookup(bx + dx, by - 1, bz + dz);
+            if registry.is_same_liquid_kind(liquid_id, below_id) {
+                let below_meta = meta_lookup(bx + dx, by - 1, bz + dz);
+                let below_level = if below_meta >= 8 {
+                    0
+                } else {
+                    i32::from(below_meta)
+                };
+                let diff = (below_level - (self_level - 8)) as f32;
+                flow_x += fx * diff;
+                flow_z += fz * diff;
+            }
+        }
+    }
+
+    if flow_x == 0.0 && flow_z == 0.0 {
+        None
+    } else {
+        Some(flow_z.atan2(flow_x) - FRAC_PI_2)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)]
@@ -19,6 +202,7 @@ pub struct CardinalChunkNeighbors<'a> {
 #[derive(Debug, Clone)]
 pub struct NeighborEdgeSliceOwned {
     blocks: Box<[u8; CHUNK_EDGE_SLICE_VOLUME]>,
+    metadata: Box<[u8; CHUNK_EDGE_SLICE_VOLUME]>,
     sky_light: Box<[u8; CHUNK_EDGE_SLICE_VOLUME]>,
     block_light: Box<[u8; CHUNK_EDGE_SLICE_VOLUME]>,
 }
@@ -46,6 +230,7 @@ impl NeighborEdgeSliceOwned {
 
     fn from_chunk_face(chunk: &ChunkData, face: FaceAxis) -> Self {
         let mut blocks = Box::new([AIR_ID; CHUNK_EDGE_SLICE_VOLUME]);
+        let mut metadata = Box::new([0_u8; CHUNK_EDGE_SLICE_VOLUME]);
         let mut sky_light = Box::new([0_u8; CHUNK_EDGE_SLICE_VOLUME]);
         let mut block_light = Box::new([0_u8; CHUNK_EDGE_SLICE_VOLUME]);
         for lateral in 0..CHUNK_WIDTH as u8 {
@@ -58,6 +243,7 @@ impl NeighborEdgeSliceOwned {
                 };
                 let index = edge_index(y, lateral);
                 blocks[index] = chunk.block(x, y, z);
+                metadata[index] = chunk.block_metadata(x, y, z);
                 sky_light[index] = chunk.sky_light(x, y, z);
                 block_light[index] = chunk.block_light(x, y, z);
             }
@@ -65,6 +251,7 @@ impl NeighborEdgeSliceOwned {
 
         Self {
             blocks,
+            metadata,
             sky_light,
             block_light,
         }
@@ -74,9 +261,16 @@ impl NeighborEdgeSliceOwned {
         self.blocks[edge_index(y, lateral)]
     }
 
-    fn raw_light_at(&self, y: u8, lateral: u8) -> u8 {
-        let index = edge_index(y, lateral);
-        self.sky_light[index].max(self.block_light[index])
+    fn metadata_at(&self, y: u8, lateral: u8) -> u8 {
+        self.metadata[edge_index(y, lateral)]
+    }
+
+    fn sky_light_at(&self, y: u8, lateral: u8) -> u8 {
+        self.sky_light[edge_index(y, lateral)]
+    }
+
+    fn block_light_at(&self, y: u8, lateral: u8) -> u8 {
+        self.block_light[edge_index(y, lateral)]
     }
 }
 
@@ -114,12 +308,17 @@ enum FaceAxis {
 pub struct MeshVertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
-    pub light_rgba: [u8; 4],
+    pub tint_rgba: [u8; 4],
+    pub light_data: [u8; 4],
 }
 
 impl MeshVertex {
-    pub const ATTRS: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Unorm8x4];
+    pub const ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x2,
+        2 => Unorm8x4,
+        3 => Uint8x4
+    ];
 
     #[must_use]
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -235,7 +434,9 @@ pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMes
         0,
         CHUNK_HEIGHT as i32,
         |x, y, z| neighbor_block(chunk, x, y, z),
-        |x, y, z| neighbor_light(chunk, x, y, z),
+        |x, y, z| neighbor_metadata(chunk, x, y, z),
+        |x, y, z| neighbor_sky_light(chunk, x, y, z),
+        |x, y, z| neighbor_block_light(chunk, x, y, z),
     );
     merge_meshes(&[split.opaque, split.transparent])
 }
@@ -303,7 +504,9 @@ pub fn build_chunk_section_split_mesh_with_neighbor_slices(
         y_start as i32,
         y_end as i32,
         |x, y, z| neighbor_block_with_slices(chunk, neighbor_slices, x, y, z),
-        |x, y, z| neighbor_light_with_slices(chunk, neighbor_slices, x, y, z),
+        |x, y, z| neighbor_metadata_with_slices(chunk, neighbor_slices, x, y, z),
+        |x, y, z| neighbor_sky_light_with_slices(chunk, neighbor_slices, x, y, z),
+        |x, y, z| neighbor_block_light_with_slices(chunk, neighbor_slices, x, y, z),
     )
 }
 
@@ -328,7 +531,11 @@ pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> Chun
                 0,
                 CHUNK_HEIGHT as i32,
                 |x, y, z| neighbor_block_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
-                |x, y, z| neighbor_light_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
+                |x, y, z| neighbor_metadata_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
+                |x, y, z| neighbor_sky_light_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
+                |x, y, z| {
+                    neighbor_block_light_from_region(chunks, &index_by_pos, chunk.pos, x, y, z)
+                },
             );
             merge_meshes(&[split.opaque, split.transparent])
         })
@@ -336,17 +543,22 @@ pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> Chun
     merge_meshes(&meshes)
 }
 
-fn build_split_chunk_mesh_with_neighbor_lookup<FB, FL>(
+#[allow(clippy::too_many_arguments)]
+fn build_split_chunk_mesh_with_neighbor_lookup<FB, FM, FS, FBL>(
     chunk: &ChunkData,
     registry: &BlockRegistry,
     y_start: i32,
     y_end: i32,
     mut neighbor_block_lookup: FB,
-    mut neighbor_light_lookup: FL,
+    mut neighbor_metadata_lookup: FM,
+    mut neighbor_sky_light_lookup: FS,
+    mut neighbor_block_light_lookup: FBL,
 ) -> SplitChunkMesh
 where
     FB: FnMut(i32, i32, i32) -> u8,
-    FL: FnMut(i32, i32, i32) -> u8,
+    FM: FnMut(i32, i32, i32) -> u8,
+    FS: FnMut(i32, i32, i32) -> u8,
+    FBL: FnMut(i32, i32, i32) -> u8,
 {
     let mut split = SplitChunkMesh::default();
     let chunk_origin_x = chunk.pos.x as f32 * CHUNK_WIDTH as f32;
@@ -360,88 +572,165 @@ where
                     continue;
                 }
 
-                let is_water = registry.is_water(block_id);
-                // Surface water: no water above — only these get the lowered top face
-                // and shrunk side-face top corners.
-                let is_surface_water = is_water
-                    && !registry.is_water(neighbor_block_lookup(local_x, y + 1, local_z));
+                let is_liquid = registry.is_liquid(block_id);
 
-                for face in FACES {
-                    let nx = local_x + face.offset[0];
-                    let ny = y + face.offset[1];
-                    let nz = local_z + face.offset[2];
-                    let neighbor_id = neighbor_block_lookup(nx, ny, nz);
+                if is_liquid {
+                    // === Liquid meshing path ===
+                    let is_water = registry.is_water(block_id);
 
-                    // Culling rules:
-                    // - Same block type: cull (water-water, lava-lava)
-                    // - Water-ice faces: cull
-                    // - Opaque occluder: cull
-                    // - Water surface top face: always render
-                    if is_water && face.offset[1] > 0 {
-                        // Top face: only render for surface water blocks
-                        if !is_surface_water {
-                            continue;
-                        }
+                    let above_id = neighbor_block_lookup(local_x, y + 1, local_z);
+                    let is_surface = !registry.is_same_liquid_kind(block_id, above_id);
+
+                    // Pre-fetch the 3×3 neighborhood (shared by corner heights + flow)
+                    let nh = if is_surface {
+                        Some(LiquidNeighborhood::fetch(
+                            local_x,
+                            y,
+                            local_z,
+                            &mut neighbor_block_lookup,
+                            &mut neighbor_metadata_lookup,
+                        ))
                     } else {
+                        None
+                    };
+
+                    let corner_heights = match &nh {
+                        Some(nh) => compute_liquid_corner_heights(nh, block_id, registry),
+                        None => [1.0; 4], // fully submerged
+                    };
+
+                    let flow_angle = match &nh {
+                        Some(nh) => compute_liquid_flow_angle(
+                            nh,
+                            block_id,
+                            registry,
+                            local_x,
+                            y,
+                            local_z,
+                            &mut neighbor_block_lookup,
+                            &mut neighbor_metadata_lookup,
+                        ),
+                        None => None,
+                    };
+
+                    let base_pos = [
+                        local_x as f32 + chunk_origin_x,
+                        y as f32,
+                        local_z as f32 + chunk_origin_z,
+                    ];
+
+                    for face in FACES {
+                        let nx = local_x + face.offset[0];
+                        let ny = y + face.offset[1];
+                        let nz = local_z + face.offset[2];
+                        let neighbor_id = neighbor_block_lookup(nx, ny, nz);
+
+                        // Culling: same-kind liquid, opaque occluder, ice (water only)
+                        if face.offset[1] > 0 {
+                            if !is_surface {
+                                continue;
+                            }
+                        } else {
+                            if registry.is_same_liquid_kind(block_id, neighbor_id)
+                                || registry.is_face_occluder(neighbor_id)
+                            {
+                                continue;
+                            }
+                            if is_water && neighbor_id == ICE_ID {
+                                continue;
+                            }
+                        }
+
+                        let (face_sky, face_block_light) = resolve_liquid_light(
+                            neighbor_id,
+                            nx,
+                            ny,
+                            nz,
+                            registry,
+                            &mut neighbor_sky_light_lookup,
+                            &mut neighbor_block_light_lookup,
+                        );
+
+                        // Water → transparent; lava → opaque (MC render layers)
+                        let target_mesh = if is_water {
+                            &mut split.transparent
+                        } else {
+                            &mut split.opaque
+                        };
+
+                        // Water texture carries its own blue colour & alpha
+                        // (generated by `patch_procedural_tiles`).  Lava is
+                        // fully opaque in the texture.  Neutral vertex tint
+                        // for both so the texture shows through faithfully.
+                        let (tint, alpha) = ([255_u8, 255, 255], 255_u8);
+
+                        let mut sprite_index =
+                            registry.sprite_index_for_face(block_id, face.offset);
+                        // MC top-face path switches to the side sprite when flow exists.
+                        if face.offset[1] > 0 && flow_angle.is_some() {
+                            sprite_index = sprite_index.saturating_add(1);
+                        }
+
+                        append_liquid_face(
+                            target_mesh,
+                            base_pos,
+                            face,
+                            sprite_index,
+                            tint,
+                            alpha,
+                            face_sky,
+                            face_block_light,
+                            &corner_heights,
+                            is_surface,
+                            if face.offset[1] > 0 { flow_angle } else { None },
+                        );
+                    }
+                } else {
+                    // === Standard opaque block path ===
+                    for face in FACES {
+                        let nx = local_x + face.offset[0];
+                        let ny = y + face.offset[1];
+                        let nz = local_z + face.offset[2];
+                        let neighbor_id = neighbor_block_lookup(nx, ny, nz);
+
                         if neighbor_id == block_id || registry.is_face_occluder(neighbor_id) {
                             continue;
                         }
-                        if is_water && neighbor_id == ICE_ID {
-                            continue;
-                        }
-                    }
 
-                    let neighbor_light = neighbor_light_lookup(nx, ny, nz);
-                    let target_mesh = if is_water {
-                        &mut split.transparent
-                    } else {
-                        &mut split.opaque
-                    };
+                        let (face_sky, face_block_light) = resolve_liquid_light(
+                            neighbor_id,
+                            nx,
+                            ny,
+                            nz,
+                            registry,
+                            &mut neighbor_sky_light_lookup,
+                            &mut neighbor_block_light_lookup,
+                        );
 
-                    let (tint, adjust) = if is_water {
-                        (
-                            [64_u8, 64, 255],
-                            FaceAdjust {
-                                vertex_alpha: 160,
-                                y_offset: if is_surface_water && face.offset[1] > 0 {
-                                    -2.0 / 16.0
-                                } else {
-                                    0.0
-                                },
-                                side_y_shrink: if is_surface_water && face.offset[1] == 0 {
-                                    -2.0 / 16.0
-                                } else {
-                                    0.0
-                                },
-                            },
-                        )
-                    } else {
-                        (
-                            resolve_face_tint(
-                                chunk,
-                                registry,
-                                block_id,
-                                face.offset,
-                                local_x as u8,
-                                local_z as u8,
-                            ),
+                        let tint = resolve_face_tint(
+                            chunk,
+                            registry,
+                            block_id,
+                            face.offset,
+                            local_x as u8,
+                            local_z as u8,
+                        );
+
+                        append_face(
+                            &mut split.opaque,
+                            [
+                                local_x as f32 + chunk_origin_x,
+                                y as f32,
+                                local_z as f32 + chunk_origin_z,
+                            ],
+                            face,
+                            registry.sprite_index_for_face(block_id, face.offset),
+                            tint,
+                            face_sky,
+                            face_block_light,
                             FaceAdjust::OPAQUE,
-                        )
-                    };
-
-                    append_face(
-                        target_mesh,
-                        [
-                            local_x as f32 + chunk_origin_x,
-                            y as f32,
-                            local_z as f32 + chunk_origin_z,
-                        ],
-                        face,
-                        registry.sprite_index_for_face(block_id, face.offset),
-                        tint,
-                        neighbor_light,
-                        adjust,
-                    );
+                        );
+                    }
                 }
             }
         }
@@ -477,7 +766,21 @@ fn neighbor_block(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
     chunk.block(x as u8, y as u8, z as u8)
 }
 
-fn neighbor_light(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
+fn neighbor_metadata(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
+    if x < 0
+        || x >= CHUNK_WIDTH as i32
+        || y < 0
+        || y >= CHUNK_HEIGHT as i32
+        || z < 0
+        || z >= CHUNK_DEPTH as i32
+    {
+        return 0;
+    }
+
+    chunk.block_metadata(x as u8, y as u8, z as u8)
+}
+
+fn neighbor_sky_light(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
     if y < 0 {
         return 0;
     }
@@ -487,7 +790,20 @@ fn neighbor_light(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
 
     let local_x = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
     let local_z = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
-    raw_light_level(chunk, local_x, y as u8, local_z)
+    chunk.sky_light(local_x, y as u8, local_z)
+}
+
+fn neighbor_block_light(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
+    if y < 0 {
+        return 0;
+    }
+    if y >= CHUNK_HEIGHT as i32 {
+        return 0;
+    }
+
+    let local_x = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
+    let local_z = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
+    chunk.block_light(local_x, y as u8, local_z)
 }
 
 fn neighbor_block_with_slices(
@@ -537,7 +853,54 @@ fn neighbor_block_with_slices(
     AIR_ID
 }
 
-fn neighbor_light_with_slices(
+fn neighbor_metadata_with_slices(
+    chunk: &ChunkData,
+    neighbors: &CardinalNeighborSlicesOwned,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        return 0;
+    }
+
+    if (0..CHUNK_WIDTH as i32).contains(&x) && (0..CHUNK_DEPTH as i32).contains(&z) {
+        return chunk.block_metadata(x as u8, y as u8, z as u8);
+    }
+
+    if x < 0 {
+        let lateral = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
+        return neighbors
+            .neg_x
+            .as_ref()
+            .map_or(0, |neighbor| neighbor.metadata_at(y as u8, lateral));
+    }
+    if x >= CHUNK_WIDTH as i32 {
+        let lateral = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
+        return neighbors
+            .pos_x
+            .as_ref()
+            .map_or(0, |neighbor| neighbor.metadata_at(y as u8, lateral));
+    }
+    if z < 0 {
+        let lateral = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
+        return neighbors
+            .neg_z
+            .as_ref()
+            .map_or(0, |neighbor| neighbor.metadata_at(y as u8, lateral));
+    }
+    if z >= CHUNK_DEPTH as i32 {
+        let lateral = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
+        return neighbors
+            .pos_z
+            .as_ref()
+            .map_or(0, |neighbor| neighbor.metadata_at(y as u8, lateral));
+    }
+
+    0
+}
+
+fn neighbor_sky_light_with_slices(
     chunk: &ChunkData,
     neighbors: &CardinalNeighborSlicesOwned,
     x: i32,
@@ -552,54 +915,51 @@ fn neighbor_light_with_slices(
     }
 
     if (0..CHUNK_WIDTH as i32).contains(&x) && (0..CHUNK_DEPTH as i32).contains(&z) {
-        return raw_light_level(chunk, x as u8, y as u8, z as u8);
+        return chunk.sky_light(x as u8, y as u8, z as u8);
     }
 
     if x < 0 {
         let lateral = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
         return neighbors.neg_x.as_ref().map_or_else(
-            || raw_light_level(chunk, 0, y as u8, z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8),
-            |neighbor| neighbor.raw_light_at(y as u8, lateral),
+            || chunk.sky_light(0, y as u8, z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8),
+            |neighbor| neighbor.sky_light_at(y as u8, lateral),
         );
     }
     if x >= CHUNK_WIDTH as i32 {
         let lateral = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
         return neighbors.pos_x.as_ref().map_or_else(
             || {
-                raw_light_level(
-                    chunk,
+                chunk.sky_light(
                     (CHUNK_WIDTH - 1) as u8,
                     y as u8,
                     z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8,
                 )
             },
-            |neighbor| neighbor.raw_light_at(y as u8, lateral),
+            |neighbor| neighbor.sky_light_at(y as u8, lateral),
         );
     }
     if z < 0 {
         let lateral = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
         return neighbors.neg_z.as_ref().map_or_else(
-            || raw_light_level(chunk, x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8, y as u8, 0),
-            |neighbor| neighbor.raw_light_at(y as u8, lateral),
+            || chunk.sky_light(x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8, y as u8, 0),
+            |neighbor| neighbor.sky_light_at(y as u8, lateral),
         );
     }
     if z >= CHUNK_DEPTH as i32 {
         let lateral = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
         return neighbors.pos_z.as_ref().map_or_else(
             || {
-                raw_light_level(
-                    chunk,
+                chunk.sky_light(
                     x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8,
                     y as u8,
                     (CHUNK_DEPTH - 1) as u8,
                 )
             },
-            |neighbor| neighbor.raw_light_at(y as u8, lateral),
+            |neighbor| neighbor.sky_light_at(y as u8, lateral),
         );
     }
 
-    raw_light_level(
-        chunk,
+    chunk.sky_light(
         x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8,
         y as u8,
         z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8,
@@ -608,6 +968,29 @@ fn neighbor_light_with_slices(
 
 fn edge_index(y: u8, lateral: u8) -> usize {
     usize::from(lateral) * CHUNK_HEIGHT + usize::from(y)
+}
+
+/// MC liquid brightness: liquid blocks report max(self, above) brightness.
+/// Apply when sampling light from a position that may be occupied by liquid.
+fn resolve_liquid_light(
+    neighbor_id: u8,
+    nx: i32,
+    ny: i32,
+    nz: i32,
+    registry: &BlockRegistry,
+    sky_lookup: &mut impl FnMut(i32, i32, i32) -> u8,
+    block_light_lookup: &mut impl FnMut(i32, i32, i32) -> u8,
+) -> (u8, u8) {
+    let sky = sky_lookup(nx, ny, nz);
+    let bl = block_light_lookup(nx, ny, nz);
+    if registry.is_liquid(neighbor_id) {
+        (
+            sky.max(sky_lookup(nx, ny + 1, nz)),
+            bl.max(block_light_lookup(nx, ny + 1, nz)),
+        )
+    } else {
+        (sky, bl)
+    }
 }
 
 fn resolve_face_tint(
@@ -653,7 +1036,96 @@ fn neighbor_block_from_region(
         })
 }
 
-fn neighbor_light_from_region(
+fn neighbor_metadata_from_region(
+    chunks: &[ChunkData],
+    index_by_pos: &HashMap<ChunkPos, usize>,
+    chunk_pos: ChunkPos,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        return 0;
+    }
+
+    let world_x = chunk_pos.x * CHUNK_WIDTH as i32 + x;
+    let world_z = chunk_pos.z * CHUNK_DEPTH as i32 + z;
+    let neighbor_chunk_pos = ChunkPos {
+        x: world_x.div_euclid(CHUNK_WIDTH as i32),
+        z: world_z.div_euclid(CHUNK_DEPTH as i32),
+    };
+    let local_x = world_x.rem_euclid(CHUNK_WIDTH as i32) as u8;
+    let local_z = world_z.rem_euclid(CHUNK_DEPTH as i32) as u8;
+
+    index_by_pos.get(&neighbor_chunk_pos).map_or(0, |index| {
+        chunks[*index].block_metadata(local_x, y as u8, local_z)
+    })
+}
+
+fn neighbor_block_light_with_slices(
+    chunk: &ChunkData,
+    neighbors: &CardinalNeighborSlicesOwned,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    if y < 0 || y >= CHUNK_HEIGHT as i32 {
+        return 0;
+    }
+
+    if (0..CHUNK_WIDTH as i32).contains(&x) && (0..CHUNK_DEPTH as i32).contains(&z) {
+        return chunk.block_light(x as u8, y as u8, z as u8);
+    }
+
+    if x < 0 {
+        let lateral = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
+        return neighbors.neg_x.as_ref().map_or_else(
+            || chunk.block_light(0, y as u8, z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8),
+            |neighbor| neighbor.block_light_at(y as u8, lateral),
+        );
+    }
+    if x >= CHUNK_WIDTH as i32 {
+        let lateral = z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8;
+        return neighbors.pos_x.as_ref().map_or_else(
+            || {
+                chunk.block_light(
+                    (CHUNK_WIDTH - 1) as u8,
+                    y as u8,
+                    z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8,
+                )
+            },
+            |neighbor| neighbor.block_light_at(y as u8, lateral),
+        );
+    }
+    if z < 0 {
+        let lateral = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
+        return neighbors.neg_z.as_ref().map_or_else(
+            || chunk.block_light(x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8, y as u8, 0),
+            |neighbor| neighbor.block_light_at(y as u8, lateral),
+        );
+    }
+    if z >= CHUNK_DEPTH as i32 {
+        let lateral = x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8;
+        return neighbors.pos_z.as_ref().map_or_else(
+            || {
+                chunk.block_light(
+                    x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8,
+                    y as u8,
+                    (CHUNK_DEPTH - 1) as u8,
+                )
+            },
+            |neighbor| neighbor.block_light_at(y as u8, lateral),
+        );
+    }
+
+    chunk.block_light(
+        x.clamp(0, CHUNK_WIDTH as i32 - 1) as u8,
+        y as u8,
+        z.clamp(0, CHUNK_DEPTH as i32 - 1) as u8,
+    )
+}
+
+fn neighbor_sky_light_from_region(
     chunks: &[ChunkData],
     index_by_pos: &HashMap<ChunkPos, usize>,
     chunk_pos: ChunkPos,
@@ -678,23 +1150,45 @@ fn neighbor_light_from_region(
     let local_z = world_z.rem_euclid(CHUNK_DEPTH as i32) as u8;
 
     index_by_pos.get(&neighbor_chunk_pos).map_or(15, |index| {
-        raw_light_level(&chunks[*index], local_x, y as u8, local_z)
+        chunks[*index].sky_light(local_x, y as u8, local_z)
     })
 }
 
-fn raw_light_level(chunk: &ChunkData, local_x: u8, y: u8, local_z: u8) -> u8 {
-    chunk
-        .sky_light(local_x, y, local_z)
-        .max(chunk.block_light(local_x, y, local_z))
+fn neighbor_block_light_from_region(
+    chunks: &[ChunkData],
+    index_by_pos: &HashMap<ChunkPos, usize>,
+    chunk_pos: ChunkPos,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    if y < 0 || y >= CHUNK_HEIGHT as i32 {
+        return 0;
+    }
+
+    let world_x = chunk_pos.x * CHUNK_WIDTH as i32 + x;
+    let world_z = chunk_pos.z * CHUNK_DEPTH as i32 + z;
+    let neighbor_chunk_pos = ChunkPos {
+        x: world_x.div_euclid(CHUNK_WIDTH as i32),
+        z: world_z.div_euclid(CHUNK_DEPTH as i32),
+    };
+    let local_x = world_x.rem_euclid(CHUNK_WIDTH as i32) as u8;
+    let local_z = world_z.rem_euclid(CHUNK_DEPTH as i32) as u8;
+
+    index_by_pos.get(&neighbor_chunk_pos).map_or(0, |index| {
+        chunks[*index].block_light(local_x, y as u8, local_z)
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_face(
     mesh: &mut ChunkMesh,
     base_pos: [f32; 3],
     face: FaceDef,
     sprite_index: u16,
     tint_rgb: [u8; 3],
-    neighbor_light: u8,
+    neighbor_sky_light: u8,
+    neighbor_block_light: u8,
     adjust: FaceAdjust,
 ) {
     let atlas_tile = 1.0 / 16.0;
@@ -708,7 +1202,9 @@ fn append_face(
     ];
 
     let base_index = mesh.vertices.len() as u32;
-    let shaded_tint = apply_alpha_light(tint_rgb, neighbor_light, face.offset);
+    let face_scale = (alpha_face_scale(face.offset) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
     for (corner, tex) in face.corners.iter().zip(uv.iter()) {
         let mut pos_y = base_pos[1] + corner[1];
         if adjust.y_offset != 0.0 {
@@ -720,7 +1216,95 @@ fn append_face(
         mesh.vertices.push(MeshVertex {
             position: [base_pos[0] + corner[0], pos_y, base_pos[2] + corner[2]],
             uv: *tex,
-            light_rgba: [shaded_tint[0], shaded_tint[1], shaded_tint[2], adjust.vertex_alpha],
+            tint_rgba: [tint_rgb[0], tint_rgb[1], tint_rgb[2], adjust.vertex_alpha],
+            light_data: [neighbor_sky_light, neighbor_block_light, face_scale, 0],
+        });
+    }
+
+    mesh.indices.extend_from_slice(&[
+        base_index,
+        base_index + 1,
+        base_index + 2,
+        base_index,
+        base_index + 2,
+        base_index + 3,
+    ]);
+}
+
+/// Emit a liquid face with per-corner interpolated heights and optional UV rotation.
+///
+/// `corner_heights` = [h_00, h_10, h_01, h_11] indexed by (dx, dz) from block origin.
+/// For surface blocks, top vertices use these heights; for submerged blocks heights are 1.0.
+/// `flow_angle` rotates the top face (+Y) UVs to visually indicate flow direction.
+/// `None` means no flow angle (static top sprite sampling).
+#[allow(clippy::too_many_arguments)]
+fn append_liquid_face(
+    mesh: &mut ChunkMesh,
+    base_pos: [f32; 3],
+    face: FaceDef,
+    sprite_index: u16,
+    tint_rgb: [u8; 3],
+    vertex_alpha: u8,
+    neighbor_sky_light: u8,
+    neighbor_block_light: u8,
+    corner_heights: &[f32; 4],
+    is_surface: bool,
+    flow_angle: Option<f32>,
+) {
+    let atlas_tile = 1.0 / 16.0;
+    let sprite_x = f32::from(sprite_index % 16) * atlas_tile;
+    let sprite_y = f32::from(sprite_index / 16) * atlas_tile;
+    let uv = if face.offset[1] > 0 {
+        // Match MC top-liquid UV path:
+        // - no flow: sample centered in base top sprite
+        // - flowing: switch to side sprite and offset by sin/cos(flow_angle)
+        let (center_u, center_v, angle) = match flow_angle {
+            Some(angle) => (sprite_x + atlas_tile, sprite_y + atlas_tile, angle),
+            None => (
+                sprite_x + atlas_tile * 0.5,
+                sprite_y + atlas_tile * 0.5,
+                0.0,
+            ),
+        };
+        let du = angle.sin() * atlas_tile * 0.5;
+        let dv = angle.cos() * atlas_tile * 0.5;
+        [
+            [center_u - dv + du, center_v + dv + du], // (x=0,z=1)
+            [center_u + dv + du, center_v + dv - du], // (x=1,z=1)
+            [center_u + dv - du, center_v - dv - du], // (x=1,z=0)
+            [center_u - dv - du, center_v - dv + du], // (x=0,z=0)
+        ]
+    } else {
+        [
+            [sprite_x, sprite_y + atlas_tile],
+            [sprite_x, sprite_y],
+            [sprite_x + atlas_tile, sprite_y],
+            [sprite_x + atlas_tile, sprite_y + atlas_tile],
+        ]
+    };
+
+    let base_index = mesh.vertices.len() as u32;
+    let face_scale = (alpha_face_scale(face.offset) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+
+    for (corner, tex) in face.corners.iter().zip(uv.iter()) {
+        let pos_y = if is_surface && corner[1] > 0.5 {
+            // Top vertex: use per-corner interpolated height
+            // Map corner (x, z) to height index: h_00, h_10, h_01, h_11
+            let xi = corner[0].round() as usize;
+            let zi = corner[2].round() as usize;
+            debug_assert!(xi <= 1 && zi <= 1);
+            base_pos[1] + corner_heights[xi + zi * 2]
+        } else {
+            base_pos[1] + corner[1]
+        };
+
+        mesh.vertices.push(MeshVertex {
+            position: [base_pos[0] + corner[0], pos_y, base_pos[2] + corner[2]],
+            uv: *tex,
+            tint_rgba: [tint_rgb[0], tint_rgb[1], tint_rgb[2], vertex_alpha],
+            light_data: [neighbor_sky_light, neighbor_block_light, face_scale, 0],
         });
     }
 
@@ -746,19 +1330,11 @@ fn alpha_face_scale(face_offset: [i32; 3]) -> f32 {
     }
 }
 
+#[cfg(test)]
 fn alpha_brightness(light_level: u8) -> f32 {
     let min_brightness = 0.05;
     let g = 1.0 - f32::from(light_level.min(15)) / 15.0;
     ((1.0 - g) / (g * 3.0 + 1.0)) * (1.0 - min_brightness) + min_brightness
-}
-
-fn apply_alpha_light(rgb: [u8; 3], light_level: u8, face_offset: [i32; 3]) -> [u8; 3] {
-    let shade = alpha_face_scale(face_offset) * alpha_brightness(light_level);
-    [
-        (f32::from(rgb[0]) * shade).round().clamp(0.0, 255.0) as u8,
-        (f32::from(rgb[1]) * shade).round().clamp(0.0, 255.0) as u8,
-        (f32::from(rgb[2]) * shade).round().clamp(0.0, 255.0) as u8,
-    ]
 }
 
 #[cfg(test)]
@@ -936,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn face_light_uses_neighbor_raw_light_level() {
+    fn face_light_encodes_neighbor_sky_block_and_face_scale() {
         let registry = BlockRegistry::alpha_1_2_6();
         let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
         chunk.set_block(1, 1, 1, 1);
@@ -957,13 +1533,12 @@ mod tests {
         let expected_levels = [5_u8, 15, 8, 12, 4, 10];
         for (face_index, level) in expected_levels.into_iter().enumerate() {
             let vertex = mesh.vertices[face_index * 4];
-            let rgb = [
-                vertex.light_rgba[0],
-                vertex.light_rgba[1],
-                vertex.light_rgba[2],
-            ];
-            let expected = apply_alpha_light([u8::MAX; 3], level, FACES[face_index].offset);
-            assert_eq!(rgb, expected);
+            assert_eq!(vertex.light_data[0], level);
+            assert_eq!(vertex.light_data[1], 0);
+            let expected_scale = (alpha_face_scale(FACES[face_index].offset) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            assert_eq!(vertex.light_data[2], expected_scale);
         }
 
         block[ChunkData::index(2, 1, 1)] = 14;
@@ -971,10 +1546,7 @@ mod tests {
         chunk.apply_light_channels(&sky, &block);
         let mesh = build_chunk_mesh(&chunk, &registry);
         let east = mesh.vertices[4];
-        let east_rgb = [east.light_rgba[0], east.light_rgba[1], east.light_rgba[2]];
-        assert_eq!(
-            east_rgb,
-            apply_alpha_light([u8::MAX; 3], 14, FACES[1].offset)
-        );
+        assert_eq!(east.light_data[0], 2);
+        assert_eq!(east.light_data[1], 14);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crate::lighting::{relight_chunk, CardinalChunkNeighborsOwned, LightEdgeSlice, LightingOutput};
 use crate::mesh::{
-    build_chunk_section_split_mesh_with_neighbor_slices, merge_meshes,
-    CardinalNeighborSlicesOwned, ChunkMesh, NeighborEdgeSliceOwned,
+    build_chunk_section_split_mesh_with_neighbor_slices, merge_meshes, CardinalNeighborSlicesOwned,
+    ChunkMesh, NeighborEdgeSliceOwned,
 };
 use crate::world::{
     BlockRegistry, ChunkData, ChunkPos, OverworldChunkGenerator, CHUNK_DEPTH, CHUNK_HEIGHT,
@@ -17,6 +17,152 @@ use crate::world::{
 
 const MAX_IN_FLIGHT_MULTIPLIER: usize = 4;
 const MAX_URGENT_DISPATCH_BURST: usize = 4;
+const AIR_ID: u8 = 0;
+const FLOWING_WATER_ID: u8 = 8;
+const WATER_ID: u8 = 9;
+const FLOWING_LAVA_ID: u8 = 10;
+const LAVA_ID: u8 = 11;
+const COBBLESTONE_ID: u8 = 4;
+const OBSIDIAN_ID: u8 = 49;
+const LIQUID_BLOCKING_IDS: [u8; 5] = [64, 71, 63, 65, 83];
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
+struct FluidCell {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum FluidPriority {
+    Normal,
+    Urgent,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FluidScheduleEntry {
+    due_tick: u64,
+    priority: FluidPriority,
+}
+
+#[derive(Debug, Default)]
+struct FluidScheduler {
+    scheduled: HashMap<FluidCell, FluidScheduleEntry>,
+    normal_by_due_tick: BTreeMap<u64, Vec<FluidCell>>,
+    urgent_by_due_tick: BTreeMap<u64, Vec<FluidCell>>,
+}
+
+impl FluidScheduler {
+    fn enqueue(&mut self, due_tick: u64, cell: FluidCell, priority: FluidPriority) {
+        let mut entry = FluidScheduleEntry { due_tick, priority };
+        if let Some(existing) = self.scheduled.get(&cell).copied() {
+            if due_tick >= existing.due_tick && priority <= existing.priority {
+                return;
+            }
+            entry.due_tick = due_tick.min(existing.due_tick);
+            entry.priority = priority.max(existing.priority);
+        }
+        self.scheduled.insert(cell, entry);
+        self.bucket_mut(entry.priority)
+            .entry(entry.due_tick)
+            .or_default()
+            .push(cell);
+    }
+
+    fn drain_due(&mut self, now_tick: u64, budget: usize) -> Vec<FluidCell> {
+        if budget == 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(budget);
+        Self::drain_bucket(
+            &mut self.scheduled,
+            &mut self.urgent_by_due_tick,
+            FluidPriority::Urgent,
+            now_tick,
+            budget,
+            &mut out,
+        );
+        if out.len() < budget {
+            Self::drain_bucket(
+                &mut self.scheduled,
+                &mut self.normal_by_due_tick,
+                FluidPriority::Normal,
+                now_tick,
+                budget,
+                &mut out,
+            );
+        }
+        out
+    }
+
+    fn drain_due_urgent(&mut self, now_tick: u64, budget: usize) -> Vec<FluidCell> {
+        if budget == 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(budget);
+        Self::drain_bucket(
+            &mut self.scheduled,
+            &mut self.urgent_by_due_tick,
+            FluidPriority::Urgent,
+            now_tick,
+            budget,
+            &mut out,
+        );
+        out
+    }
+
+    fn bucket_mut(&mut self, priority: FluidPriority) -> &mut BTreeMap<u64, Vec<FluidCell>> {
+        match priority {
+            FluidPriority::Normal => &mut self.normal_by_due_tick,
+            FluidPriority::Urgent => &mut self.urgent_by_due_tick,
+        }
+    }
+
+    fn drain_bucket(
+        scheduled: &mut HashMap<FluidCell, FluidScheduleEntry>,
+        by_due_tick: &mut BTreeMap<u64, Vec<FluidCell>>,
+        expected_priority: FluidPriority,
+        now_tick: u64,
+        budget: usize,
+        out: &mut Vec<FluidCell>,
+    ) {
+        while out.len() < budget {
+            let Some(next_due) = by_due_tick.keys().next().copied() else {
+                break;
+            };
+            if next_due > now_tick {
+                break;
+            }
+            let Some(mut cells) = by_due_tick.remove(&next_due) else {
+                break;
+            };
+            while let Some(cell) = cells.pop() {
+                let Some(entry) = scheduled.get(&cell).copied() else {
+                    continue;
+                };
+                if entry.due_tick != next_due || entry.priority != expected_priority {
+                    continue;
+                }
+                scheduled.remove(&cell);
+                out.push(cell);
+                if out.len() == budget {
+                    break;
+                }
+            }
+            if !cells.is_empty() {
+                by_due_tick.insert(next_due, cells);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LiquidKind {
+    Water,
+    Lava,
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ChunkResidencyState {
@@ -31,6 +177,12 @@ pub enum ChunkResidencyState {
 enum WorkPriority {
     Background,
     Urgent,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BlockMutationOrigin {
+    Player,
+    Fluid,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,7 +200,7 @@ pub struct ResidencyConfig {
 impl Default for ResidencyConfig {
     fn default() -> Self {
         Self {
-            view_radius: 3,
+            view_radius: 5,
             max_generation_dispatch: 8,
             max_lighting_dispatch: 8,
             max_meshing_dispatch: 8,
@@ -191,6 +343,8 @@ pub struct ChunkStreamer {
     remesh_enqueued_total: u64,
     relight_enqueued_total: u64,
     relight_dropped_stale_total: u64,
+    fluid_scheduler: FluidScheduler,
+    sim_tick: u64,
     render_updates: Vec<RenderMeshUpdate>,
 }
 
@@ -481,6 +635,8 @@ impl ChunkStreamer {
             remesh_enqueued_total: 0,
             relight_enqueued_total: 0,
             relight_dropped_stale_total: 0,
+            fluid_scheduler: FluidScheduler::default(),
+            sim_tick: 0,
             render_updates: Vec::new(),
         }
     }
@@ -524,15 +680,22 @@ impl ChunkStreamer {
 
     #[allow(dead_code)]
     pub fn mark_block_geometry_dirty(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
-        self.mark_block_geometry_dirty_at_y(pos, local_x, 64, local_z);
+        self.mark_block_geometry_dirty_at_y_with_priority(
+            pos,
+            local_x,
+            64,
+            local_z,
+            WorkPriority::Urgent,
+        );
     }
 
-    fn mark_block_geometry_dirty_at_y(
+    fn mark_block_geometry_dirty_at_y_with_priority(
         &mut self,
         pos: ChunkPos,
         local_x: u8,
         local_y: u8,
         local_z: u8,
+        priority: WorkPriority,
     ) {
         if usize::from(local_x) >= CHUNK_WIDTH
             || usize::from(local_y) >= CHUNK_HEIGHT
@@ -552,13 +715,13 @@ impl ChunkStreamer {
         }
 
         let mut edge_coherence_targets = vec![pos];
-        self.enqueue_geometry_sections_remesh(pos, section_mask, WorkPriority::Urgent);
+        self.enqueue_geometry_sections_remesh(pos, section_mask, priority);
         if local_x == 0 {
             let west = ChunkPos {
                 x: pos.x - 1,
                 z: pos.z,
             };
-            self.enqueue_geometry_sections_remesh(west, section_mask, WorkPriority::Urgent);
+            self.enqueue_geometry_sections_remesh(west, section_mask, priority);
             edge_coherence_targets.push(west);
         }
         if local_x == (CHUNK_WIDTH as u8 - 1) {
@@ -566,7 +729,7 @@ impl ChunkStreamer {
                 x: pos.x + 1,
                 z: pos.z,
             };
-            self.enqueue_geometry_sections_remesh(east, section_mask, WorkPriority::Urgent);
+            self.enqueue_geometry_sections_remesh(east, section_mask, priority);
             edge_coherence_targets.push(east);
         }
         if local_z == 0 {
@@ -574,7 +737,7 @@ impl ChunkStreamer {
                 x: pos.x,
                 z: pos.z - 1,
             };
-            self.enqueue_geometry_sections_remesh(north, section_mask, WorkPriority::Urgent);
+            self.enqueue_geometry_sections_remesh(north, section_mask, priority);
             edge_coherence_targets.push(north);
         }
         if local_z == (CHUNK_DEPTH as u8 - 1) {
@@ -582,7 +745,7 @@ impl ChunkStreamer {
                 x: pos.x,
                 z: pos.z + 1,
             };
-            self.enqueue_geometry_sections_remesh(south, section_mask, WorkPriority::Urgent);
+            self.enqueue_geometry_sections_remesh(south, section_mask, priority);
             edge_coherence_targets.push(south);
         }
 
@@ -593,19 +756,30 @@ impl ChunkStreamer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn mark_block_lighting_dirty(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
+        self.mark_block_lighting_dirty_with_priority(pos, local_x, local_z, WorkPriority::Urgent);
+    }
+
+    fn mark_block_lighting_dirty_with_priority(
+        &mut self,
+        pos: ChunkPos,
+        local_x: u8,
+        local_z: u8,
+        priority: WorkPriority,
+    ) {
         if usize::from(local_x) >= CHUNK_WIDTH || usize::from(local_z) >= CHUNK_DEPTH {
             return;
         }
 
-        self.enqueue_lighting_relight(pos, WorkPriority::Urgent);
+        self.enqueue_lighting_relight(pos, priority);
         if local_x == 0 {
             self.enqueue_lighting_relight(
                 ChunkPos {
                     x: pos.x - 1,
                     z: pos.z,
                 },
-                WorkPriority::Urgent,
+                priority,
             );
         }
         if local_x == (CHUNK_WIDTH as u8 - 1) {
@@ -614,7 +788,7 @@ impl ChunkStreamer {
                     x: pos.x + 1,
                     z: pos.z,
                 },
-                WorkPriority::Urgent,
+                priority,
             );
         }
         if local_z == 0 {
@@ -623,7 +797,7 @@ impl ChunkStreamer {
                     x: pos.x,
                     z: pos.z - 1,
                 },
-                WorkPriority::Urgent,
+                priority,
             );
         }
         if local_z == (CHUNK_DEPTH as u8 - 1) {
@@ -632,7 +806,7 @@ impl ChunkStreamer {
                     x: pos.x,
                     z: pos.z + 1,
                 },
-                WorkPriority::Urgent,
+                priority,
             );
         }
     }
@@ -674,6 +848,56 @@ impl ChunkStreamer {
         Some(chunk.block(local_x, world_y as u8, local_z))
     }
 
+    #[must_use]
+    pub fn block_metadata_at_world(&self, world_x: i32, world_y: i32, world_z: i32) -> Option<u8> {
+        if !(0..CHUNK_HEIGHT as i32).contains(&world_y) {
+            return None;
+        }
+
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
+        let slot = self.slots.get(&pos)?;
+        if slot.state == ChunkResidencyState::Evicting {
+            return None;
+        }
+
+        let chunk = slot.chunk.as_ref()?;
+        Some(chunk.block_metadata(local_x, world_y as u8, local_z))
+    }
+
+    #[must_use]
+    pub fn effective_light_at_world(
+        &self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        ambient_darkness: u8,
+    ) -> Option<u8> {
+        if world_y < 0 {
+            return Some(0);
+        }
+        let ambient = ambient_darkness.min(15);
+        if world_y >= CHUNK_HEIGHT as i32 {
+            return Some(15_u8.saturating_sub(ambient));
+        }
+
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
+        let slot = self.slots.get(&pos)?;
+        if slot.state == ChunkResidencyState::Evicting {
+            return None;
+        }
+
+        let chunk = slot.chunk.as_ref()?;
+        let sky = chunk
+            .sky_light(local_x, world_y as u8, local_z)
+            .saturating_sub(ambient);
+        let block = chunk.block_light(local_x, world_y as u8, local_z);
+        Some(block.max(sky))
+    }
+
+    pub fn begin_sim_tick(&mut self, sim_tick: u64) {
+        self.sim_tick = sim_tick;
+    }
+
     pub fn set_block_at_world(
         &mut self,
         world_x: i32,
@@ -681,13 +905,69 @@ impl ChunkStreamer {
         world_z: i32,
         block_id: u8,
     ) -> bool {
+        self.apply_block_with_metadata_at_world(
+            world_x,
+            world_y,
+            world_z,
+            block_id,
+            0,
+            BlockMutationOrigin::Player,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn set_block_with_metadata_at_world(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        block_id: u8,
+        metadata: u8,
+    ) -> bool {
+        self.apply_block_with_metadata_at_world(
+            world_x,
+            world_y,
+            world_z,
+            block_id,
+            metadata,
+            BlockMutationOrigin::Player,
+        )
+    }
+
+    fn set_block_with_metadata_at_world_for_fluid(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        block_id: u8,
+        metadata: u8,
+    ) -> bool {
+        self.apply_block_with_metadata_at_world(
+            world_x,
+            world_y,
+            world_z,
+            block_id,
+            metadata,
+            BlockMutationOrigin::Fluid,
+        )
+    }
+
+    fn apply_block_with_metadata_at_world(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        block_id: u8,
+        metadata: u8,
+        origin: BlockMutationOrigin,
+    ) -> bool {
         if !(0..CHUNK_HEIGHT as i32).contains(&world_y) || !self.registry.is_defined_block(block_id)
         {
             return false;
         }
 
         let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
-        let changed = {
+        let (old_block_id, block_changed, metadata_changed) = {
             let Some(slot) = self.slots.get_mut(&pos) else {
                 return false;
             };
@@ -699,19 +979,130 @@ impl ChunkStreamer {
                 return false;
             };
             let local_y = world_y as u8;
-            if chunk.block(local_x, local_y, local_z) == block_id {
+            let old_block_id = chunk.block(local_x, local_y, local_z);
+            let old_meta = chunk.block_metadata(local_x, local_y, local_z);
+            let clamped_meta = metadata.min(0x0F);
+            let block_changed = old_block_id != block_id;
+            let metadata_changed = old_meta != clamped_meta;
+            if !block_changed && !metadata_changed {
                 return false;
             }
-            chunk.set_block(local_x, local_y, local_z, block_id);
-            true
+            if block_changed {
+                chunk.set_block_with_metadata(local_x, local_y, local_z, block_id, metadata);
+            } else {
+                chunk.set_block_metadata(local_x, local_y, local_z, metadata);
+            }
+            (old_block_id, block_changed, metadata_changed)
         };
 
-        if changed {
-            self.refresh_columns_after_block_edit(pos, local_x, local_z);
-            self.mark_block_lighting_dirty(pos, local_x, local_z);
-            self.mark_block_geometry_dirty_at_y(pos, local_x, world_y as u8, local_z);
+        if block_changed {
+            let lightweight_liquid_swap = is_equivalent_liquid_state_swap(old_block_id, block_id);
+            if lightweight_liquid_swap {
+                if origin == BlockMutationOrigin::Player {
+                    self.enqueue_liquid_tick_with_neighbors(
+                        world_x,
+                        world_y,
+                        world_z,
+                        self.sim_tick,
+                        FluidPriority::Urgent,
+                    );
+                }
+                return true;
+            }
+            match origin {
+                BlockMutationOrigin::Player => {
+                    self.refresh_columns_after_block_edit(pos, local_x, local_z);
+                    self.mark_block_lighting_dirty_with_priority(
+                        pos,
+                        local_x,
+                        local_z,
+                        WorkPriority::Urgent,
+                    );
+                    self.mark_block_geometry_dirty_at_y_with_priority(
+                        pos,
+                        local_x,
+                        world_y as u8,
+                        local_z,
+                        WorkPriority::Urgent,
+                    );
+                    self.enqueue_liquid_tick_with_neighbors(
+                        world_x,
+                        world_y,
+                        world_z,
+                        self.sim_tick,
+                        FluidPriority::Urgent,
+                    );
+                }
+                BlockMutationOrigin::Fluid => {
+                    self.mark_block_lighting_dirty_with_priority(
+                        pos,
+                        local_x,
+                        local_z,
+                        WorkPriority::Background,
+                    );
+                    self.mark_block_geometry_dirty_at_y_with_priority(
+                        pos,
+                        local_x,
+                        world_y as u8,
+                        local_z,
+                        WorkPriority::Background,
+                    );
+                    self.enqueue_liquid_tick_with_neighbors(
+                        world_x,
+                        world_y,
+                        world_z,
+                        self.sim_tick,
+                        FluidPriority::Normal,
+                    );
+                }
+            }
+        } else if metadata_changed {
+            let priority = match origin {
+                BlockMutationOrigin::Player => WorkPriority::Urgent,
+                BlockMutationOrigin::Fluid => WorkPriority::Background,
+            };
+            self.mark_block_geometry_dirty_at_y_with_priority(
+                pos,
+                local_x,
+                world_y as u8,
+                local_z,
+                priority,
+            );
+
+            if origin == BlockMutationOrigin::Player {
+                self.enqueue_liquid_tick_with_neighbors(
+                    world_x,
+                    world_y,
+                    world_z,
+                    self.sim_tick,
+                    FluidPriority::Urgent,
+                );
+            }
         }
-        changed
+        true
+    }
+
+    pub fn tick_fluids(&mut self, sim_tick: u64, budget: usize) -> usize {
+        self.sim_tick = sim_tick;
+        let due_cells = self.fluid_scheduler.drain_due(sim_tick, budget.max(1));
+        let processed = due_cells.len();
+        for cell in due_cells {
+            self.process_fluid_cell(cell, sim_tick);
+        }
+        processed
+    }
+
+    pub fn tick_fluids_urgent(&mut self, sim_tick: u64, budget: usize) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        self.sim_tick = sim_tick;
+        let due_cells = self.fluid_scheduler.drain_due_urgent(sim_tick, budget);
+        let processed = due_cells.len();
+        for cell in due_cells {
+            self.process_fluid_cell(cell, sim_tick);
+        }
+        processed
     }
 
     #[must_use]
@@ -1114,6 +1505,10 @@ impl ChunkStreamer {
                         slot.transparent_section_meshes = std::array::from_fn(|_| None);
                         slot.meshed_section_mask = 0;
                     }
+                    self.enqueue_chunk_liquids(pos, self.sim_tick);
+                    for neighbor in cardinal_neighbors(pos) {
+                        self.enqueue_chunk_liquids(neighbor, self.sim_tick);
+                    }
                     self.mark_chunk_lighting_dirty(pos);
                     self.mark_neighbors_for_relight(pos);
                     self.mark_neighbors_for_remesh(pos);
@@ -1212,15 +1607,14 @@ impl ChunkStreamer {
                                 } else {
                                     Some(mesh)
                                 };
-                            slot.transparent_section_meshes[index] = if transparent_mesh
-                                .vertices
-                                .is_empty()
-                                || transparent_mesh.indices.is_empty()
-                            {
-                                None
-                            } else {
-                                Some(transparent_mesh)
-                            };
+                            slot.transparent_section_meshes[index] =
+                                if transparent_mesh.vertices.is_empty()
+                                    || transparent_mesh.indices.is_empty()
+                                {
+                                    None
+                                } else {
+                                    Some(transparent_mesh)
+                                };
                         }
                         slot.meshed_section_mask |= result.section_mask & full_section_mask();
                         slot.state = ChunkResidencyState::Ready;
@@ -1563,6 +1957,682 @@ impl ChunkStreamer {
         chunk.recalculate_column_height_and_sky_light(local_x, local_z, &self.registry);
         chunk.reseed_column_emitted_light(local_x, local_z, &self.registry);
     }
+
+    fn enqueue_chunk_liquids(&mut self, pos: ChunkPos, now_tick: u64) {
+        let Some(slot) = self.slots.get(&pos) else {
+            return;
+        };
+        if slot.state == ChunkResidencyState::Evicting {
+            return;
+        }
+        let Some(chunk) = slot.chunk.as_ref() else {
+            return;
+        };
+
+        let mut cells = Vec::new();
+        for local_x in 0..CHUNK_WIDTH as i32 {
+            for local_z in 0..CHUNK_DEPTH as i32 {
+                for y in 0..CHUNK_HEIGHT as i32 {
+                    let block_id = chunk.block(local_x as u8, y as u8, local_z as u8);
+                    let Some(kind) = liquid_kind_for_block(block_id) else {
+                        continue;
+                    };
+                    let world_x = pos.x * CHUNK_WIDTH as i32 + local_x;
+                    let world_z = pos.z * CHUNK_DEPTH as i32 + local_z;
+                    if !self.is_seed_liquid_tick_candidate(world_x, y, world_z, block_id, kind) {
+                        continue;
+                    }
+                    cells.push((
+                        FluidCell {
+                            x: world_x,
+                            y,
+                            z: world_z,
+                        },
+                        kind,
+                    ));
+                }
+            }
+        }
+        for (cell, kind) in cells {
+            self.schedule_liquid_tick(cell, now_tick, kind, FluidPriority::Normal);
+        }
+    }
+
+    fn is_seed_liquid_tick_candidate(
+        &self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        block_id: u8,
+        kind: LiquidKind,
+    ) -> bool {
+        if block_id == kind.flowing_id() {
+            return true;
+        }
+        if self.can_spread_to(world_x, world_y - 1, world_z, kind) {
+            return true;
+        }
+        if self.can_spread_to(world_x - 1, world_y, world_z, kind)
+            || self.can_spread_to(world_x + 1, world_y, world_z, kind)
+            || self.can_spread_to(world_x, world_y, world_z - 1, kind)
+            || self.can_spread_to(world_x, world_y, world_z + 1, kind)
+        {
+            return true;
+        }
+        let local_x = world_x.rem_euclid(CHUNK_WIDTH as i32);
+        let local_z = world_z.rem_euclid(CHUNK_DEPTH as i32);
+        local_x == 0
+            || local_x == (CHUNK_WIDTH as i32 - 1)
+            || local_z == 0
+            || local_z == (CHUNK_DEPTH as i32 - 1)
+    }
+
+    fn enqueue_liquid_tick_with_neighbors(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        now_tick: u64,
+        priority: FluidPriority,
+    ) {
+        let candidates = [
+            (world_x, world_y, world_z),
+            (world_x - 1, world_y, world_z),
+            (world_x + 1, world_y, world_z),
+            (world_x, world_y, world_z - 1),
+            (world_x, world_y, world_z + 1),
+            (world_x, world_y - 1, world_z),
+            (world_x, world_y + 1, world_z),
+        ];
+        for (x, y, z) in candidates {
+            self.enqueue_liquid_tick_at(x, y, z, now_tick, priority);
+        }
+        self.apply_lava_water_collision_around(world_x, world_y, world_z, now_tick);
+    }
+
+    fn enqueue_liquid_tick_at(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        now_tick: u64,
+        priority: FluidPriority,
+    ) {
+        if !(0..CHUNK_HEIGHT as i32).contains(&world_y) {
+            return;
+        }
+        let Some(block_id) = self.block_at_world(world_x, world_y, world_z) else {
+            return;
+        };
+        let Some(kind) = liquid_kind_for_block(block_id) else {
+            return;
+        };
+        self.schedule_liquid_tick(
+            FluidCell {
+                x: world_x,
+                y: world_y,
+                z: world_z,
+            },
+            now_tick,
+            kind,
+            priority,
+        );
+    }
+
+    fn schedule_liquid_tick(
+        &mut self,
+        cell: FluidCell,
+        now_tick: u64,
+        kind: LiquidKind,
+        priority: FluidPriority,
+    ) {
+        let due = now_tick.saturating_add(kind.tick_rate());
+        self.fluid_scheduler.enqueue(due, cell, priority);
+    }
+
+    /// MC: after changing a flowing block's metadata, updateNeighbors() triggers
+    /// neighborChanged() on all 6 adjacent blocks.  This wakes any adjacent
+    /// source/flowing liquid so it can react (e.g. source → flowing conversion).
+    fn wake_liquid_neighbors(&mut self, cell: FluidCell, now_tick: u64) {
+        let neighbors = [
+            (cell.x - 1, cell.y, cell.z),
+            (cell.x + 1, cell.y, cell.z),
+            (cell.x, cell.y - 1, cell.z),
+            (cell.x, cell.y + 1, cell.z),
+            (cell.x, cell.y, cell.z - 1),
+            (cell.x, cell.y, cell.z + 1),
+        ];
+        for (x, y, z) in neighbors {
+            self.enqueue_liquid_tick_at(x, y, z, now_tick, FluidPriority::Normal);
+        }
+    }
+
+    fn process_fluid_cell(&mut self, cell: FluidCell, sim_tick: u64) {
+        if !(0..CHUNK_HEIGHT as i32).contains(&cell.y) {
+            return;
+        }
+        let Some(block_id) = self.block_at_world(cell.x, cell.y, cell.z) else {
+            return;
+        };
+        let Some(kind) = liquid_kind_for_block(block_id) else {
+            return;
+        };
+
+        let mut local_block_id = block_id;
+        if block_id == kind.source_id() {
+            let metadata = self
+                .block_metadata_at_world(cell.x, cell.y, cell.z)
+                .unwrap_or(0);
+            if self.set_block_with_metadata_at_world_for_fluid(
+                cell.x,
+                cell.y,
+                cell.z,
+                kind.flowing_id(),
+                metadata,
+            ) {
+                local_block_id = kind.flowing_id();
+            }
+        }
+
+        if local_block_id != kind.flowing_id() {
+            return;
+        }
+
+        self.tick_flowing_liquid(cell, kind, sim_tick);
+    }
+
+    fn tick_flowing_liquid(&mut self, cell: FluidCell, kind: LiquidKind, sim_tick: u64) {
+        let mut level = self.get_liquid_state(cell.x, cell.y, cell.z, kind);
+        if level < 0 {
+            return;
+        }
+        let step = kind.flow_step();
+        let mut can_convert_to_source = true;
+
+        if level > 0 {
+            let mut adjacent_sources = 0;
+            let mut lowest = -100;
+            lowest = self.get_lowest_depth(
+                cell.x - 1,
+                cell.y,
+                cell.z,
+                kind,
+                lowest,
+                &mut adjacent_sources,
+            );
+            lowest = self.get_lowest_depth(
+                cell.x + 1,
+                cell.y,
+                cell.z,
+                kind,
+                lowest,
+                &mut adjacent_sources,
+            );
+            lowest = self.get_lowest_depth(
+                cell.x,
+                cell.y,
+                cell.z - 1,
+                kind,
+                lowest,
+                &mut adjacent_sources,
+            );
+            lowest = self.get_lowest_depth(
+                cell.x,
+                cell.y,
+                cell.z + 1,
+                kind,
+                lowest,
+                &mut adjacent_sources,
+            );
+            let mut new_level = lowest + step;
+            if new_level >= 8 || lowest < 0 {
+                new_level = -1;
+            }
+
+            let above = self.get_liquid_state(cell.x, cell.y + 1, cell.z, kind);
+            if above >= 0 {
+                new_level = if above >= 8 { above } else { above + 8 };
+            }
+
+            if kind == LiquidKind::Water && adjacent_sources >= 2 {
+                let below_solid = self.is_solid_block(cell.x, cell.y - 1, cell.z);
+                // MC's second branch checks self metadata == 0, but this code only
+                // runs when level > 0, so it's dead code. Match MC: only the
+                // below-solid branch can fire.
+                let below_is_same_liquid = liquid_kind_for_block(
+                    self.block_at_world(cell.x, cell.y - 1, cell.z)
+                        .unwrap_or(AIR_ID),
+                ) == Some(kind)
+                    && level == 0; // always false here since level > 0
+                if below_solid || below_is_same_liquid {
+                    new_level = 0;
+                }
+            }
+
+            if kind == LiquidKind::Lava
+                && level < 8
+                && new_level < 8
+                && new_level > level
+                && lava_stall(cell, sim_tick)
+            {
+                new_level = level;
+                can_convert_to_source = false;
+            }
+
+            if new_level != level {
+                level = new_level;
+                if level < 0 {
+                    self.set_block_with_metadata_at_world_for_fluid(
+                        cell.x, cell.y, cell.z, AIR_ID, 0,
+                    );
+                } else {
+                    self.set_block_with_metadata_at_world_for_fluid(
+                        cell.x,
+                        cell.y,
+                        cell.z,
+                        kind.flowing_id(),
+                        level as u8,
+                    );
+                    self.schedule_liquid_tick(cell, sim_tick, kind, FluidPriority::Normal);
+                }
+                // MC: updateNeighbors after changing flowing block state.
+                // Wake adjacent liquid blocks so they react to the change.
+                self.wake_liquid_neighbors(cell, sim_tick);
+            } else if can_convert_to_source {
+                let metadata = self
+                    .block_metadata_at_world(cell.x, cell.y, cell.z)
+                    .unwrap_or(0);
+                self.set_block_with_metadata_at_world_for_fluid(
+                    cell.x,
+                    cell.y,
+                    cell.z,
+                    kind.source_id(),
+                    metadata,
+                );
+            }
+        } else {
+            let metadata = self
+                .block_metadata_at_world(cell.x, cell.y, cell.z)
+                .unwrap_or(0);
+            self.set_block_with_metadata_at_world_for_fluid(
+                cell.x,
+                cell.y,
+                cell.z,
+                kind.source_id(),
+                metadata,
+            );
+        }
+
+        if self.can_spread_to(cell.x, cell.y - 1, cell.z, kind) {
+            let down_level = if level >= 8 { level } else { level + 8 };
+            self.spread_to(
+                FluidCell {
+                    x: cell.x,
+                    y: cell.y - 1,
+                    z: cell.z,
+                },
+                kind,
+                down_level as u8,
+                sim_tick,
+            );
+        } else if level >= 0 && (level == 0 || self.is_liquid_blocking(cell.x, cell.y - 1, cell.z))
+        {
+            let spread = self.get_spread_directions(cell.x, cell.y, cell.z, kind);
+            let mut next = level + step;
+            if level >= 8 {
+                next = 1;
+            }
+            if next < 8 {
+                if spread[0] {
+                    self.spread_to(
+                        FluidCell {
+                            x: cell.x - 1,
+                            y: cell.y,
+                            z: cell.z,
+                        },
+                        kind,
+                        next as u8,
+                        sim_tick,
+                    );
+                }
+                if spread[1] {
+                    self.spread_to(
+                        FluidCell {
+                            x: cell.x + 1,
+                            y: cell.y,
+                            z: cell.z,
+                        },
+                        kind,
+                        next as u8,
+                        sim_tick,
+                    );
+                }
+                if spread[2] {
+                    self.spread_to(
+                        FluidCell {
+                            x: cell.x,
+                            y: cell.y,
+                            z: cell.z - 1,
+                        },
+                        kind,
+                        next as u8,
+                        sim_tick,
+                    );
+                }
+                if spread[3] {
+                    self.spread_to(
+                        FluidCell {
+                            x: cell.x,
+                            y: cell.y,
+                            z: cell.z + 1,
+                        },
+                        kind,
+                        next as u8,
+                        sim_tick,
+                    );
+                }
+            }
+        }
+    }
+
+    fn spread_to(&mut self, cell: FluidCell, kind: LiquidKind, depth: u8, sim_tick: u64) {
+        if !self.can_spread_to(cell.x, cell.y, cell.z, kind) {
+            return;
+        }
+        // MC: when liquid spreads into a non-air block (flowers, torches, etc.),
+        // water calls dropItems() and lava calls fizz().
+        // TODO: drop displaced block as item entity once entity system exists.
+        self.set_block_with_metadata_at_world_for_fluid(
+            cell.x,
+            cell.y,
+            cell.z,
+            kind.flowing_id(),
+            depth,
+        );
+        self.schedule_liquid_tick(cell, sim_tick, kind, FluidPriority::Normal);
+        self.apply_lava_water_collision_around(cell.x, cell.y, cell.z, sim_tick);
+    }
+
+    fn get_lowest_depth(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        kind: LiquidKind,
+        depth: i32,
+        adjacent_sources: &mut i32,
+    ) -> i32 {
+        let mut state = self.get_liquid_state(x, y, z, kind);
+        if state < 0 {
+            return depth;
+        }
+        if state == 0 {
+            *adjacent_sources += 1;
+        }
+        if state >= 8 {
+            state = 0;
+        }
+        if depth < 0 || state < depth {
+            state
+        } else {
+            depth
+        }
+    }
+
+    fn get_spread_directions(&self, x: i32, y: i32, z: i32, kind: LiquidKind) -> [bool; 4] {
+        let mut distance_to_gap = [1000; 4];
+        for (dir, slot) in distance_to_gap.iter_mut().enumerate() {
+            let (nx, nz) = neighbor_offset(x, z, dir);
+            if self.is_liquid_blocking(nx, y, nz) || (self.get_liquid_state(nx, y, nz, kind) == 0) {
+                continue;
+            }
+            *slot = if !self.is_liquid_blocking(nx, y - 1, nz) {
+                0
+            } else {
+                self.get_distance_to_gap(nx, y, nz, 1, dir as i32, kind)
+            };
+        }
+
+        let min = *distance_to_gap.iter().min().unwrap_or(&1000);
+        [
+            distance_to_gap[0] == min,
+            distance_to_gap[1] == min,
+            distance_to_gap[2] == min,
+            distance_to_gap[3] == min,
+        ]
+    }
+
+    fn get_distance_to_gap(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        distance: i32,
+        from_dir: i32,
+        kind: LiquidKind,
+    ) -> i32 {
+        let mut best = 1000;
+        for dir in 0..4 {
+            if is_opposite(dir as i32, from_dir) {
+                continue;
+            }
+            let (nx, nz) = neighbor_offset(x, z, dir);
+            if self.is_liquid_blocking(nx, y, nz) || self.get_liquid_state(nx, y, nz, kind) == 0 {
+                continue;
+            }
+            if !self.is_liquid_blocking(nx, y - 1, nz) {
+                return distance;
+            }
+            if distance >= 4 {
+                continue;
+            }
+            let n = self.get_distance_to_gap(nx, y, nz, distance + 1, dir as i32, kind);
+            if n < best {
+                best = n;
+            }
+        }
+        best
+    }
+
+    fn get_liquid_state(&self, x: i32, y: i32, z: i32, kind: LiquidKind) -> i32 {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return -1;
+        }
+        let Some(block_id) = self.block_at_world(x, y, z) else {
+            return -1;
+        };
+        if liquid_kind_for_block(block_id) != Some(kind) {
+            return -1;
+        }
+        i32::from(self.block_metadata_at_world(x, y, z).unwrap_or(0))
+    }
+
+    fn is_solid_block(&self, x: i32, y: i32, z: i32) -> bool {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return true;
+        }
+        let Some(block_id) = self.block_at_world(x, y, z) else {
+            return false;
+        };
+        self.registry.is_solid(block_id)
+    }
+
+    fn is_liquid_blocking(&self, x: i32, y: i32, z: i32) -> bool {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return true;
+        }
+        let Some(block_id) = self.block_at_world(x, y, z) else {
+            return false;
+        };
+        if LIQUID_BLOCKING_IDS.contains(&block_id) {
+            return true;
+        }
+        if block_id == AIR_ID {
+            return false;
+        }
+        self.registry.is_solid(block_id)
+    }
+
+    fn can_spread_to(&self, x: i32, y: i32, z: i32, kind: LiquidKind) -> bool {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return false;
+        }
+        let Some(block_id) = self.block_at_world(x, y, z) else {
+            return false;
+        };
+        if liquid_kind_for_block(block_id) == Some(kind) {
+            return false;
+        }
+        if liquid_kind_for_block(block_id) == Some(LiquidKind::Lava) {
+            return false;
+        }
+        !self.is_liquid_blocking(x, y, z)
+    }
+
+    fn apply_lava_water_collision_around(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        sim_tick: u64,
+    ) {
+        let checks = [
+            (world_x, world_y, world_z),
+            (world_x - 1, world_y, world_z),
+            (world_x + 1, world_y, world_z),
+            (world_x, world_y, world_z - 1),
+            (world_x, world_y, world_z + 1),
+            (world_x, world_y - 1, world_z),
+            (world_x, world_y + 1, world_z),
+        ];
+        for (x, y, z) in checks {
+            self.apply_lava_water_collision_at(x, y, z, sim_tick);
+        }
+    }
+
+    fn apply_lava_water_collision_at(&mut self, x: i32, y: i32, z: i32, sim_tick: u64) {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return;
+        }
+        let Some(block_id) = self.block_at_world(x, y, z) else {
+            return;
+        };
+        if !self.registry.is_lava(block_id) {
+            return;
+        }
+
+        let touching_water = self
+            .block_at_world(x, y, z - 1)
+            .is_some_and(|id| self.registry.is_water(id))
+            || self
+                .block_at_world(x, y, z + 1)
+                .is_some_and(|id| self.registry.is_water(id))
+            || self
+                .block_at_world(x - 1, y, z)
+                .is_some_and(|id| self.registry.is_water(id))
+            || self
+                .block_at_world(x + 1, y, z)
+                .is_some_and(|id| self.registry.is_water(id))
+            || self
+                .block_at_world(x, y + 1, z)
+                .is_some_and(|id| self.registry.is_water(id));
+        if !touching_water {
+            return;
+        }
+
+        let metadata = self.block_metadata_at_world(x, y, z).unwrap_or(0);
+        let replacement = if metadata == 0 {
+            Some(OBSIDIAN_ID)
+        } else if metadata <= 4 {
+            Some(COBBLESTONE_ID)
+        } else {
+            None // MC: no conversion for deep lava, but still fizzes
+        };
+        if let Some(new_block) = replacement {
+            self.set_block_with_metadata_at_world_for_fluid(x, y, z, new_block, 0);
+        }
+        // MC always triggers fizz + neighbor updates when lava touches water,
+        // even for deep lava (meta > 4) that doesn't convert.
+        self.enqueue_liquid_tick_with_neighbors(x, y, z, sim_tick, FluidPriority::Normal);
+    }
+}
+
+impl LiquidKind {
+    fn flowing_id(self) -> u8 {
+        match self {
+            Self::Water => FLOWING_WATER_ID,
+            Self::Lava => FLOWING_LAVA_ID,
+        }
+    }
+
+    fn source_id(self) -> u8 {
+        match self {
+            Self::Water => WATER_ID,
+            Self::Lava => LAVA_ID,
+        }
+    }
+
+    fn tick_rate(self) -> u64 {
+        match self {
+            Self::Water => 5,
+            Self::Lava => 30,
+        }
+    }
+
+    fn flow_step(self) -> i32 {
+        match self {
+            Self::Water => 1,
+            Self::Lava => 2,
+        }
+    }
+}
+
+fn liquid_kind_for_block(block_id: u8) -> Option<LiquidKind> {
+    if matches!(block_id, FLOWING_WATER_ID | WATER_ID) {
+        Some(LiquidKind::Water)
+    } else if matches!(block_id, FLOWING_LAVA_ID | LAVA_ID) {
+        Some(LiquidKind::Lava)
+    } else {
+        None
+    }
+}
+
+fn is_equivalent_liquid_state_swap(from: u8, to: u8) -> bool {
+    matches!(
+        (from, to),
+        (FLOWING_WATER_ID, WATER_ID)
+            | (WATER_ID, FLOWING_WATER_ID)
+            | (FLOWING_LAVA_ID, LAVA_ID)
+            | (LAVA_ID, FLOWING_LAVA_ID)
+    )
+}
+
+fn neighbor_offset(x: i32, z: i32, dir: usize) -> (i32, i32) {
+    match dir {
+        0 => (x - 1, z),
+        1 => (x + 1, z),
+        2 => (x, z - 1),
+        _ => (x, z + 1),
+    }
+}
+
+fn is_opposite(dir: i32, from: i32) -> bool {
+    (dir == 0 && from == 1)
+        || (dir == 1 && from == 0)
+        || (dir == 2 && from == 3)
+        || (dir == 3 && from == 2)
+}
+
+fn lava_stall(cell: FluidCell, tick: u64) -> bool {
+    let mut hash = tick
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add((cell.x as i64 as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        .wrapping_add((cell.y as i64 as u64).wrapping_mul(0x94D0_49BB_1331_11EB))
+        .wrapping_add((cell.z as i64 as u64).wrapping_mul(0x369D_EA0F_31A5_3F85));
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    hash ^= hash >> 33;
+    (hash & 3) != 0
 }
 
 impl Drop for ChunkStreamer {
@@ -1742,11 +2812,11 @@ fn boundary_light_channels_changed(chunk: &ChunkData, lighting: &LightingOutput)
     false
 }
 
-    fn boundary_light_cell_changed(
-        chunk: &ChunkData,
-        lighting: &LightingOutput,
-        local_x: u8,
-        y: u8,
+fn boundary_light_cell_changed(
+    chunk: &ChunkData,
+    lighting: &LightingOutput,
+    local_x: u8,
+    y: u8,
     local_z: u8,
 ) -> bool {
     let index = ChunkData::index(local_x, y, local_z);
@@ -1760,6 +2830,65 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    const TEST_STONE_ID: u8 = 1;
+
+    fn insert_ready_air_chunk(streamer: &mut ChunkStreamer, pos: ChunkPos) {
+        let mut chunk = ChunkData::new(pos, AIR_ID);
+        chunk.recalculate_height_map(&streamer.registry);
+        chunk.seed_emitted_light(&streamer.registry);
+        streamer.slots.insert(
+            pos,
+            ChunkResidencyEntry {
+                state: ChunkResidencyState::Ready,
+                dirty: ChunkDirtyFlags::default(),
+                lighting_revision: 0,
+                chunk: Some(chunk),
+                section_meshes: std::array::from_fn(|_| None),
+                transparent_section_meshes: std::array::from_fn(|_| None),
+                meshed_section_mask: full_section_mask(),
+            },
+        );
+        streamer.required.insert(pos);
+    }
+
+    fn run_fluid_ticks(
+        streamer: &mut ChunkStreamer,
+        tick_start: u64,
+        tick_count: u64,
+        budget: usize,
+    ) {
+        for tick in tick_start..tick_start + tick_count {
+            streamer.tick_fluids(tick, budget);
+        }
+    }
+
+    #[test]
+    fn effective_light_query_matches_alpha_rule_and_world_bounds() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(42, registry, ResidencyConfig::default());
+        let pos = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, pos);
+
+        let local_x = 8_u8;
+        let local_y = 70_u8;
+        let local_z = 8_u8;
+        let index = ChunkData::index(local_x, local_y, local_z);
+        let mut sky = [0_u8; CHUNK_WIDTH * CHUNK_DEPTH * CHUNK_HEIGHT];
+        let mut block = [0_u8; CHUNK_WIDTH * CHUNK_DEPTH * CHUNK_HEIGHT];
+        sky[index] = 9;
+        block[index] = 2;
+        streamer
+            .slots
+            .get_mut(&pos)
+            .and_then(|slot| slot.chunk.as_mut())
+            .expect("inserted ready chunk should exist")
+            .apply_light_channels(&sky, &block);
+
+        assert_eq!(streamer.effective_light_at_world(8, 70, 8, 4), Some(5));
+        assert_eq!(streamer.effective_light_at_world(8, -1, 8, 4), Some(0));
+        assert_eq!(streamer.effective_light_at_world(8, 200, 8, 4), Some(11));
+    }
 
     #[test]
     fn missing_sections_do_not_include_empty_but_meshed_sections() {
@@ -1817,7 +2946,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             let _ = streamer.update_target(center);
             if streamer.metrics().ready == 1 {
                 break;
@@ -1848,7 +2977,7 @@ mod tests {
         );
 
         let start = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             let _ = streamer.update_target(start);
             if streamer.metrics().ready == 1 {
                 break;
@@ -1857,7 +2986,7 @@ mod tests {
         }
 
         let next = ChunkPos { x: 3, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             let _ = streamer.update_target(next);
             if streamer.metrics().ready == 1 && streamer.slot_state(start).is_none() {
                 break;
@@ -1952,7 +3081,7 @@ mod tests {
 
         let start = ChunkPos { x: 0, z: 0 };
         let mut saw_upsert = false;
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(start);
             saw_upsert |= streamer
                 .drain_render_updates()
@@ -1988,7 +3117,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready >= 9 {
                 break;
@@ -2025,7 +3154,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready == 1 {
                 break;
@@ -2071,7 +3200,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready >= 9 {
                 break;
@@ -2102,6 +3231,43 @@ mod tests {
     }
 
     #[test]
+    fn fluid_metadata_change_marks_chunk_meshing_dirty() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        {
+            let slot = streamer
+                .slots
+                .get_mut(&center)
+                .expect("ready chunk should exist");
+            let chunk = slot.chunk.as_mut().expect("chunk data should be present");
+            chunk.set_block_with_metadata(8, 70, 8, FLOWING_WATER_ID, 1);
+        }
+
+        let remesh_before = streamer.metrics().remesh_enqueued;
+        assert!(streamer.set_block_with_metadata_at_world_for_fluid(8, 70, 8, FLOWING_WATER_ID, 2));
+        assert_eq!(streamer.block_metadata_at_world(8, 70, 8), Some(2));
+        assert_eq!(
+            streamer.slot_state(center),
+            Some(ChunkResidencyState::Meshing)
+        );
+        assert!(streamer.metrics().remesh_enqueued > remesh_before);
+    }
+
+    #[test]
     fn placing_torch_relights_chunk_with_emitted_light() {
         let registry = BlockRegistry::alpha_1_2_6();
         let mut streamer = ChunkStreamer::new(
@@ -2117,7 +3283,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             let metrics = streamer.metrics();
             if metrics.ready == 1
@@ -2144,7 +3310,7 @@ mod tests {
         let (x, y, z) = place_target.expect("expected an air block above solid support");
         assert!(streamer.set_block_at_world(x, y, z, 50));
 
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             let metrics = streamer.metrics();
             if metrics.in_flight_lighting == 0
@@ -2192,7 +3358,7 @@ mod tests {
 
         let center = ChunkPos { x: 0, z: 0 };
         let mut target = None;
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
 
             if target.is_none() {
@@ -2218,7 +3384,7 @@ mod tests {
         assert!(streamer.meshing_in_flight.contains(&center));
         assert!(streamer.set_block_at_world(x, y, z, 0));
 
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready == 1 && streamer.metrics().in_flight_meshing == 0 {
                 break;
@@ -2249,7 +3415,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready == 1 {
                 break;
@@ -2278,7 +3444,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready >= 9 {
                 break;
@@ -2317,7 +3483,7 @@ mod tests {
 
         let center = ChunkPos { x: 0, z: 0 };
         let mut dirtied_while_in_flight = false;
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.lighting_in_flight.contains(&center) {
                 streamer.mark_chunk_lighting_dirty(center);
@@ -2328,7 +3494,7 @@ mod tests {
         }
         assert!(dirtied_while_in_flight);
 
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().relight_dropped_stale > 0 {
                 break;
@@ -2355,7 +3521,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready >= 9 {
                 break;
@@ -2381,7 +3547,7 @@ mod tests {
             .apply_light_channels(&sky, &block);
         streamer.mark_chunk_lighting_dirty(center);
 
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             let east_dirty = streamer
                 .slots
@@ -2419,7 +3585,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready >= 9 {
                 break;
@@ -2448,7 +3614,7 @@ mod tests {
             .apply_light_channels(&sky, &block);
         streamer.mark_chunk_lighting_dirty(center);
 
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             let east_revision_after = streamer
                 .slots
@@ -2485,7 +3651,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             let metrics = streamer.metrics();
             if metrics.ready >= 9
@@ -2509,7 +3675,7 @@ mod tests {
 
         assert!(streamer.set_block_at_world(8, 64, 8, 76));
 
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().in_flight_lighting == 0
                 && streamer
@@ -2546,7 +3712,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready >= 9
                 && streamer.metrics().in_flight_lighting == 0
@@ -2585,7 +3751,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready >= 9
                 && streamer.metrics().in_flight_lighting == 0
@@ -2629,7 +3795,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready >= 9
                 && streamer.metrics().in_flight_lighting == 0
@@ -2737,7 +3903,7 @@ mod tests {
         );
 
         let center = ChunkPos { x: 0, z: 0 };
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             if streamer.metrics().ready == 1
                 && streamer.metrics().in_flight_lighting == 0
@@ -2762,7 +3928,7 @@ mod tests {
         assert!(streamer.set_block_at_world(x, y, z, 0));
 
         let mut saw_upsert_while_lighting_dirty = false;
-        for _ in 0..500 {
+        for _ in 0..2_000 {
             streamer.tick(center);
             let center_dirty_lighting = streamer
                 .slots
@@ -2804,5 +3970,188 @@ mod tests {
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].pos, ChunkPos { x: 0, z: 0 });
         assert_eq!(states[0].residency_state, ChunkResidencyState::Requested);
+    }
+
+    #[test]
+    fn fluid_tick_water_flows_downward() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 8, WATER_ID, 0));
+        streamer.enqueue_liquid_tick_with_neighbors(8, 70, 8, 0, FluidPriority::Urgent);
+        run_fluid_ticks(&mut streamer, 1, 12, 64);
+
+        let below = streamer.block_at_world(8, 69, 8);
+        assert!(matches!(below, Some(FLOWING_WATER_ID | WATER_ID)));
+    }
+
+    #[test]
+    fn fluid_tick_lava_meets_water_turns_to_obsidian() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 8, FLOWING_LAVA_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(9, 70, 8, WATER_ID, 0));
+        streamer.apply_lava_water_collision_around(8, 70, 8, 0);
+
+        assert_eq!(streamer.block_at_world(8, 70, 8), Some(OBSIDIAN_ID));
+    }
+
+    #[test]
+    fn fluid_scheduler_processes_urgent_before_normal() {
+        let mut scheduler = FluidScheduler::default();
+        let urgent = FluidCell {
+            x: 999,
+            y: 64,
+            z: 0,
+        };
+        scheduler.enqueue(5, urgent, FluidPriority::Urgent);
+        for x in 0..128 {
+            scheduler.enqueue(5, FluidCell { x, y: 64, z: 0 }, FluidPriority::Normal);
+        }
+
+        let drained = scheduler.drain_due(5, 1);
+        assert_eq!(drained, vec![urgent]);
+    }
+
+    #[test]
+    fn fluid_scheduler_urgent_drain_leaves_normal_backlog() {
+        let mut scheduler = FluidScheduler::default();
+        let urgent = FluidCell { x: 9, y: 64, z: 0 };
+        let normal = FluidCell { x: 8, y: 64, z: 0 };
+        scheduler.enqueue(5, urgent, FluidPriority::Urgent);
+        scheduler.enqueue(5, normal, FluidPriority::Normal);
+
+        assert_eq!(scheduler.drain_due_urgent(5, 8), vec![urgent]);
+        assert_eq!(scheduler.drain_due(5, 8), vec![normal]);
+    }
+
+    #[test]
+    fn breaking_block_next_to_water_wakes_flow_quickly() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        assert!(streamer.set_block_with_metadata_at_world(8, 69, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(9, 69, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(7, 70, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 7, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 9, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 8, WATER_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(9, 70, 8, TEST_STONE_ID, 0));
+
+        run_fluid_ticks(&mut streamer, 1, 6, 64);
+        assert_eq!(streamer.block_at_world(9, 70, 8), Some(TEST_STONE_ID));
+
+        assert!(streamer.set_block_at_world(9, 70, 8, AIR_ID));
+        run_fluid_ticks(&mut streamer, 7, 16, 64);
+
+        assert!(matches!(
+            streamer.block_at_world(9, 70, 8),
+            Some(FLOWING_WATER_ID | WATER_ID)
+        ));
+    }
+
+    #[test]
+    fn placing_water_spreads_without_manual_enqueue() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        assert!(streamer.set_block_at_world(8, 70, 8, WATER_ID));
+        run_fluid_ticks(&mut streamer, 1, 16, 64);
+
+        assert!(matches!(
+            streamer.block_at_world(8, 69, 8),
+            Some(FLOWING_WATER_ID | WATER_ID)
+        ));
+    }
+
+    #[test]
+    fn cross_chunk_edge_flow_wakes_after_neighbor_arrives() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        assert!(streamer.set_block_with_metadata_at_world(15, 69, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(14, 70, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(15, 70, 7, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(15, 70, 9, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(15, 70, 8, WATER_ID, 0));
+
+        streamer.enqueue_chunk_liquids(center, 0);
+        run_fluid_ticks(&mut streamer, 1, 10, 64);
+        assert_eq!(streamer.block_at_world(16, 70, 8), None);
+
+        let east = ChunkPos { x: 1, z: 0 };
+        insert_ready_air_chunk(&mut streamer, east);
+        assert!(streamer.set_block_with_metadata_at_world(16, 69, 8, TEST_STONE_ID, 0));
+        streamer.enqueue_chunk_liquids(center, 10);
+        streamer.enqueue_chunk_liquids(east, 10);
+
+        run_fluid_ticks(&mut streamer, 11, 20, 128);
+        assert!(matches!(
+            streamer.block_at_world(16, 70, 8),
+            Some(FLOWING_WATER_ID | WATER_ID)
+        ));
     }
 }

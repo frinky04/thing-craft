@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::fmt;
 use std::path::Path;
@@ -32,6 +33,7 @@ const IRON_ORE_ID: u8 = 15;
 const COAL_ORE_ID: u8 = 16;
 const OAK_LOG_ID: u8 = 17;
 const OAK_LEAVES_ID: u8 = 18;
+const OBSIDIAN_ID: u8 = 49;
 const MOSSY_COBBLESTONE_ID: u8 = 48;
 const MOB_SPAWNER_ID: u8 = 52;
 const DIAMOND_ORE_ID: u8 = 56;
@@ -286,6 +288,16 @@ impl BlockRegistry {
         add(&mut by_id, 20, "glass", 49, MaterialKind::Glass, true, 0, 0);
         add(&mut by_id, 35, "wool", 64, MaterialKind::Wool, true, 255, 0);
         add(&mut by_id, 46, "tnt", 8, MaterialKind::Wood, true, 255, 0);
+        add(
+            &mut by_id,
+            OBSIDIAN_ID,
+            "obsidian",
+            37,
+            MaterialKind::Stone,
+            true,
+            255,
+            0,
+        );
         add(
             &mut by_id,
             MOSSY_COBBLESTONE_ID,
@@ -570,6 +582,22 @@ impl BlockRegistry {
     }
 
     #[must_use]
+    pub fn is_lava(&self, block_id: u8) -> bool {
+        matches!(block_id, FLOWING_LAVA_ID | LAVA_ID)
+    }
+
+    /// True when `a` and `b` are both water (flowing or source) or both lava.
+    #[must_use]
+    pub fn is_same_liquid_kind(&self, a: u8, b: u8) -> bool {
+        (self.is_water(a) && self.is_water(b)) || (self.is_lava(a) && self.is_lava(b))
+    }
+
+    #[must_use]
+    pub fn is_solid(&self, block_id: u8) -> bool {
+        self.get(block_id).is_some_and(|block| block.solid)
+    }
+
+    #[must_use]
     pub fn is_defined_block(&self, block_id: u8) -> bool {
         self.get(block_id).is_some()
     }
@@ -785,6 +813,108 @@ impl OverworldChunkGenerator {
 
     #[must_use]
     pub fn generate_chunk(&self, chunk_pos: ChunkPos, registry: &BlockRegistry) -> ChunkData {
+        self.generate_region(chunk_pos, 0, registry)
+            .into_iter()
+            .next()
+            .expect("single-chunk region generation should return one chunk")
+    }
+
+    #[must_use]
+    pub fn generate_region(
+        &self,
+        center_chunk: ChunkPos,
+        radius: i32,
+        registry: &BlockRegistry,
+    ) -> Vec<ChunkData> {
+        if radius < 0 {
+            return Vec::new();
+        }
+
+        let min_x = center_chunk.x - radius;
+        let max_x = center_chunk.x + radius;
+        let min_z = center_chunk.z - radius;
+        let max_z = center_chunk.z + radius;
+
+        // Populate into an expanded support ring so tree placement can read/write
+        // across chunk borders like vanilla does.
+        let support_min = ChunkPos {
+            x: min_x - 1,
+            z: min_z - 1,
+        };
+        let support_max = ChunkPos {
+            x: max_x + 1,
+            z: max_z + 1,
+        };
+        let target_min = ChunkPos { x: min_x, z: min_z };
+        let target_max = ChunkPos { x: max_x, z: max_z };
+        let mut chunks =
+            self.generate_base_region(support_min, support_max, target_min, target_max, registry);
+
+        // For each target chunk [x,z], vanilla-style tree roots come from source
+        // chunks [x-1..x] and [z-1..z].
+        let source_min = ChunkPos {
+            x: min_x - 1,
+            z: min_z - 1,
+        };
+        let source_max = ChunkPos { x: max_x, z: max_z };
+        place_trees(
+            &mut chunks,
+            self.seed,
+            &self.biome_source,
+            source_min,
+            source_max,
+        );
+
+        let mut output = Vec::new();
+        for chunk_z in min_z..=max_z {
+            for chunk_x in min_x..=max_x {
+                let pos = ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                };
+                let mut chunk = chunks.remove(&pos).unwrap_or_else(|| {
+                    panic!(
+                        "missing generated chunk at ({}, {}) while extracting region",
+                        chunk_x, chunk_z
+                    )
+                });
+                chunk.recalculate_height_map(registry);
+                chunk.seed_emitted_light(registry);
+                output.push(chunk);
+            }
+        }
+        output
+    }
+
+    fn generate_base_region(
+        &self,
+        min_chunk: ChunkPos,
+        max_chunk: ChunkPos,
+        target_min: ChunkPos,
+        target_max: ChunkPos,
+        registry: &BlockRegistry,
+    ) -> HashMap<ChunkPos, ChunkData> {
+        let mut chunks = HashMap::new();
+        for chunk_z in min_chunk.z..=max_chunk.z {
+            for chunk_x in min_chunk.x..=max_chunk.x {
+                let pos = ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                };
+                let mut chunk = self.generate_terrain_chunk(pos);
+                if (target_min.x..=target_max.x).contains(&chunk_x)
+                    && (target_min.z..=target_max.z).contains(&chunk_z)
+                {
+                    self.populate_underground_features(&mut chunk);
+                }
+                chunk.recalculate_height_map(registry);
+                chunks.insert(pos, chunk);
+            }
+        }
+        chunks
+    }
+
+    fn generate_terrain_chunk(&self, chunk_pos: ChunkPos) -> ChunkData {
         let mut chunk = ChunkData::new(chunk_pos, AIR_ID);
 
         for local_x in 0..CHUNK_WIDTH as u8 {
@@ -844,38 +974,13 @@ impl OverworldChunkGenerator {
             }
         }
 
-        carve_caves(&mut chunk, self.seed);
-        populate_ores(&mut chunk, self.seed);
-        place_dungeon_stubs(&mut chunk, self.seed);
-        // Height map needed by place_trees for O(1) surface lookups.
-        chunk.recalculate_height_map(registry);
-        place_trees(&mut chunk, self.seed, &self.biome_source);
-        // Re-run after trees to account for new log/leaf blocks.
-        chunk.recalculate_height_map(registry);
-        chunk.seed_emitted_light(registry);
         chunk
     }
 
-    #[must_use]
-    pub fn generate_region(
-        &self,
-        center_chunk: ChunkPos,
-        radius: i32,
-        registry: &BlockRegistry,
-    ) -> Vec<ChunkData> {
-        let mut chunks = Vec::new();
-        for chunk_z in (center_chunk.z - radius)..=(center_chunk.z + radius) {
-            for chunk_x in (center_chunk.x - radius)..=(center_chunk.x + radius) {
-                chunks.push(self.generate_chunk(
-                    ChunkPos {
-                        x: chunk_x,
-                        z: chunk_z,
-                    },
-                    registry,
-                ));
-            }
-        }
-        chunks
+    fn populate_underground_features(&self, chunk: &mut ChunkData) {
+        carve_caves(chunk, self.seed);
+        populate_ores(chunk, self.seed);
+        place_dungeon_stubs(chunk, self.seed);
     }
 }
 
@@ -1483,67 +1588,130 @@ fn trees_per_chunk(biome: BiomeKind) -> i32 {
     }
 }
 
-fn place_trees(chunk: &mut ChunkData, world_seed: u64, biome_source: &BiomeSource) {
-    let cx = chunk.pos.x;
-    let cz = chunk.pos.z;
+fn place_trees(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    world_seed: u64,
+    biome_source: &BiomeSource,
+    source_min: ChunkPos,
+    source_max: ChunkPos,
+) {
+    for source_z in source_min.z..=source_max.z {
+        for source_x in source_min.x..=source_max.x {
+            // XOR with a constant to decorrelate from dungeon/ore placement.
+            let mut rng = SmallRng::seed_from_u64(
+                (alpha_chunk_seed(world_seed, source_x, source_z) ^ 0xBEEF_CAFE) as u64,
+            );
 
-    // XOR with a constant to decorrelate from dungeon/ore placement.
-    let mut rng =
-        SmallRng::seed_from_u64((alpha_chunk_seed(world_seed, cx, cz) ^ 0xBEEF_CAFE) as u64);
+            // Sample biome at chunk center to determine tree density.
+            let center_x = source_x * CHUNK_WIDTH as i32 + 8;
+            let center_z = source_z * CHUNK_DEPTH as i32 + 8;
+            let biome_sample = biome_source.sample(center_x, center_z);
+            let base_count = trees_per_chunk(biome_sample.biome);
 
-    // Sample biome at chunk center to determine tree density.
-    let center_x = cx * CHUNK_WIDTH as i32 + 8;
-    let center_z = cz * CHUNK_DEPTH as i32 + 8;
-    let biome_sample = biome_source.sample(center_x, center_z);
-    let base_count = trees_per_chunk(biome_sample.biome);
+            // Alpha adds a random 0..10 offset, then attempts that many trees.
+            let attempt_count = base_count + rng.gen_range(0..10_i32);
+            if attempt_count <= 0 {
+                continue;
+            }
 
-    // Alpha adds a random 0..10 offset, then attempts that many trees.
-    let attempt_count = base_count + rng.gen_range(0..10_i32);
-    if attempt_count <= 0 {
-        return;
-    }
+            for _ in 0..attempt_count {
+                // Vanilla feature roots are selected from [8..23] within source chunk.
+                let world_x = source_x * CHUNK_WIDTH as i32 + rng.gen_range(0..16_i32) + 8;
+                let world_z = source_z * CHUNK_DEPTH as i32 + rng.gen_range(0..16_i32) + 8;
+                let kind = tree_kind_for_biome(biome_sample.biome, &mut rng);
 
-    for _ in 0..attempt_count {
-        let local_x = rng.gen_range(0..CHUNK_WIDTH as i32);
-        let local_z = rng.gen_range(0..CHUNK_DEPTH as i32);
-        let kind = tree_kind_for_biome(biome_sample.biome, &mut rng);
-
-        if let Some(surface_y) = find_surface_y(chunk, local_x as u8, local_z as u8) {
-            match kind {
-                TreeKind::Oak => {
-                    let trunk_height = rng.gen_range(0..3_i32) + 4; // 4-6 blocks
-                    try_place_tree(chunk, &mut rng, local_x, surface_y, local_z, trunk_height);
-                }
-                TreeKind::Birch => {
-                    let trunk_height = rng.gen_range(0..2_i32) + 5; // 5-6 blocks
-                    try_place_birch_tree(
-                        chunk,
-                        &mut rng,
-                        local_x,
-                        surface_y,
-                        local_z,
-                        trunk_height,
-                    );
-                }
-                TreeKind::Pine => {
-                    let trunk_height = rng.gen_range(0..5_i32) + 6; // 6-10 blocks
-                    try_place_pine_tree(
-                        chunk,
-                        &mut rng,
-                        local_x,
-                        surface_y,
-                        local_z,
-                        trunk_height,
-                    );
+                if let Some(surface_y) = find_surface_y_world(chunks, world_x, world_z) {
+                    match kind {
+                        TreeKind::Oak => {
+                            let trunk_height = rng.gen_range(0..3_i32) + 4; // 4-6 blocks
+                            try_place_tree(
+                                chunks,
+                                &mut rng,
+                                world_x,
+                                surface_y,
+                                world_z,
+                                trunk_height,
+                            );
+                        }
+                        TreeKind::Birch => {
+                            let trunk_height = rng.gen_range(0..2_i32) + 5; // 5-6 blocks
+                            try_place_birch_tree(
+                                chunks,
+                                &mut rng,
+                                world_x,
+                                surface_y,
+                                world_z,
+                                trunk_height,
+                            );
+                        }
+                        TreeKind::Pine => {
+                            let trunk_height = rng.gen_range(0..5_i32) + 6; // 6-10 blocks
+                            try_place_pine_tree(
+                                chunks,
+                                &mut rng,
+                                world_x,
+                                surface_y,
+                                world_z,
+                                trunk_height,
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// Find the y of the highest non-air block at this column using the
-/// precomputed height map. Returns the y of the topmost solid block.
-fn find_surface_y(chunk: &ChunkData, local_x: u8, local_z: u8) -> Option<i32> {
+fn world_to_chunk_local(world_x: i32, world_z: i32) -> (ChunkPos, u8, u8) {
+    let chunk_x = world_x.div_euclid(CHUNK_WIDTH as i32);
+    let chunk_z = world_z.div_euclid(CHUNK_DEPTH as i32);
+    let local_x = world_x.rem_euclid(CHUNK_WIDTH as i32) as u8;
+    let local_z = world_z.rem_euclid(CHUNK_DEPTH as i32) as u8;
+    (
+        ChunkPos {
+            x: chunk_x,
+            z: chunk_z,
+        },
+        local_x,
+        local_z,
+    )
+}
+
+fn world_block(chunks: &HashMap<ChunkPos, ChunkData>, world_x: i32, y: i32, world_z: i32) -> u8 {
+    if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        return AIR_ID;
+    }
+    let (chunk_pos, local_x, local_z) = world_to_chunk_local(world_x, world_z);
+    chunks
+        .get(&chunk_pos)
+        .map_or(AIR_ID, |chunk| chunk.block(local_x, y as u8, local_z))
+}
+
+fn set_world_block(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    world_x: i32,
+    y: i32,
+    world_z: i32,
+    block_id: u8,
+) {
+    if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        return;
+    }
+    let (chunk_pos, local_x, local_z) = world_to_chunk_local(world_x, world_z);
+    if let Some(chunk) = chunks.get_mut(&chunk_pos) {
+        chunk.set_block(local_x, y as u8, local_z, block_id);
+    }
+}
+
+/// Find the y of the highest non-air block at this world column using the
+/// precomputed per-chunk height maps.
+fn find_surface_y_world(
+    chunks: &HashMap<ChunkPos, ChunkData>,
+    world_x: i32,
+    world_z: i32,
+) -> Option<i32> {
+    let (chunk_pos, local_x, local_z) = world_to_chunk_local(world_x, world_z);
+    let chunk = chunks.get(&chunk_pos)?;
     let h = chunk.height_at(local_x, local_z);
     if h == 0 {
         None
@@ -1555,14 +1723,14 @@ fn find_surface_y(chunk: &ChunkData, local_x: u8, local_z: u8) -> Option<i32> {
 /// Attempt to place an oak tree at the given position. Validates ground block
 /// and clearance, then places trunk and leaf canopy.
 fn try_place_tree(
-    chunk: &mut ChunkData,
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
     rng: &mut SmallRng,
-    local_x: i32,
+    world_x: i32,
     surface_y: i32,
-    local_z: i32,
+    world_z: i32,
     trunk_height: i32,
 ) {
-    let ground_block = chunk.block(local_x as u8, surface_y as u8, local_z as u8);
+    let ground_block = world_block(chunks, world_x, surface_y, world_z);
     if ground_block != GRASS_ID && ground_block != DIRT_ID {
         return;
     }
@@ -1587,14 +1755,9 @@ fn try_place_tree(
         let radius = if cy >= trunk_top { 1 } else { 2 };
         for dx in -radius..=radius {
             for dz in -radius..=radius {
-                let bx = local_x + dx;
-                let bz = local_z + dz;
-                if !(0..CHUNK_WIDTH as i32).contains(&bx) || !(0..CHUNK_DEPTH as i32).contains(&bz)
-                {
-                    // Out-of-chunk blocks: skip (acceptable clipping for single-chunk gen).
-                    continue;
-                }
-                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                let bx = world_x + dx;
+                let bz = world_z + dz;
+                let existing = world_block(chunks, bx, cy, bz);
                 if existing != AIR_ID && existing != OAK_LEAVES_ID {
                     return;
                 }
@@ -1603,7 +1766,7 @@ fn try_place_tree(
     }
 
     // Replace ground with dirt (matching Alpha behavior).
-    chunk.set_block(local_x as u8, surface_y as u8, local_z as u8, DIRT_ID);
+    set_world_block(chunks, world_x, surface_y, world_z, DIRT_ID);
 
     // Place leaf canopy: layers from (trunk_top - 3) to (trunk_top + 1).
     // Lower layers (trunk_top-3, trunk_top-2): radius 2, corners randomly pruned.
@@ -1614,12 +1777,8 @@ fn try_place_tree(
         let radius = if layer_from_top >= 2 { 2 } else { 1 };
         for dx in -radius..=radius {
             for dz in -radius..=radius {
-                let bx = local_x + dx;
-                let bz = local_z + dz;
-                if !(0..CHUNK_WIDTH as i32).contains(&bx) || !(0..CHUNK_DEPTH as i32).contains(&bz)
-                {
-                    continue;
-                }
+                let bx = world_x + dx;
+                let bz = world_z + dz;
                 if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
                     continue;
                 }
@@ -1631,9 +1790,9 @@ fn try_place_tree(
                 if radius == 2 && dx.abs() == 2 && dz.abs() == 2 && rng.gen_range(0..2_i32) == 0 {
                     continue;
                 }
-                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                let existing = world_block(chunks, bx, cy, bz);
                 if existing == AIR_ID {
-                    chunk.set_block(bx as u8, cy as u8, bz as u8, OAK_LEAVES_ID);
+                    set_world_block(chunks, bx, cy, bz, OAK_LEAVES_ID);
                 }
             }
         }
@@ -1641,13 +1800,10 @@ fn try_place_tree(
 
     // Place leaves at trunk_top + 1 (small crown cap): just the center column.
     let cap_y = trunk_top + 1;
-    if cap_y < CHUNK_HEIGHT as i32
-        && (0..CHUNK_WIDTH as i32).contains(&local_x)
-        && (0..CHUNK_DEPTH as i32).contains(&local_z)
-    {
-        let existing = chunk.block(local_x as u8, cap_y as u8, local_z as u8);
+    if cap_y < CHUNK_HEIGHT as i32 {
+        let existing = world_block(chunks, world_x, cap_y, world_z);
         if existing == AIR_ID {
-            chunk.set_block(local_x as u8, cap_y as u8, local_z as u8, OAK_LEAVES_ID);
+            set_world_block(chunks, world_x, cap_y, world_z, OAK_LEAVES_ID);
         }
     }
 
@@ -1656,21 +1812,21 @@ fn try_place_tree(
         if ty >= CHUNK_HEIGHT as i32 {
             break;
         }
-        chunk.set_block(local_x as u8, ty as u8, local_z as u8, OAK_LOG_ID);
+        set_world_block(chunks, world_x, ty, world_z, OAK_LOG_ID);
     }
 }
 
 /// Birch tree: slightly taller, thinner canopy (radius 1 throughout).
 /// Uses OAK_LOG_ID and OAK_LEAVES_ID (Alpha 1.2.6 has only one log/leaf type).
 fn try_place_birch_tree(
-    chunk: &mut ChunkData,
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
     rng: &mut SmallRng,
-    local_x: i32,
+    world_x: i32,
     surface_y: i32,
-    local_z: i32,
+    world_z: i32,
     trunk_height: i32,
 ) {
-    let ground_block = chunk.block(local_x as u8, surface_y as u8, local_z as u8);
+    let ground_block = world_block(chunks, world_x, surface_y, world_z);
     if ground_block != GRASS_ID && ground_block != DIRT_ID {
         return;
     }
@@ -1691,14 +1847,9 @@ fn try_place_birch_tree(
         }
         for dx in -1..=1_i32 {
             for dz in -1..=1_i32 {
-                let bx = local_x + dx;
-                let bz = local_z + dz;
-                if !(0..CHUNK_WIDTH as i32).contains(&bx)
-                    || !(0..CHUNK_DEPTH as i32).contains(&bz)
-                {
-                    continue;
-                }
-                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                let bx = world_x + dx;
+                let bz = world_z + dz;
+                let existing = world_block(chunks, bx, cy, bz);
                 if existing != AIR_ID && existing != OAK_LEAVES_ID {
                     return;
                 }
@@ -1706,19 +1857,14 @@ fn try_place_birch_tree(
         }
     }
 
-    chunk.set_block(local_x as u8, surface_y as u8, local_z as u8, DIRT_ID);
+    set_world_block(chunks, world_x, surface_y, world_z, DIRT_ID);
 
     // Canopy: 3 layers of radius 1, with corner pruning.
     for cy in (trunk_top - 2)..=(trunk_top) {
         for dx in -1..=1_i32 {
             for dz in -1..=1_i32 {
-                let bx = local_x + dx;
-                let bz = local_z + dz;
-                if !(0..CHUNK_WIDTH as i32).contains(&bx)
-                    || !(0..CHUNK_DEPTH as i32).contains(&bz)
-                {
-                    continue;
-                }
+                let bx = world_x + dx;
+                let bz = world_z + dz;
                 if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
                     continue;
                 }
@@ -1729,9 +1875,9 @@ fn try_place_birch_tree(
                 if dx.abs() == 1 && dz.abs() == 1 && rng.gen_range(0..2_i32) == 0 {
                     continue;
                 }
-                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                let existing = world_block(chunks, bx, cy, bz);
                 if existing == AIR_ID {
-                    chunk.set_block(bx as u8, cy as u8, bz as u8, OAK_LEAVES_ID);
+                    set_world_block(chunks, bx, cy, bz, OAK_LEAVES_ID);
                 }
             }
         }
@@ -1740,9 +1886,9 @@ fn try_place_birch_tree(
     // Cap leaf.
     let cap_y = trunk_top + 1;
     if cap_y < CHUNK_HEIGHT as i32 {
-        let existing = chunk.block(local_x as u8, cap_y as u8, local_z as u8);
+        let existing = world_block(chunks, world_x, cap_y, world_z);
         if existing == AIR_ID {
-            chunk.set_block(local_x as u8, cap_y as u8, local_z as u8, OAK_LEAVES_ID);
+            set_world_block(chunks, world_x, cap_y, world_z, OAK_LEAVES_ID);
         }
     }
 
@@ -1751,21 +1897,21 @@ fn try_place_birch_tree(
         if ty >= CHUNK_HEIGHT as i32 {
             break;
         }
-        chunk.set_block(local_x as u8, ty as u8, local_z as u8, OAK_LOG_ID);
+        set_world_block(chunks, world_x, ty, world_z, OAK_LOG_ID);
     }
 }
 
 /// Pine tree: tall trunk with triangular canopy that narrows from bottom to top.
 /// Uses OAK_LOG_ID and OAK_LEAVES_ID (Alpha 1.2.6 has only one log/leaf type).
 fn try_place_pine_tree(
-    chunk: &mut ChunkData,
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
     _rng: &mut SmallRng,
-    local_x: i32,
+    world_x: i32,
     surface_y: i32,
-    local_z: i32,
+    world_z: i32,
     trunk_height: i32,
 ) {
-    let ground_block = chunk.block(local_x as u8, surface_y as u8, local_z as u8);
+    let ground_block = world_block(chunks, world_x, surface_y, world_z);
     if ground_block != GRASS_ID && ground_block != DIRT_ID {
         return;
     }
@@ -1790,14 +1936,9 @@ fn try_place_pine_tree(
         let radius = pine_canopy_radius(layer_from_bottom, canopy_layers);
         for dx in -radius..=radius {
             for dz in -radius..=radius {
-                let bx = local_x + dx;
-                let bz = local_z + dz;
-                if !(0..CHUNK_WIDTH as i32).contains(&bx)
-                    || !(0..CHUNK_DEPTH as i32).contains(&bz)
-                {
-                    continue;
-                }
-                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                let bx = world_x + dx;
+                let bz = world_z + dz;
+                let existing = world_block(chunks, bx, cy, bz);
                 if existing != AIR_ID && existing != OAK_LEAVES_ID {
                     return;
                 }
@@ -1805,7 +1946,7 @@ fn try_place_pine_tree(
         }
     }
 
-    chunk.set_block(local_x as u8, surface_y as u8, local_z as u8, DIRT_ID);
+    set_world_block(chunks, world_x, surface_y, world_z, DIRT_ID);
 
     // Place canopy layers.
     for cy in canopy_start..=(trunk_top + 1) {
@@ -1816,19 +1957,14 @@ fn try_place_pine_tree(
         let radius = pine_canopy_radius(layer_from_bottom, canopy_layers);
         for dx in -radius..=radius {
             for dz in -radius..=radius {
-                let bx = local_x + dx;
-                let bz = local_z + dz;
-                if !(0..CHUNK_WIDTH as i32).contains(&bx)
-                    || !(0..CHUNK_DEPTH as i32).contains(&bz)
-                {
-                    continue;
-                }
+                let bx = world_x + dx;
+                let bz = world_z + dz;
                 if dx == 0 && dz == 0 && cy <= trunk_top {
                     continue; // Trunk column handled separately.
                 }
-                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                let existing = world_block(chunks, bx, cy, bz);
                 if existing == AIR_ID {
-                    chunk.set_block(bx as u8, cy as u8, bz as u8, OAK_LEAVES_ID);
+                    set_world_block(chunks, bx, cy, bz, OAK_LEAVES_ID);
                 }
             }
         }
@@ -1839,13 +1975,13 @@ fn try_place_pine_tree(
         if ty >= CHUNK_HEIGHT as i32 {
             break;
         }
-        chunk.set_block(local_x as u8, ty as u8, local_z as u8, OAK_LOG_ID);
+        set_world_block(chunks, world_x, ty, world_z, OAK_LOG_ID);
     }
 
     // Single leaf on very top (above trunk_top).
     let top_y = trunk_top + 1;
     if top_y < CHUNK_HEIGHT as i32 {
-        chunk.set_block(local_x as u8, top_y as u8, local_z as u8, OAK_LEAVES_ID);
+        set_world_block(chunks, world_x, top_y, world_z, OAK_LEAVES_ID);
     }
 }
 
@@ -1879,6 +2015,7 @@ pub struct ChunkPos {
 pub struct ChunkData {
     pub pos: ChunkPos,
     blocks: Box<[u8; CHUNK_VOLUME]>,
+    metadata: NibbleStorage,
     sky_light: NibbleStorage,
     block_light: NibbleStorage,
     height_map: [u8; CHUNK_AREA],
@@ -1892,6 +2029,7 @@ impl ChunkData {
         Self {
             pos,
             blocks: Box::new([fill_block; CHUNK_VOLUME]),
+            metadata: NibbleStorage::new(CHUNK_VOLUME),
             sky_light: NibbleStorage::new(CHUNK_VOLUME),
             block_light: NibbleStorage::new(CHUNK_VOLUME),
             height_map: [0; CHUNK_AREA],
@@ -1909,6 +2047,31 @@ impl ChunkData {
     pub fn set_block(&mut self, local_x: u8, y: u8, local_z: u8, block_id: u8) {
         let idx = Self::index(local_x, y, local_z);
         self.blocks[idx] = block_id;
+        self.metadata.set(idx, 0);
+    }
+
+    pub fn set_block_with_metadata(
+        &mut self,
+        local_x: u8,
+        y: u8,
+        local_z: u8,
+        block_id: u8,
+        metadata: u8,
+    ) {
+        let idx = Self::index(local_x, y, local_z);
+        self.blocks[idx] = block_id;
+        self.metadata.set(idx, metadata);
+    }
+
+    #[must_use]
+    pub fn block_metadata(&self, local_x: u8, y: u8, local_z: u8) -> u8 {
+        let idx = Self::index(local_x, y, local_z);
+        self.metadata.get(idx)
+    }
+
+    pub fn set_block_metadata(&mut self, local_x: u8, y: u8, local_z: u8, metadata: u8) {
+        let idx = Self::index(local_x, y, local_z);
+        self.metadata.set(idx, metadata);
     }
 
     #[must_use]
@@ -2185,6 +2348,8 @@ impl BootstrapWorld {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -2490,6 +2655,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tree_placement_writes_across_chunk_boundaries() {
+        let mut chunks = HashMap::new();
+        let mut west = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        let mut east = ChunkData::new(ChunkPos { x: 1, z: 0 }, AIR_ID);
+        for x in 0..16_u8 {
+            for z in 0..16_u8 {
+                west.set_block(x, 59, z, DIRT_ID);
+                west.set_block(x, 60, z, GRASS_ID);
+                east.set_block(x, 59, z, DIRT_ID);
+                east.set_block(x, 60, z, GRASS_ID);
+            }
+        }
+        chunks.insert(west.pos, west);
+        chunks.insert(east.pos, east);
+
+        let mut rng = SmallRng::seed_from_u64(7);
+        // Root on the east edge of chunk (0, 0); canopy should spill into (1, 0).
+        try_place_tree(&mut chunks, &mut rng, 15, 60, 8, 5);
+
+        let east_chunk = chunks
+            .get(&ChunkPos { x: 1, z: 0 })
+            .expect("east chunk should exist");
+        let mut found_spill = false;
+        for y in 61..=66_u8 {
+            for z in 6..=10_u8 {
+                let block = east_chunk.block(0, y, z);
+                if block == OAK_LEAVES_ID || block == OAK_LOG_ID {
+                    found_spill = true;
+                    break;
+                }
+            }
+            if found_spill {
+                break;
+            }
+        }
+        assert!(
+            found_spill,
+            "expected boundary tree canopy spill into east chunk, but none was written"
+        );
     }
 
     #[test]

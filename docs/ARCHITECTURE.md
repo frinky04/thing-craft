@@ -76,6 +76,9 @@ This allows future network packets to feed the same command path without forking
 - Runtime debug stats include visible chunk count and edit-to-visible mesh latency metrics.
 - Chunk border debug mode now overlays per-chunk generation/lighting/meshing status bars to diagnose queue pressure and lighting churn near seams.
 - Terrain shading now includes Alpha-style alpha cutout discard and linear fog blending in WGSL.
+- Day/night now runs as fixed-tick world-time state (`24000`-tick cycle) in the app loop; renderer uniforms carry ambient darkness and dynamic fog color derived from Alpha formulas.
+- Terrain vertex payload now carries separate sky-light and block-light channels plus face-scale factors; fragment shading combines them per-frame (`max(block, sky-ambient_darkness)`) so daylight transitions do not require full chunk relighting.
+- Liquid simulation is queue-driven and budgeted per fixed tick. Runtime tracks scheduled liquid cells in loaded chunks, updates metadata depth/source-flowing states, and applies lava-water conversion to obsidian/cobblestone while reusing existing dirty-lighting/dirty-mesh propagation hooks.
 
 ## Early Pitfalls to Avoid
 

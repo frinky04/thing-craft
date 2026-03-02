@@ -17,6 +17,10 @@ use crate::world::{ChunkPos, CHUNK_SECTION_COUNT, SECTION_HEIGHT};
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const DEFAULT_FOG_COLOR: [f32; 3] = [0.04, 0.07, 0.12];
 const BUFFER_POOL_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+const CLOUD_LAYER_HEIGHT: f32 = 120.33;
+const CLOUD_UV_SCALE: f32 = 1.0 / 2048.0;
+const CLOUD_TILE_SIZE: f32 = 32.0;
+const CLOUD_GRID_RADIUS_TILES: i32 = 8;
 
 pub struct Renderer<'w> {
     surface: wgpu::Surface<'w>,
@@ -27,9 +31,14 @@ pub struct Renderer<'w> {
     render_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     debug_line_pipeline: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
+    cloud_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    terrain_bind_group: wgpu::BindGroup,
+    sky_uniform_buffer: wgpu::Buffer,
+    sky_bind_group: wgpu::BindGroup,
+    terrain_atlas: TerrainAtlas,
+    cloud_layer: CloudLayer,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     scene_mesh: Option<SceneMeshGpu>,
@@ -47,6 +56,13 @@ pub struct Renderer<'w> {
     hud_vertex_buffer: Option<wgpu::Buffer>,
     hud_vertex_count: u32,
     fog_color: [f32; 3],
+    sky_color: [f32; 3],
+    render_sky: bool,
+    cloud_color: [f32; 3],
+    cloud_scroll: f32,
+    ambient_darkness: f32,
+    daylight_factor: f32,
+    camera_pos: [f32; 3],
     mesh_buffer_pool: MeshBufferPool,
 }
 
@@ -56,6 +72,32 @@ struct SceneMeshGpu {
     index_count: u32,
     vertex_bytes: u64,
     index_bytes: u64,
+}
+
+struct TerrainAtlas {
+    bind_group: wgpu::BindGroup,
+    texture: wgpu::Texture,
+    water_top: WaterSpriteAnimator,
+    water_side: WaterSpriteAnimator,
+}
+
+struct CloudLayer {
+    bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
+    uniform_bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
+struct WaterSpriteAnimator {
+    current: [f32; 256],
+    next: [f32; 256],
+    heat: [f32; 256],
+    heat_delta: [f32; 256],
+    ticks: i32,
+    side_variant: bool,
+    rng_state: u32,
 }
 
 struct DebugLineMeshGpu {
@@ -97,6 +139,46 @@ struct CameraUniform {
     fog_start: f32,
     fog_color: [f32; 3],
     fog_end: f32,
+    ambient_darkness: f32,
+    daylight_factor: f32,
+    _pad: [f32; 2],
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct SkyUniform {
+    color: [f32; 3],
+    _pad: f32,
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct CloudUniform {
+    origin: [f32; 3],
+    alpha: f32,
+    uv_offset: [f32; 2],
+    _pad0: [f32; 2],
+    color: [f32; 3],
+    _pad1: f32,
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct CloudVertex {
+    local_pos: [f32; 2],
+}
+
+impl CloudVertex {
+    const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x2];
+
+    #[must_use]
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -109,6 +191,103 @@ struct MeshBufferPool {
 struct PooledBuffer {
     buffer: wgpu::Buffer,
     size: u64,
+}
+
+impl WaterSpriteAnimator {
+    fn new(side_variant: bool, seed: u32) -> Self {
+        Self {
+            current: [0.0; 256],
+            next: [0.0; 256],
+            heat: [0.0; 256],
+            heat_delta: [0.0; 256],
+            ticks: 0,
+            side_variant,
+            rng_state: seed.max(1),
+        }
+    }
+
+    fn rand_f32(&mut self) -> f32 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng_state = x.max(1);
+        self.rng_state as f32 / u32::MAX as f32
+    }
+
+    fn tick(&mut self) -> [u8; 1024] {
+        self.ticks += 1;
+
+        for i in 0..16_i32 {
+            for j in 0..16_i32 {
+                let mut sum = 0.0_f32;
+                if self.side_variant {
+                    for m in (j - 2)..=j {
+                        let n = i & 0xF;
+                        let p = m & 0xF;
+                        sum += self.current[(n + p * 16) as usize];
+                    }
+                    self.next[(i + j * 16) as usize] =
+                        sum / 3.2 + self.heat[(i + j * 16) as usize] * 0.8;
+                } else {
+                    for m in (i - 1)..=(i + 1) {
+                        let n = m & 0xF;
+                        let p = j & 0xF;
+                        sum += self.current[(n + p * 16) as usize];
+                    }
+                    self.next[(i + j * 16) as usize] =
+                        sum / 3.3 + self.heat[(i + j * 16) as usize] * 0.8;
+                }
+            }
+        }
+
+        for i in 0..16_i32 {
+            for k in 0..16_i32 {
+                let index = (i + k * 16) as usize;
+                self.heat[index] += self.heat_delta[index] * 0.05;
+                if self.heat[index] < 0.0 {
+                    self.heat[index] = 0.0;
+                }
+
+                if self.side_variant {
+                    self.heat_delta[index] -= 0.3;
+                    if self.rand_f32() < 0.2 {
+                        self.heat_delta[index] = 0.5;
+                    }
+                } else {
+                    self.heat_delta[index] -= 0.1;
+                    if self.rand_f32() < 0.05 {
+                        self.heat_delta[index] = 0.5;
+                    }
+                }
+            }
+        }
+
+        std::mem::swap(&mut self.next, &mut self.current);
+
+        let mut pixels = [0_u8; 1024];
+        for l in 0..256_i32 {
+            let sample = if self.side_variant {
+                (l - self.ticks * 16) & 0xFF
+            } else {
+                l
+            } as usize;
+            let g = self.current[sample].clamp(0.0, 1.0);
+            let h = g * g;
+            let red = (32.0 + h * 32.0) as u8;
+            let green = (50.0 + h * 64.0) as u8;
+            let blue = 255_u8;
+            let alpha = (146.0 + h * 50.0) as u8;
+
+            let p = l as usize * 4;
+            pixels[p] = red;
+            pixels[p + 1] = green;
+            pixels[p + 2] = blue;
+            pixels[p + 3] = alpha;
+        }
+
+        pixels
+    }
 }
 
 #[derive(Debug, Error)]
@@ -244,7 +423,14 @@ impl<'w> Renderer<'w> {
             .formats
             .iter()
             .copied()
-            .find(wgpu::TextureFormat::is_srgb)
+            .find(|format| !format.is_srgb())
+            .or_else(|| {
+                surface_caps
+                    .formats
+                    .iter()
+                    .copied()
+                    .find(wgpu::TextureFormat::is_srgb)
+            })
             .unwrap_or(surface_caps.formats[0]);
 
         let present_mode = surface_caps
@@ -282,6 +468,9 @@ impl<'w> Renderer<'w> {
             fog_start: 0.0,
             fog_color: DEFAULT_FOG_COLOR,
             fog_end: 1.0,
+            ambient_darkness: 0.0,
+            daylight_factor: 1.0,
+            _pad: [0.0; 2],
         };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("thingcraft-camera-buffer"),
@@ -313,6 +502,38 @@ impl<'w> Renderer<'w> {
             }],
         });
 
+        let sky_uniform = SkyUniform {
+            color: DEFAULT_FOG_COLOR,
+            _pad: 0.0,
+        };
+        let sky_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("thingcraft-sky-uniform-buffer"),
+            contents: bytemuck::bytes_of(&sky_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let sky_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-sky-bind-group-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thingcraft-sky-bind-group"),
+            layout: &sky_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sky_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
         let terrain_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("thingcraft-terrain-bind-group-layout"),
@@ -336,12 +557,48 @@ impl<'w> Renderer<'w> {
                 ],
             });
 
-        let terrain_bind_group = create_terrain_bind_group(
+        let terrain_atlas = create_terrain_atlas(
             &device,
             &queue,
             &terrain_bind_group_layout,
             Path::new("resources/minecraft-a1.2.6-client/terrain.png"),
         );
+        let cloud_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-cloud-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let cloud_uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-cloud-uniform-bind-group-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("thingcraft-chunk-shader"),
@@ -397,49 +654,164 @@ impl<'w> Renderer<'w> {
             multiview: None,
         });
 
-        let transparent_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("thingcraft-transparent-pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    buffers: &[MeshVertex::layout()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None, // Water visible from both sides when underwater
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: false, // Reads depth but doesn't write
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview: None,
+        let transparent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-transparent-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[MeshVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // Water visible from both sides when underwater
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false, // Reads depth but doesn't write
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-sky-shader"),
+            source: wgpu::ShaderSource::Wgsl(SKY_SHADER.into()),
+        });
+        let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("thingcraft-sky-pipeline-layout"),
+            bind_group_layouts: &[&sky_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-sky-pipeline"),
+            layout: Some(&sky_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+
+        let cloud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-cloud-shader"),
+            source: wgpu::ShaderSource::Wgsl(CLOUD_SHADER.into()),
+        });
+        let cloud_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("thingcraft-cloud-pipeline-layout"),
+                bind_group_layouts: &[
+                    &camera_bind_group_layout,
+                    &cloud_bind_group_layout,
+                    &cloud_uniform_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
             });
+        let cloud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-cloud-pipeline"),
+            layout: Some(&cloud_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &cloud_shader,
+                entry_point: "vs_main",
+                buffers: &[CloudVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cloud_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+        let cloud_layer = create_cloud_layer(
+            &device,
+            &queue,
+            &cloud_bind_group_layout,
+            &cloud_uniform_bind_group_layout,
+            Path::new("resources/minecraft-a1.2.6-client/environment/clouds.png"),
+        );
 
         let debug_line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("thingcraft-debug-line-shader"),
@@ -589,9 +961,14 @@ impl<'w> Renderer<'w> {
             render_pipeline,
             transparent_pipeline,
             debug_line_pipeline,
+            sky_pipeline,
+            cloud_pipeline,
             camera_buffer,
             camera_bind_group,
-            terrain_bind_group,
+            sky_uniform_buffer,
+            sky_bind_group,
+            terrain_atlas,
+            cloud_layer,
             depth_texture,
             depth_view,
             scene_mesh: None,
@@ -609,6 +986,13 @@ impl<'w> Renderer<'w> {
             hud_vertex_buffer: None,
             hud_vertex_count: 0,
             fog_color: DEFAULT_FOG_COLOR,
+            sky_color: DEFAULT_FOG_COLOR,
+            render_sky: false,
+            cloud_color: [1.0, 1.0, 1.0],
+            cloud_scroll: 0.0,
+            ambient_darkness: 0.0,
+            daylight_factor: 1.0,
+            camera_pos: [0.0; 3],
             mesh_buffer_pool: MeshBufferPool::default(),
         })
     }
@@ -634,11 +1018,40 @@ impl<'w> Renderer<'w> {
             fog_start,
             fog_color: self.fog_color,
             fog_end: fog_end.max(fog_start + 0.001),
+            ambient_darkness: self.ambient_darkness,
+            daylight_factor: self.daylight_factor,
+            _pad: [0.0; 2],
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         let matrix = Mat4::from_cols_array_2d(&view_proj);
         self.camera_frustum = Some(FrustumPlanes::from_view_proj(matrix));
+        self.camera_pos = camera_pos;
+    }
+
+    pub fn set_day_night(
+        &mut self,
+        fog_color: [f32; 3],
+        sky_color: [f32; 3],
+        ambient_darkness: u8,
+        render_sky: bool,
+    ) {
+        self.fog_color = fog_color;
+        self.sky_color = sky_color;
+        self.render_sky = render_sky;
+        self.ambient_darkness = f32::from(ambient_darkness.min(11));
+        self.daylight_factor = (15.0 - self.ambient_darkness).clamp(0.0, 15.0) / 15.0;
+        let uniform = SkyUniform {
+            color: self.sky_color,
+            _pad: 0.0,
+        };
+        self.queue
+            .write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    pub fn set_cloud_state(&mut self, cloud_color: [f32; 3], cloud_scroll: f32) {
+        self.cloud_color = cloud_color;
+        self.cloud_scroll = cloud_scroll;
     }
 
     pub fn set_scene_mesh(&mut self, mesh: &ChunkMesh) {
@@ -726,7 +1139,9 @@ impl<'w> Renderer<'w> {
             &mut self.chunk_meshes
         };
 
-        let sections = map.entry(pos).or_insert_with(|| std::array::from_fn(|_| None));
+        let sections = map
+            .entry(pos)
+            .or_insert_with(|| std::array::from_fn(|_| None));
 
         if let Some(old_mesh) = sections[index].take() {
             self.mesh_buffer_pool
@@ -847,6 +1262,50 @@ impl<'w> Renderer<'w> {
             .write_buffer(&self.hud_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
+    fn update_cloud_uniform(&mut self) {
+        let uniform = CloudUniform {
+            origin: [self.camera_pos[0], CLOUD_LAYER_HEIGHT, self.camera_pos[2]],
+            alpha: 0.8,
+            uv_offset: [self.cloud_scroll * CLOUD_UV_SCALE, 0.0],
+            _pad0: [0.0; 2],
+            color: self.cloud_color,
+            _pad1: 0.0,
+        };
+        self.queue.write_buffer(
+            &self.cloud_layer.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
+    }
+
+    pub fn advance_dynamic_liquid_textures(&mut self, ticks: u32) {
+        if ticks == 0 {
+            return;
+        }
+
+        let mut water_top_tile = [0_u8; 1024];
+        let mut water_side_tile = [0_u8; 1024];
+        for _ in 0..ticks {
+            water_top_tile = self.terrain_atlas.water_top.tick();
+            water_side_tile = self.terrain_atlas.water_side.tick();
+        }
+
+        upload_dynamic_sprite(
+            &self.queue,
+            &self.terrain_atlas.texture,
+            WATER_TOP_SPRITE,
+            1,
+            &water_top_tile,
+        );
+        upload_dynamic_sprite(
+            &self.queue,
+            &self.terrain_atlas.texture,
+            WATER_SIDE_SPRITE,
+            2,
+            &water_side_tile,
+        );
+    }
+
     pub fn reconfigure(&mut self) {
         if self.config.width == 0 || self.config.height == 0 {
             return;
@@ -885,6 +1344,7 @@ impl<'w> Renderer<'w> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("thingcraft-render-encoder"),
             });
+        self.update_cloud_uniform();
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -914,10 +1374,16 @@ impl<'w> Renderer<'w> {
                 occlusion_query_set: None,
             });
 
+            if self.render_sky {
+                render_pass.set_pipeline(&self.sky_pipeline);
+                render_pass.set_bind_group(0, &self.sky_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
+
             if let Some(scene_mesh) = &self.scene_mesh {
                 render_pass.set_pipeline(&self.render_pipeline);
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.terrain_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.terrain_atlas.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, scene_mesh.vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(scene_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -927,7 +1393,7 @@ impl<'w> Renderer<'w> {
             if !self.chunk_meshes.is_empty() {
                 render_pass.set_pipeline(&self.render_pipeline);
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.terrain_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.terrain_atlas.bind_group, &[]);
                 let frustum = self.camera_frustum.as_ref();
                 let mut visible = 0_usize;
                 for (pos, sections) in &self.chunk_meshes {
@@ -963,7 +1429,7 @@ impl<'w> Renderer<'w> {
             if !self.chunk_transparent_meshes.is_empty() {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.terrain_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.terrain_atlas.bind_group, &[]);
                 let frustum = self.camera_frustum.as_ref();
                 for (pos, sections) in &self.chunk_transparent_meshes {
                     for (section_y, chunk_mesh) in sections.iter().enumerate() {
@@ -985,6 +1451,17 @@ impl<'w> Renderer<'w> {
                     }
                 }
             }
+
+            render_pass.set_pipeline(&self.cloud_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.cloud_layer.bind_group, &[]);
+            render_pass.set_bind_group(2, &self.cloud_layer.uniform_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.cloud_layer.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(
+                self.cloud_layer.index_buffer.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            render_pass.draw_indexed(0..self.cloud_layer.index_count, 0, 0..1);
 
             if self.chunk_border_debug_enabled {
                 if let Some(chunk_border_mesh) = &self.chunk_border_mesh {
@@ -1299,13 +1776,167 @@ fn create_depth_resources(
     (depth_texture, depth_view)
 }
 
-fn create_terrain_bind_group(
+fn create_cloud_layer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture_layout: &wgpu::BindGroupLayout,
+    uniform_layout: &wgpu::BindGroupLayout,
+    cloud_texture_path: &Path,
+) -> CloudLayer {
+    let (width, height, rgba) = load_png_rgba(cloud_texture_path);
+    let cloud_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("thingcraft-cloud-texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &cloud_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let texture_view = cloud_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("thingcraft-cloud-sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("thingcraft-cloud-bind-group"),
+        layout: texture_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    let cloud_uniform = CloudUniform {
+        origin: [0.0, CLOUD_LAYER_HEIGHT, 0.0],
+        alpha: 0.8,
+        uv_offset: [0.0, 0.0],
+        _pad0: [0.0; 2],
+        color: [1.0, 1.0, 1.0],
+        _pad1: 0.0,
+    };
+    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-cloud-uniform-buffer"),
+        contents: bytemuck::bytes_of(&cloud_uniform),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("thingcraft-cloud-uniform-bind-group"),
+        layout: uniform_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let (vertices, indices) = build_cloud_grid_mesh();
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-cloud-vertex-buffer"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-cloud-index-buffer"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+
+    CloudLayer {
+        bind_group,
+        uniform_buffer,
+        uniform_bind_group,
+        vertex_buffer,
+        index_buffer,
+        index_count: indices.len() as u32,
+    }
+}
+
+fn build_cloud_grid_mesh() -> (Vec<CloudVertex>, Vec<u32>) {
+    let extent = CLOUD_GRID_RADIUS_TILES as f32 * CLOUD_TILE_SIZE;
+    let tiles_per_axis = CLOUD_GRID_RADIUS_TILES * 2;
+    let mut vertices = Vec::with_capacity((tiles_per_axis * tiles_per_axis * 4) as usize);
+    let mut indices = Vec::with_capacity((tiles_per_axis * tiles_per_axis * 6) as usize);
+
+    for z in 0..tiles_per_axis {
+        for x in 0..tiles_per_axis {
+            let x0 = -extent + x as f32 * CLOUD_TILE_SIZE;
+            let z0 = -extent + z as f32 * CLOUD_TILE_SIZE;
+            let x1 = x0 + CLOUD_TILE_SIZE;
+            let z1 = z0 + CLOUD_TILE_SIZE;
+            let base = vertices.len() as u32;
+            vertices.push(CloudVertex {
+                local_pos: [x0, z0],
+            });
+            vertices.push(CloudVertex {
+                local_pos: [x1, z0],
+            });
+            vertices.push(CloudVertex {
+                local_pos: [x1, z1],
+            });
+            vertices.push(CloudVertex {
+                local_pos: [x0, z1],
+            });
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+
+    (vertices, indices)
+}
+
+fn create_terrain_atlas(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
     atlas_path: &Path,
-) -> wgpu::BindGroup {
-    let (width, height, atlas_rgba) = load_terrain_atlas_rgba(atlas_path);
+) -> TerrainAtlas {
+    let (width, height, mut atlas_rgba) = load_terrain_atlas_rgba(atlas_path);
+    let mut water_top = WaterSpriteAnimator::new(false, 0x43D1_2F5B);
+    let mut water_side = WaterSpriteAnimator::new(true, 0x91B3_07C9);
+    let initial_top_tile = water_top.tick();
+    let initial_side_tile = water_side.tick();
+    patch_procedural_tiles(
+        &mut atlas_rgba,
+        width,
+        &initial_top_tile,
+        &initial_side_tile,
+    );
     let texture_size = wgpu::Extent3d {
         width,
         height,
@@ -1318,7 +1949,7 @@ fn create_terrain_bind_group(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1351,7 +1982,7 @@ fn create_terrain_bind_group(
         ..Default::default()
     });
 
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("thingcraft-terrain-bind-group"),
         layout,
         entries: &[
@@ -1364,7 +1995,14 @@ fn create_terrain_bind_group(
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
         ],
-    })
+    });
+
+    TerrainAtlas {
+        bind_group,
+        texture,
+        water_top,
+        water_side,
+    }
 }
 
 fn load_terrain_atlas_rgba(atlas_path: &Path) -> (u32, u32, Vec<u8>) {
@@ -1398,6 +2036,210 @@ fn load_terrain_atlas_rgba(atlas_path: &Path) -> (u32, u32, Vec<u8>) {
     fallback()
 }
 
+fn load_png_rgba(path: &Path) -> (u32, u32, Vec<u8>) {
+    let fallback = || {
+        (
+            2,
+            2,
+            vec![
+                255, 255, 255, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0,
+            ],
+        )
+    };
+
+    let candidate_paths = [path.to_path_buf(), Path::new("..").join(path)];
+    for candidate in candidate_paths {
+        let bytes = match std::fs::read(&candidate) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+
+        let image = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) {
+            Ok(image) => image,
+            Err(_) => continue,
+        };
+
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        return (width, height, rgba.into_raw());
+    }
+
+    fallback()
+}
+
+// ---------------------------------------------------------------------------
+// Procedural tile generation — MC Alpha generates water & lava textures at
+// runtime via DynamicTexture sprites. Water top/side here are updated every
+// frame using the original CA formulas. Lava remains a static approximation.
+// ---------------------------------------------------------------------------
+
+const TILE_PX: u32 = 16;
+const WATER_TOP_SPRITE: u16 = 205;
+const WATER_SIDE_SPRITE: u16 = 206;
+const LAVA_TOP_SPRITE: u16 = 237;
+const LAVA_SIDE_SPRITE: u16 = 238;
+
+/// Deterministic hash → f32 in [0, 1].
+fn hash_f32(x: u32, y: u32, seed: u32) -> f32 {
+    let mut h = x
+        .wrapping_mul(374_761_393)
+        .wrapping_add(y.wrapping_mul(668_265_263))
+        .wrapping_add(seed.wrapping_mul(1_013_904_223));
+    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+    h ^= h >> 16;
+    (h & 0xFFFF) as f32 / 65535.0
+}
+
+/// Cellular-automaton heat diffusion on a 16×16 torus, then normalise to
+/// the full [0, 1] range so the colour mapping gets maximum contrast.
+fn diffused_noise(seed: u32, iterations: u32) -> [[f32; 16]; 16] {
+    let mut grid = [[0.0_f32; 16]; 16];
+    for y in 0..16_u32 {
+        for x in 0..16_u32 {
+            grid[y as usize][x as usize] = hash_f32(x, y, seed);
+        }
+    }
+    for _ in 0..iterations {
+        let prev = grid;
+        for y in 0..16_usize {
+            for x in 0..16_usize {
+                let sum = prev[(y + 15) % 16][x]
+                    + prev[(y + 1) % 16][x]
+                    + prev[y][(x + 15) % 16]
+                    + prev[y][(x + 1) % 16];
+                grid[y][x] = (prev[y][x] + sum) / 5.0;
+            }
+        }
+    }
+    // Normalise to [0, 1].
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for row in &grid {
+        for &v in row {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    let span = (hi - lo).max(1e-6);
+    for row in &mut grid {
+        for v in row {
+            *v = (*v - lo) / span;
+        }
+    }
+    grid
+}
+
+/// Approximate one frame of MC Alpha's `LavaSprite`.
+/// Colour formula (sRGB): R = 155 + v·100, G = v²·170, B = v⁴·128, A = 255.
+fn generate_lava_tile() -> [u8; 1024] {
+    let grid = diffused_noise(137, 4);
+    let mut px = [0_u8; 1024];
+    for (y, row) in grid.iter().enumerate() {
+        for (x, &v) in row.iter().enumerate() {
+            let i = (y * 16 + x) * 4;
+            px[i] = (155.0 + v * 100.0) as u8;
+            px[i + 1] = (v * v * 170.0) as u8;
+            px[i + 2] = (v * v * v * v * 128.0) as u8;
+            px[i + 3] = 255;
+        }
+    }
+    px
+}
+
+/// Write a 16×16 RGBA tile into the atlas buffer at the given sprite index.
+fn blit_tile(atlas: &mut [u8], atlas_width: u32, sprite: u16, tile: &[u8; 1024]) {
+    let col = u32::from(sprite % 16);
+    let row = u32::from(sprite / 16);
+    let stride = atlas_width * 4;
+    for ty in 0..TILE_PX {
+        for tx in 0..TILE_PX {
+            let ax = col * TILE_PX + tx;
+            let ay = row * TILE_PX + ty;
+            let ai = (ay * stride + ax * 4) as usize;
+            let ti = ((ty * TILE_PX + tx) * 4) as usize;
+            atlas[ai..ai + 4].copy_from_slice(&tile[ti..ti + 4]);
+        }
+    }
+}
+
+fn blit_tile_replicated(
+    atlas: &mut [u8],
+    atlas_width: u32,
+    sprite: u16,
+    replicate: u32,
+    tile: &[u8; 1024],
+) {
+    let base_col = u32::from(sprite % 16);
+    let base_row = u32::from(sprite / 16);
+    for ry in 0..replicate {
+        for rx in 0..replicate {
+            if base_col + rx >= 16 || base_row + ry >= 16 {
+                continue;
+            }
+            let replicated_sprite = ((base_row + ry) * 16 + (base_col + rx)) as u16;
+            blit_tile(atlas, atlas_width, replicated_sprite, tile);
+        }
+    }
+}
+
+/// Patch placeholder tiles with procedurally generated water & lava textures.
+fn patch_procedural_tiles(
+    atlas: &mut [u8],
+    atlas_width: u32,
+    water_top_tile: &[u8; 1024],
+    water_side_tile: &[u8; 1024],
+) {
+    let lava_tile = generate_lava_tile();
+    blit_tile(atlas, atlas_width, WATER_TOP_SPRITE, water_top_tile);
+    blit_tile_replicated(atlas, atlas_width, WATER_SIDE_SPRITE, 2, water_side_tile);
+    blit_tile(atlas, atlas_width, LAVA_TOP_SPRITE, &lava_tile);
+    blit_tile_replicated(atlas, atlas_width, LAVA_SIDE_SPRITE, 2, &lava_tile);
+}
+
+fn upload_dynamic_sprite(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    sprite: u16,
+    replicate: u32,
+    tile: &[u8; 1024],
+) {
+    let base_col = u32::from(sprite % 16);
+    let base_row = u32::from(sprite / 16);
+    for ry in 0..replicate {
+        for rx in 0..replicate {
+            if base_col + rx >= 16 || base_row + ry >= 16 {
+                continue;
+            }
+            let replicated_sprite = ((base_row + ry) * 16 + (base_col + rx)) as u16;
+            let col = u32::from(replicated_sprite % 16);
+            let row = u32::from(replicated_sprite / 16);
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: col * TILE_PX,
+                        y: row * TILE_PX,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                tile,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * TILE_PX),
+                    rows_per_image: Some(TILE_PX),
+                },
+                wgpu::Extent3d {
+                    width: TILE_PX,
+                    height: TILE_PX,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+}
+
 const CHUNK_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -1405,6 +2247,9 @@ struct Camera {
     fog_start: f32,
     fog_color: vec3<f32>,
     fog_end: f32,
+    ambient_darkness: f32,
+    daylight_factor: f32,
+    _pad: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -1419,14 +2264,18 @@ var terrain_sampler: sampler;
 struct VertexIn {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
-    @location(2) light: vec4<f32>,
+    @location(2) tint: vec4<f32>,
+    @location(3) light_data: vec4<u32>,
 };
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) light: vec4<f32>,
-    @location(2) world_pos: vec3<f32>,
+    @location(1) tint: vec4<f32>,
+    @location(2) sky_light: f32,
+    @location(3) block_light: f32,
+    @location(4) face_scale: f32,
+    @location(5) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -1434,9 +2283,19 @@ fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
     out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
     out.uv = input.uv;
-    out.light = input.light;
+    out.tint = input.tint;
+    out.sky_light = f32(input.light_data.x);
+    out.block_light = f32(input.light_data.y);
+    out.face_scale = f32(input.light_data.z) / 255.0;
     out.world_pos = input.position;
     return out;
+}
+
+fn alpha_brightness(level: f32) -> f32 {
+    let min_brightness = 0.05;
+    let clamped = clamp(level, 0.0, 15.0);
+    let g = 1.0 - clamped / 15.0;
+    return ((1.0 - g) / (g * 3.0 + 1.0)) * (1.0 - min_brightness) + min_brightness;
 }
 
 @fragment
@@ -1445,12 +2304,107 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (texel.a <= 0.1) {
         discard;
     }
-    let lit = texel.rgb * input.light.rgb;
-    let alpha = texel.a * input.light.a;
+    let day_sky = max(input.sky_light - camera.ambient_darkness, 0.0);
+    let effective = max(input.block_light, day_sky);
+    let brightness = alpha_brightness(effective);
+    let shade = input.face_scale * brightness;
+    let lit = texel.rgb * input.tint.rgb * shade;
+    let alpha = texel.a * input.tint.a;
     let distance_to_camera = distance(input.world_pos, camera.camera_pos);
     let fog_span = max(camera.fog_end - camera.fog_start, 0.0001);
     let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
     let color = mix(lit, camera.fog_color, fog_t);
+    return vec4<f32>(color, alpha);
+}
+"#;
+
+const SKY_SHADER: &str = r#"
+struct Sky {
+    color: vec3<f32>,
+    _pad: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> sky: Sky;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    return vec4<f32>(pos[vertex_index], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(sky.color, 1.0);
+}
+"#;
+
+const CLOUD_SHADER: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    fog_start: f32,
+    fog_color: vec3<f32>,
+    fog_end: f32,
+    ambient_darkness: f32,
+    daylight_factor: f32,
+    _pad: vec2<f32>,
+};
+
+struct Cloud {
+    origin: vec3<f32>,
+    alpha: f32,
+    uv_offset: vec2<f32>,
+    _pad0: vec2<f32>,
+    color: vec3<f32>,
+    _pad1: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+@group(1) @binding(0)
+var cloud_texture: texture_2d<f32>;
+
+@group(1) @binding(1)
+var cloud_sampler: sampler;
+
+@group(2) @binding(0)
+var<uniform> cloud: Cloud;
+
+struct VertexIn {
+    @location(0) local_pos: vec2<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) world_pos: vec3<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    let world_pos = vec3<f32>(input.local_pos.x + cloud.origin.x, cloud.origin.y, input.local_pos.y + cloud.origin.z);
+    out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    out.uv = world_pos.xz * 0.00048828125 + cloud.uv_offset;
+    out.world_pos = world_pos;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(cloud_texture, cloud_sampler, input.uv);
+    let alpha = texel.a * cloud.alpha;
+    let base = texel.rgb * cloud.color;
+    let distance_to_camera = distance(input.world_pos, camera.camera_pos);
+    let fog_span = max(camera.fog_end - camera.fog_start, 0.0001);
+    let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
+    let color = mix(base, camera.fog_color, fog_t);
     return vec4<f32>(color, alpha);
 }
 "#;
