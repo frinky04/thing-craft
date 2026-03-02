@@ -30,7 +30,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - Block and sky light channels use nibble storage (`4-bit` packed values).
 - A deterministic Overworld generator uses biome climate sampling + terrain noise to create startup chunks.
 - A CPU chunk mesher generates indexed triangle geometry with face-culling and atlas UVs (including face-aware texture selection from the block registry).
-- Vertex color modulation is currently used as a lightweight tint path (grass top uses a fixed bootstrap tint; dynamic biome tinting remains pending).
+- Vertex color modulation is used as the tint path; grass top tint is generated per column from biome temperature/downfall and sampled through Alpha `misc/grasscolor.png` (with a fallback map when unavailable).
 - Region meshing performs neighbor-aware culling across chunk boundaries so interior shared faces are not emitted.
 - Bootstrap startup currently pre-generates a small region (`3x3` chunks) and builds one combined region mesh for first render.
 - The renderer owns GPU buffers/pipeline and draws chunk mesh indices each frame using camera view-projection uniforms and the Alpha terrain atlas texture.

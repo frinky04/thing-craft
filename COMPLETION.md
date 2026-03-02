@@ -18,7 +18,7 @@
 - [x] Terrain atlas loader now resolves from both repo root and crate-local working directories.
 - [x] Region meshing now culls hidden faces across chunk boundaries (not just within individual chunks).
 - [x] Face-aware atlas sampling added for grass (top/bottom/side textures now differ as in Alpha).
-- [x] Grass top now applies color tint modulation (biome-tint pipeline stub; fixed bootstrap tint value for now).
+- [x] Grass top now uses biome-driven tint sampled from Alpha `misc/grasscolor.png` (with fallback if missing).
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
 
