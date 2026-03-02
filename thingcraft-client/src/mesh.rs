@@ -272,11 +272,13 @@ fn append_face(
     ];
 
     let base_index = mesh.vertices.len() as u32;
+    let shade = face_shade(face.offset);
+    let shaded_tint = apply_shade(tint_rgb, shade);
     for (corner, tex) in face.corners.iter().zip(uv.iter()) {
         mesh.vertices.push(MeshVertex {
             position: [base_x + corner[0], base_y + corner[1], base_z + corner[2]],
             uv: *tex,
-            light_rgba: [tint_rgb[0], tint_rgb[1], tint_rgb[2], u8::MAX],
+            light_rgba: [shaded_tint[0], shaded_tint[1], shaded_tint[2], u8::MAX],
         });
     }
 
@@ -288,6 +290,26 @@ fn append_face(
         base_index + 2,
         base_index + 3,
     ]);
+}
+
+fn face_shade(face_offset: [i32; 3]) -> u8 {
+    if face_offset[1] > 0 {
+        255
+    } else if face_offset[1] < 0 {
+        128
+    } else if face_offset[2] != 0 {
+        204
+    } else {
+        153
+    }
+}
+
+fn apply_shade(rgb: [u8; 3], shade: u8) -> [u8; 3] {
+    [
+        ((u16::from(rgb[0]) * u16::from(shade)) / 255) as u8,
+        ((u16::from(rgb[1]) * u16::from(shade)) / 255) as u8,
+        ((u16::from(rgb[2]) * u16::from(shade)) / 255) as u8,
+    ]
 }
 
 #[cfg(test)]
@@ -413,5 +435,15 @@ mod tests {
             );
             assert!(normal.dot(outward) > 0.99);
         }
+    }
+
+    #[test]
+    fn directional_face_shading_matches_alpha_profile() {
+        assert_eq!(face_shade([0, 1, 0]), 255);
+        assert_eq!(face_shade([0, -1, 0]), 128);
+        assert_eq!(face_shade([0, 0, 1]), 204);
+        assert_eq!(face_shade([0, 0, -1]), 204);
+        assert_eq!(face_shade([1, 0, 0]), 153);
+        assert_eq!(face_shade([-1, 0, 0]), 153);
     }
 }
