@@ -17,6 +17,7 @@
 - [x] Camera strafe basis and chunk `+Z/-Z` face winding corrected; side-face culling is now consistent.
 - [x] Terrain atlas loader now resolves from both repo root and crate-local working directories.
 - [x] Region meshing now culls hidden faces across chunk boundaries (not just within individual chunks).
+- [x] Face-aware atlas sampling added for grass (top/bottom/side textures now differ as in Alpha).
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
 
