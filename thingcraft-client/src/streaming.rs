@@ -353,6 +353,7 @@ impl ChunkStreamer {
             .filter_map(|(pos, entry)| {
                 if entry.state == ChunkResidencyState::Meshing
                     && entry.chunk.is_some()
+                    && entry.dirty.geometry
                     && !self.meshing_in_flight.contains(pos)
                     && self.required.contains(pos)
                 {
@@ -406,6 +407,9 @@ impl ChunkStreamer {
             {
                 break;
             }
+            if let Some(slot) = self.slots.get_mut(&pos) {
+                slot.dirty.geometry = false;
+            }
             self.meshing_in_flight.insert(pos);
         }
     }
@@ -446,9 +450,12 @@ impl ChunkStreamer {
 
                     if let Some(slot) = self.slots.get_mut(&result.pos) {
                         slot.chunk = Some(result.chunk);
-                        slot.dirty.geometry = false;
                         slot.mesh = Some(result.mesh);
-                        slot.state = ChunkResidencyState::Ready;
+                        slot.state = if slot.dirty.geometry {
+                            ChunkResidencyState::Meshing
+                        } else {
+                            ChunkResidencyState::Ready
+                        };
                         self.mesh_dirty = true;
                         if let Some(mesh) = &slot.mesh {
                             self.render_updates.push(RenderMeshUpdate::Upsert {
