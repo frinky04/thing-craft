@@ -16,6 +16,14 @@ use crate::streaming::{world_pos_to_chunk_pos, ChunkStreamer, ResidencyConfig};
 use crate::time_step::FixedStepClock;
 use crate::world::{BootstrapWorld, ChunkPos};
 
+const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
+    "wgpu_core=warn",
+    "wgpu_hal=warn",
+    "naga=warn",
+    "ash=warn",
+    "calloop=warn",
+];
+
 #[derive(Debug, Default)]
 struct LoopStats {
     frame_count: u64,
@@ -74,7 +82,7 @@ impl LoopStats {
 
 pub fn run() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(build_env_filter())
         .init();
 
     let event_loop = EventLoop::new()?;
@@ -291,5 +299,54 @@ fn set_mouse_capture(window: &Window, captured: bool) {
         }
     } else if let Err(err) = window.set_cursor_grab(CursorGrabMode::None) {
         warn!(?err, "failed to release cursor");
+    }
+}
+
+fn build_env_filter() -> tracing_subscriber::EnvFilter {
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,thingcraft_client=debug"));
+
+    for directive in NOISY_LOG_TARGET_DEFAULTS {
+        let target = directive.split('=').next().unwrap_or_default();
+        let has_explicit_target = rust_log
+            .as_deref()
+            .is_some_and(|value| has_target_directive(value, target));
+        if has_explicit_target {
+            continue;
+        }
+
+        if let Ok(parsed) = directive.parse() {
+            filter = filter.add_directive(parsed);
+        }
+    }
+
+    filter
+}
+
+fn has_target_directive(env_filter: &str, target: &str) -> bool {
+    env_filter.split(',').map(str::trim).any(|directive| {
+        directive == target
+            || directive
+                .strip_prefix(target)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_target_directive;
+
+    #[test]
+    fn detects_target_directives_exactly() {
+        assert!(has_target_directive(
+            "thingcraft_client=debug,wgpu_core=trace",
+            "wgpu_core"
+        ));
+        assert!(has_target_directive("wgpu_hal=debug", "wgpu_hal"));
+        assert!(!has_target_directive(
+            "thingcraft_client=debug,wgpu=info",
+            "wgpu_core"
+        ));
     }
 }

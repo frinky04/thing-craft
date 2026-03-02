@@ -24,6 +24,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p thingcraft-client
 ```
 
+For debug runtime stats without `wgpu` internals flooding output:
+
+```bash
+RUST_LOG=debug cargo run -p thingcraft-client
+```
+
 ## Controls
 
 - `W/A/S/D`: Move horizontally
