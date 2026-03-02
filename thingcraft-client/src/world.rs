@@ -492,6 +492,15 @@ impl BlockRegistry {
     }
 
     #[must_use]
+    pub fn face_tint_rgb(&self, block_id: u8, face_offset: [i32; 3]) -> [u8; 3] {
+        match (block_id, face_offset[1]) {
+            // Alpha grass-top is biome-tinted in the original client.
+            (GRASS_ID, 1) => [126, 201, 86],
+            _ => [u8::MAX, u8::MAX, u8::MAX],
+        }
+    }
+
+    #[must_use]
     pub fn is_defined_block(&self, block_id: u8) -> bool {
         self.get(block_id).is_some()
     }
@@ -1005,6 +1014,16 @@ mod tests {
         assert_eq!(registry.sprite_index_for_face(GRASS_ID, [0, 1, 0]), 0);
         assert_eq!(registry.sprite_index_for_face(GRASS_ID, [0, -1, 0]), 2);
         assert_eq!(registry.sprite_index_for_face(GRASS_ID, [1, 0, 0]), 3);
+    }
+
+    #[test]
+    fn grass_top_face_has_green_tint() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert_eq!(registry.face_tint_rgb(GRASS_ID, [0, 1, 0]), [126, 201, 86]);
+        assert_eq!(
+            registry.face_tint_rgb(STONE_ID, [0, 1, 0]),
+            [u8::MAX, u8::MAX, u8::MAX]
+        );
     }
 
     #[test]

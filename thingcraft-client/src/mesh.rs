@@ -165,7 +165,7 @@ where
                         local_z as f32 + chunk_origin_z,
                         face,
                         registry.sprite_index_for_face(block_id, face.offset),
-                        registry.emitted_light_of(block_id),
+                        registry.face_tint_rgb(block_id, face.offset),
                     );
                 }
             }
@@ -237,7 +237,7 @@ fn append_face(
     base_z: f32,
     face: FaceDef,
     sprite_index: u16,
-    emitted_light: u8,
+    tint_rgb: [u8; 3],
 ) {
     let atlas_tile = 1.0 / 16.0;
     let sprite_x = f32::from(sprite_index % 16) * atlas_tile;
@@ -251,11 +251,10 @@ fn append_face(
 
     let base_index = mesh.vertices.len() as u32;
     for (corner, tex) in face.corners.iter().zip(uv.iter()) {
-        let light = emitted_light.saturating_mul(17);
         mesh.vertices.push(MeshVertex {
             position: [base_x + corner[0], base_y + corner[1], base_z + corner[2]],
             uv: *tex,
-            light_rgba: [light, light, light, u8::MAX],
+            light_rgba: [tint_rgb[0], tint_rgb[1], tint_rgb[2], u8::MAX],
         });
     }
 
