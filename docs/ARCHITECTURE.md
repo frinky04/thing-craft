@@ -29,6 +29,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
   - `(x << 11) | (z << 7) | y`
 - Block and sky light channels use nibble storage (`4-bit` packed values).
 - A deterministic Overworld generator uses biome climate sampling + terrain noise to create startup chunks.
+- A CPU chunk mesher generates indexed triangle geometry with face-culling and atlas UVs.
 
 ## Networking-Ready Input Pattern
 

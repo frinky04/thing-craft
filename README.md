@@ -12,6 +12,7 @@ The repository currently includes a bootstrap client with:
 - Transform interpolation for smooth rendering when simulation cadence differs from frame cadence
 - Alpha-derived block registry and chunk core model (`16x16x128`, nibble light storage)
 - Deterministic Overworld chunk bootstrap with Alpha climate thresholds and waterline targeting `Y=64`
+- CPU chunk mesher with face culling + terrain atlas UV assignment (geometry generation path)
 
 ## Development Commands
 

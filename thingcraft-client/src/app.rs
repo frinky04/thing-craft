@@ -10,6 +10,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
 use crate::ecs::EcsRuntime;
+use crate::mesh::build_chunk_mesh;
 use crate::renderer::{RenderError, Renderer};
 use crate::time_step::FixedStepClock;
 use crate::world::BootstrapWorld;
@@ -90,6 +91,7 @@ pub fn run() -> Result<()> {
     let fixed_config = ecs_runtime.fixed_tick_config();
     let mut fixed_clock = FixedStepClock::new(fixed_config.tick_hz, fixed_config.max_catchup_steps);
     let bootstrap_world = BootstrapWorld::alpha_bootstrap();
+    let spawn_mesh = build_chunk_mesh(&bootstrap_world.spawn_chunk, &bootstrap_world.registry);
 
     let mut last_frame_start = Instant::now();
     let mut loop_stats = LoopStats::default();
@@ -103,6 +105,8 @@ pub fn run() -> Result<()> {
         spawn_chunk_x = bootstrap_world.spawn_chunk.pos.x,
         spawn_chunk_z = bootstrap_world.spawn_chunk.pos.z,
         center_height = bootstrap_world.spawn_chunk.height_at(8, 8),
+        spawn_mesh_vertices = spawn_mesh.vertices.len(),
+        spawn_mesh_indices = spawn_mesh.indices.len(),
         "thingcraft client booted"
     );
 

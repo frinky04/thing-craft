@@ -478,6 +478,22 @@ impl BlockRegistry {
     }
 
     #[must_use]
+    pub fn sprite_index_of(&self, block_id: u8) -> u16 {
+        self.get(block_id).map_or(0, |block| block.sprite_index)
+    }
+
+    #[must_use]
+    pub fn is_defined_block(&self, block_id: u8) -> bool {
+        self.get(block_id).is_some()
+    }
+
+    #[must_use]
+    pub fn is_face_occluder(&self, block_id: u8) -> bool {
+        self.get(block_id)
+            .is_some_and(|block| block.solid && block.opacity == 255)
+    }
+
+    #[must_use]
     pub fn defined_block_count(&self) -> usize {
         self.by_id.iter().filter(|block| block.is_some()).count()
     }

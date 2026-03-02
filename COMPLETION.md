@@ -9,6 +9,7 @@
 - [x] Alpha-derived block registry skeleton added (with explicit Alpha-excluded block IDs).
 - [x] Chunk core storage model added (`16x16x128`, nibble light channels, Alpha index layout).
 - [x] Deterministic biome climate sampler and overworld startup chunk generator scaffold added.
+- [x] CPU chunk meshing scaffold added (face culling + atlas UV generation).
 - [x] Reference tracking doc added (`docs/REFERENCES.md`) for copied constants/behaviors.
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
