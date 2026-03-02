@@ -30,7 +30,7 @@ const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
 const APPLY_STREAM_UPDATES_TO_RENDERER: bool = true;
 const BLOCK_INTERACTION_REACH_BLOCKS: f64 = 5.0;
 const AIR_BLOCK_ID: u8 = 0;
-const DEFAULT_PLACE_BLOCK_ID: u8 = 3;
+const HOTBAR_BLOCK_IDS: [u8; 9] = [3, 1, 4, 12, 13, 17, 5, 20, 50];
 const EDIT_LATENCY_SAMPLE_WINDOW: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
@@ -220,6 +220,7 @@ pub fn run() -> Result<()> {
     let mut mouse_captured = false;
     let mut block_interaction_requests = VecDeque::new();
     let mut edit_latency_tracker = EditLatencyTracker::default();
+    let mut selected_place_block_id = HOTBAR_BLOCK_IDS[0];
 
     info!(
         tick_hz = fixed_config.tick_hz,
@@ -236,6 +237,8 @@ pub fn run() -> Result<()> {
         stream_gen_budget = residency_config.max_generation_dispatch,
         stream_light_budget = residency_config.max_lighting_dispatch,
         stream_mesh_budget = residency_config.max_meshing_dispatch,
+        selected_hotbar_slot = 1,
+        selected_place_block = selected_place_block_id,
         "thingcraft client booted"
     );
 
@@ -396,6 +399,31 @@ pub fn run() -> Result<()> {
                         let is_pressed = event.state == ElementState::Pressed;
                         ecs_runtime.handle_key(code, is_pressed);
 
+                        if is_pressed && !event.repeat {
+                            if let Some(slot) = hotbar_slot_for_key(code) {
+                                let block_id = HOTBAR_BLOCK_IDS[slot];
+                                if bootstrap_world.registry.is_defined_block(block_id) {
+                                    selected_place_block_id = block_id;
+                                    let block_name = bootstrap_world
+                                        .registry
+                                        .get(block_id)
+                                        .map_or("unknown", |block| block.name);
+                                    info!(
+                                        hotbar_slot = slot + 1,
+                                        place_block_id = selected_place_block_id,
+                                        place_block_name = block_name,
+                                        "updated selected placement block"
+                                    );
+                                } else {
+                                    warn!(
+                                        hotbar_slot = slot + 1,
+                                        place_block_id = block_id,
+                                        "hotbar slot points to undefined block id; selection ignored"
+                                    );
+                                }
+                            }
+                        }
+
                         if code == KeyCode::KeyB && is_pressed && !event.repeat {
                             let enabled = !renderer.chunk_border_debug_enabled();
                             renderer.set_chunk_border_debug(enabled);
@@ -436,7 +464,7 @@ pub fn run() -> Result<()> {
                         &mut ecs_runtime,
                         &mut block_interaction_requests,
                         BlockInteractionKind::Place {
-                            block_id: DEFAULT_PLACE_BLOCK_ID,
+                            block_id: selected_place_block_id,
                         },
                     );
                 }
@@ -586,6 +614,21 @@ fn affected_chunks_for_block_edit(world_x: i32, world_z: i32) -> Vec<ChunkPos> {
     }
 
     affected
+}
+
+fn hotbar_slot_for_key(code: KeyCode) -> Option<usize> {
+    match code {
+        KeyCode::Digit1 => Some(0),
+        KeyCode::Digit2 => Some(1),
+        KeyCode::Digit3 => Some(2),
+        KeyCode::Digit4 => Some(3),
+        KeyCode::Digit5 => Some(4),
+        KeyCode::Digit6 => Some(5),
+        KeyCode::Digit7 => Some(6),
+        KeyCode::Digit8 => Some(7),
+        KeyCode::Digit9 => Some(8),
+        _ => None,
+    }
 }
 
 fn raycast_first_solid_block<F>(
@@ -780,12 +823,13 @@ fn parse_env_u32(key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use glam::DVec3;
+    use winit::keyboard::KeyCode;
 
     use super::{
-        affected_chunks_for_block_edit, has_target_directive, parse_env_u32,
-        raycast_first_solid_block, BlockRayHit, AIR_BLOCK_ID,
+        affected_chunks_for_block_edit, has_target_directive, hotbar_slot_for_key, parse_env_u32,
+        raycast_first_solid_block, BlockRayHit, AIR_BLOCK_ID, HOTBAR_BLOCK_IDS,
     };
-    use crate::world::{ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
+    use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
 
     #[test]
     fn detects_target_directives_exactly() {
@@ -823,6 +867,23 @@ mod tests {
             affected_chunks_for_block_edit(2, edge_z),
             vec![ChunkPos { x: 0, z: 0 }, ChunkPos { x: 0, z: 1 }]
         );
+    }
+
+    #[test]
+    fn hotbar_digit_keys_map_to_expected_slots() {
+        assert_eq!(hotbar_slot_for_key(KeyCode::Digit1), Some(0));
+        assert_eq!(hotbar_slot_for_key(KeyCode::Digit5), Some(4));
+        assert_eq!(hotbar_slot_for_key(KeyCode::Digit9), Some(8));
+        assert_eq!(hotbar_slot_for_key(KeyCode::KeyB), None);
+    }
+
+    #[test]
+    fn hotbar_blocks_are_defined_in_alpha_registry() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert_eq!(HOTBAR_BLOCK_IDS.len(), 9);
+        for block_id in HOTBAR_BLOCK_IDS {
+            assert!(registry.is_defined_block(block_id));
+        }
     }
 
     #[test]

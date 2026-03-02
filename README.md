@@ -43,6 +43,7 @@ THINGCRAFT_VIEW_RADIUS=5 THINGCRAFT_GEN_BUDGET=12 THINGCRAFT_LIGHT_BUDGET=12 THI
 - Mouse movement (after click): Look
 - Left click: Capture cursor (first click), then break targeted block
 - Right click (while captured): Place block on targeted face
+- `1`..`9`: Select hotbar placement block (slot 9 is torch)
 - `Escape`: Release cursor
 - `F`: Toggle fly mode
 - `B`: Toggle chunk border debug overlay

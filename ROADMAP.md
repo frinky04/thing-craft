@@ -9,6 +9,7 @@
 - M4 complete: deterministic biome/climate fields, surface terrain, cave carving (Alpha worm algorithm), ore vein placement (7 ore types), and dungeon stubs implemented.
 - M5 complete: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, fixed-tick block interaction requests (raycast break/place + dirty remesh propagation), per-edit column height/light refresh, and renderer frustum culling are implemented.
 - M6 complete: async lighting worker lane plus Alpha-style rendered light integration are validated end-to-end (bounded dispatch, queue-based sky/block propagation, stale-result dropping, boundary-scoped neighbor invalidation, urgent edit relight/remesh lanes, neighbor-lighting-stable meshing, and brightness-table-based face shading from propagated light).
+- M7 in progress: Wave 1 started with hotbar-driven block placement (`1..9`) and torch placement wired through runtime relight/remesh propagation.
 
 ## M0 - Repository Foundation
 

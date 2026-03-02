@@ -1623,6 +1623,79 @@ mod tests {
     }
 
     #[test]
+    fn placing_torch_relights_chunk_with_emitted_light() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry.clone(),
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 2,
+                max_lighting_dispatch: 2,
+                max_meshing_dispatch: 2,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            let metrics = streamer.metrics();
+            if metrics.ready == 1
+                && metrics.in_flight_lighting == 0
+                && metrics.in_flight_meshing == 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(streamer.metrics().ready, 1);
+
+        let mut place_target = None;
+        for y in 1..(CHUNK_HEIGHT as i32 - 1) {
+            if streamer.block_at_world(8, y, 8) == Some(0)
+                && streamer
+                    .block_at_world(8, y - 1, 8)
+                    .is_some_and(|block| block != 0)
+            {
+                place_target = Some((8, y, 8));
+                break;
+            }
+        }
+        let (x, y, z) = place_target.expect("expected an air block above solid support");
+        assert!(streamer.set_block_at_world(x, y, z, 50));
+
+        for _ in 0..500 {
+            streamer.tick(center);
+            let metrics = streamer.metrics();
+            if metrics.in_flight_lighting == 0
+                && metrics.in_flight_meshing == 0
+                && streamer
+                    .slots
+                    .get(&center)
+                    .is_some_and(|slot| !slot.dirty.lighting)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let (_, local_x, local_z) = world_block_to_chunk_pos_and_local(x, z);
+        let center_slot = streamer
+            .slots
+            .get(&center)
+            .expect("center slot should exist");
+        let center_chunk = center_slot
+            .chunk
+            .as_ref()
+            .expect("center chunk should exist");
+        assert_eq!(center_chunk.block(local_x, y as u8, local_z), 50);
+        assert_eq!(
+            center_chunk.block_light(local_x, y as u8, local_z),
+            registry.emitted_light_of(50)
+        );
+    }
+
+    #[test]
     fn in_flight_meshing_result_does_not_overwrite_block_edits() {
         let registry = BlockRegistry::alpha_1_2_6();
         let mut streamer = ChunkStreamer::new(
