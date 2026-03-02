@@ -44,6 +44,8 @@ pub struct ResidencyMetrics {
     pub meshing: usize,
     pub ready: usize,
     pub evicting: usize,
+    pub dirty_chunks: usize,
+    pub remesh_enqueued: u64,
     pub total: usize,
     pub in_flight_generation: usize,
     pub in_flight_meshing: usize,
@@ -58,8 +60,15 @@ pub enum RenderMeshUpdate {
 #[derive(Debug)]
 struct ChunkResidencyEntry {
     state: ChunkResidencyState,
+    dirty: ChunkDirtyFlags,
     chunk: Option<ChunkData>,
     mesh: Option<ChunkMesh>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ChunkDirtyFlags {
+    geometry: bool,
+    lighting: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +110,7 @@ pub struct ChunkStreamer {
     generation_thread: Option<thread::JoinHandle<()>>,
     meshing_thread: Option<thread::JoinHandle<()>>,
     mesh_dirty: bool,
+    remesh_enqueued_total: u64,
     render_updates: Vec<RenderMeshUpdate>,
 }
 
@@ -170,6 +180,7 @@ impl ChunkStreamer {
             generation_thread: Some(generation_thread),
             meshing_thread: Some(meshing_thread),
             mesh_dirty: true,
+            remesh_enqueued_total: 0,
             render_updates: Vec::new(),
         }
     }
@@ -192,12 +203,50 @@ impl ChunkStreamer {
         mem::take(&mut self.render_updates)
     }
 
+    pub fn mark_chunk_geometry_dirty(&mut self, pos: ChunkPos) {
+        self.enqueue_geometry_remesh(pos);
+    }
+
+    #[cfg(test)]
+    pub fn mark_block_geometry_dirty(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
+        if usize::from(local_x) >= CHUNK_WIDTH || usize::from(local_z) >= CHUNK_DEPTH {
+            return;
+        }
+
+        self.enqueue_geometry_remesh(pos);
+        if local_x == 0 {
+            self.enqueue_geometry_remesh(ChunkPos {
+                x: pos.x - 1,
+                z: pos.z,
+            });
+        }
+        if local_x == (CHUNK_WIDTH as u8 - 1) {
+            self.enqueue_geometry_remesh(ChunkPos {
+                x: pos.x + 1,
+                z: pos.z,
+            });
+        }
+        if local_z == 0 {
+            self.enqueue_geometry_remesh(ChunkPos {
+                x: pos.x,
+                z: pos.z - 1,
+            });
+        }
+        if local_z == (CHUNK_DEPTH as u8 - 1) {
+            self.enqueue_geometry_remesh(ChunkPos {
+                x: pos.x,
+                z: pos.z + 1,
+            });
+        }
+    }
+
     #[must_use]
     pub fn metrics(&self) -> ResidencyMetrics {
         let mut metrics = ResidencyMetrics {
             total: self.slots.len(),
             in_flight_generation: self.generation_in_flight.len(),
             in_flight_meshing: self.meshing_in_flight.len(),
+            remesh_enqueued: self.remesh_enqueued_total,
             ..Default::default()
         };
 
@@ -208,6 +257,9 @@ impl ChunkStreamer {
                 ChunkResidencyState::Meshing => metrics.meshing += 1,
                 ChunkResidencyState::Ready => metrics.ready += 1,
                 ChunkResidencyState::Evicting => metrics.evicting += 1,
+            }
+            if slot.dirty.geometry || slot.dirty.lighting {
+                metrics.dirty_chunks += 1;
             }
         }
 
@@ -225,6 +277,7 @@ impl ChunkStreamer {
                 required.insert(pos);
                 self.slots.entry(pos).or_insert(ChunkResidencyEntry {
                     state: ChunkResidencyState::Requested,
+                    dirty: ChunkDirtyFlags::default(),
                     chunk: None,
                     mesh: None,
                 });
@@ -235,6 +288,7 @@ impl ChunkStreamer {
         for (pos, slot) in &mut self.slots {
             if !required.contains(pos) && slot.state != ChunkResidencyState::Evicting {
                 slot.state = ChunkResidencyState::Evicting;
+                slot.dirty = ChunkDirtyFlags::default();
                 slot.chunk = None;
                 slot.mesh = None;
                 self.mesh_dirty = true;
@@ -369,9 +423,10 @@ impl ChunkStreamer {
 
                     if let Some(slot) = self.slots.get_mut(&pos) {
                         slot.chunk = Some(result.chunk);
+                        slot.dirty = ChunkDirtyFlags::default();
                         slot.mesh = None;
-                        slot.state = ChunkResidencyState::Meshing;
                     }
+                    self.mark_chunk_geometry_dirty(pos);
                     self.mark_neighbors_for_remesh(pos);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
@@ -391,6 +446,7 @@ impl ChunkStreamer {
 
                     if let Some(slot) = self.slots.get_mut(&result.pos) {
                         slot.chunk = Some(result.chunk);
+                        slot.dirty.geometry = false;
                         slot.mesh = Some(result.mesh);
                         slot.state = ChunkResidencyState::Ready;
                         self.mesh_dirty = true;
@@ -474,12 +530,22 @@ impl ChunkStreamer {
 
     fn mark_neighbors_for_remesh(&mut self, pos: ChunkPos) {
         for neighbor in cardinal_neighbors(pos) {
-            let Some(slot) = self.slots.get_mut(&neighbor) else {
-                continue;
-            };
-            if slot.state == ChunkResidencyState::Ready && slot.chunk.is_some() {
-                slot.state = ChunkResidencyState::Meshing;
-            }
+            self.mark_chunk_geometry_dirty(neighbor);
+        }
+    }
+
+    fn enqueue_geometry_remesh(&mut self, pos: ChunkPos) {
+        let Some(slot) = self.slots.get_mut(&pos) else {
+            return;
+        };
+        if slot.state == ChunkResidencyState::Evicting || slot.chunk.is_none() {
+            return;
+        }
+
+        slot.dirty.geometry = true;
+        if slot.state != ChunkResidencyState::Meshing {
+            slot.state = ChunkResidencyState::Meshing;
+            self.remesh_enqueued_total = self.remesh_enqueued_total.saturating_add(1);
         }
     }
 }
@@ -682,5 +748,40 @@ mod tests {
         assert!(updates
             .iter()
             .any(|update| matches!(update, RenderMeshUpdate::Remove { pos } if *pos == start)));
+    }
+
+    #[test]
+    fn edge_dirty_marks_neighbor_for_remesh() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 1,
+                max_generation_dispatch: 9,
+                max_meshing_dispatch: 9,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready >= 9 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(streamer.metrics().ready >= 9);
+
+        let east = ChunkPos { x: 1, z: 0 };
+        let remesh_before = streamer.metrics().remesh_enqueued;
+        streamer.mark_block_geometry_dirty(center, (CHUNK_WIDTH as u8) - 1, 8);
+        let metrics = streamer.metrics();
+        assert_eq!(
+            streamer.slot_state(east),
+            Some(ChunkResidencyState::Meshing)
+        );
+        assert!(metrics.remesh_enqueued > remesh_before);
+        assert!(metrics.dirty_chunks > 0);
     }
 }
