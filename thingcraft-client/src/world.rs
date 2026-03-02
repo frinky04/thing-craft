@@ -910,19 +910,29 @@ fn carve_caves(chunk: &mut ChunkData, world_seed: u64) {
                     // Carve a room
                     let room_width = 1.0 + java_next_float(&mut rng) as f64 * 6.0;
                     carve_tunnel(
-                        &mut rng, chunk, cx, cz, start_x, start_y, start_z,
-                        room_width as f32, 0.0, 0.0, -1, -1, 0.5,
+                        &mut rng,
+                        chunk,
+                        cx,
+                        cz,
+                        start_x,
+                        start_y,
+                        start_z,
+                        room_width as f32,
+                        0.0,
+                        0.0,
+                        -1,
+                        -1,
+                        0.5,
                     );
                     k += java_next_int(&mut rng, 4);
                 }
                 for _ in 0..k {
                     let yaw = java_next_float(&mut rng) * PI as f32 * 2.0;
                     let pitch = (java_next_float(&mut rng) - 0.5) * 2.0 / 8.0;
-                    let base_width =
-                        java_next_float(&mut rng) * 2.0 + java_next_float(&mut rng);
+                    let base_width = java_next_float(&mut rng) * 2.0 + java_next_float(&mut rng);
                     carve_tunnel(
-                        &mut rng, chunk, cx, cz, start_x, start_y, start_z,
-                        base_width, yaw, pitch, 0, 0, 1.0,
+                        &mut rng, chunk, cx, cz, start_x, start_y, start_z, base_width, yaw, pitch,
+                        0, 0, 1.0,
                     );
                 }
             }
@@ -967,8 +977,8 @@ fn carve_tunnel(
     let gradual_pitch = java_next_int(&mut rng, 6) == 0;
 
     while tunnel < tunnel_count {
-        let horiz_radius = 1.5
-            + ((tunnel as f32 * PI as f32 / tunnel_count as f32).sin() * base_width) as f64;
+        let horiz_radius =
+            1.5 + ((tunnel as f32 * PI as f32 / tunnel_count as f32).sin() * base_width) as f64;
         let vert_radius = horiz_radius * width_height_ratio;
 
         let cos_pitch = pitch.cos();
@@ -987,26 +997,46 @@ fn carve_tunnel(
 
         pitch_drift *= 0.9;
         yaw_drift *= 0.75;
-        pitch_drift += (java_next_float(&mut rng) - java_next_float(&mut rng)) * java_next_float(&mut rng) * 2.0;
-        yaw_drift += (java_next_float(&mut rng) - java_next_float(&mut rng)) * java_next_float(&mut rng) * 4.0;
+        pitch_drift += (java_next_float(&mut rng) - java_next_float(&mut rng))
+            * java_next_float(&mut rng)
+            * 2.0;
+        yaw_drift += (java_next_float(&mut rng) - java_next_float(&mut rng))
+            * java_next_float(&mut rng)
+            * 4.0;
 
         // Fork at midpoint
         if !is_room && tunnel == fork_point && base_width > 1.0 {
             let w1 = java_next_float(&mut rng) * 0.5 + 0.5;
             carve_tunnel(
-                &mut rng, chunk, chunk_x, chunk_z, x, y, z,
+                &mut rng,
+                chunk,
+                chunk_x,
+                chunk_z,
+                x,
+                y,
+                z,
                 w1,
                 yaw - PI as f32 / 2.0,
                 pitch / 3.0,
-                tunnel, tunnel_count, 1.0,
+                tunnel,
+                tunnel_count,
+                1.0,
             );
             let w2 = java_next_float(&mut rng) * 0.5 + 0.5;
             carve_tunnel(
-                &mut rng, chunk, chunk_x, chunk_z, x, y, z,
+                &mut rng,
+                chunk,
+                chunk_x,
+                chunk_z,
+                x,
+                y,
+                z,
                 w2,
                 yaw + PI as f32 / 2.0,
                 pitch / 3.0,
-                tunnel, tunnel_count, 1.0,
+                tunnel,
+                tunnel_count,
+                1.0,
             );
             return;
         }
@@ -1026,6 +1056,11 @@ fn carve_tunnel(
                 && z <= center_z + 16.0 + horiz_radius * 2.0
             {
                 carve_ellipsoid(chunk, chunk_x, chunk_z, x, y, z, horiz_radius, vert_radius);
+            }
+
+            // Alpha: rooms exit the loop after the first carve pass (CaveWorldCarver line 133)
+            if is_room {
+                break;
             }
         }
 
@@ -1086,12 +1121,7 @@ fn carve_ellipsoid(
                             if was_grass && ly > 0 {
                                 let below = chunk.block(lx as u8, (ly - 1) as u8, lz as u8);
                                 if below == DIRT_ID {
-                                    chunk.set_block(
-                                        lx as u8,
-                                        (ly - 1) as u8,
-                                        lz as u8,
-                                        GRASS_ID,
-                                    );
+                                    chunk.set_block(lx as u8, (ly - 1) as u8, lz as u8, GRASS_ID);
                                 }
                             }
                         }
@@ -1114,13 +1144,48 @@ struct OreConfig {
 }
 
 const ORE_TABLE: &[OreConfig] = &[
-    OreConfig { block_id: DIRT_ID,         vein_size: 32, attempts: 20, max_y: 128 },
-    OreConfig { block_id: GRAVEL_ID,       vein_size: 32, attempts: 10, max_y: 128 },
-    OreConfig { block_id: COAL_ORE_ID,     vein_size: 16, attempts: 20, max_y: 128 },
-    OreConfig { block_id: IRON_ORE_ID,     vein_size: 8,  attempts: 20, max_y: 64 },
-    OreConfig { block_id: GOLD_ORE_ID,     vein_size: 8,  attempts: 2,  max_y: 32 },
-    OreConfig { block_id: REDSTONE_ORE_ID, vein_size: 7,  attempts: 8,  max_y: 16 },
-    OreConfig { block_id: DIAMOND_ORE_ID,  vein_size: 7,  attempts: 1,  max_y: 16 },
+    OreConfig {
+        block_id: DIRT_ID,
+        vein_size: 32,
+        attempts: 20,
+        max_y: 128,
+    },
+    OreConfig {
+        block_id: GRAVEL_ID,
+        vein_size: 32,
+        attempts: 10,
+        max_y: 128,
+    },
+    OreConfig {
+        block_id: COAL_ORE_ID,
+        vein_size: 16,
+        attempts: 20,
+        max_y: 128,
+    },
+    OreConfig {
+        block_id: IRON_ORE_ID,
+        vein_size: 8,
+        attempts: 20,
+        max_y: 64,
+    },
+    OreConfig {
+        block_id: GOLD_ORE_ID,
+        vein_size: 8,
+        attempts: 2,
+        max_y: 32,
+    },
+    OreConfig {
+        block_id: REDSTONE_ORE_ID,
+        vein_size: 7,
+        attempts: 8,
+        max_y: 16,
+    },
+    OreConfig {
+        block_id: DIAMOND_ORE_ID,
+        vein_size: 7,
+        attempts: 1,
+        max_y: 16,
+    },
 ];
 
 fn populate_ores(chunk: &mut ChunkData, world_seed: u64) {
@@ -1176,12 +1241,13 @@ fn place_vein(
         // Alpha uses identical horizontal and vertical radii (spherical cross-section)
         let half_extent = sin_val * radius_noise + 1.0;
 
-        let x_min = (interp_x - half_extent / 2.0).floor() as i32;
-        let x_max = (interp_x + half_extent / 2.0).floor() as i32;
-        let y_min = (interp_y - half_extent / 2.0).floor() as i32;
-        let y_max = (interp_y + half_extent / 2.0).floor() as i32;
-        let z_min = (interp_z - half_extent / 2.0).floor() as i32;
-        let z_max = (interp_z + half_extent / 2.0).floor() as i32;
+        // Java (int) cast truncates toward zero, not floor — matters for negative coords
+        let x_min = (interp_x - half_extent / 2.0) as i32;
+        let x_max = (interp_x + half_extent / 2.0) as i32;
+        let y_min = (interp_y - half_extent / 2.0) as i32;
+        let y_max = (interp_y + half_extent / 2.0) as i32;
+        let z_min = (interp_z - half_extent / 2.0) as i32;
+        let z_max = (interp_z + half_extent / 2.0) as i32;
 
         for bx in x_min..=x_max {
             let local_x = bx - chunk_base_x;
@@ -1215,13 +1281,22 @@ fn place_vein(
 // Dungeon stubs  (translated from DungeonFeature.java / OverworldChunkGenerator.java)
 // ---------------------------------------------------------------------------
 
+/// Alpha's `material.isSolid()` — air and liquids are non-solid.
+fn is_solid_for_dungeon(block_id: u8) -> bool {
+    !matches!(
+        block_id,
+        AIR_ID | FLOWING_WATER_ID | WATER_ID | FLOWING_LAVA_ID | LAVA_ID
+    )
+}
+
 fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
     let cx = chunk.pos.x;
     let cz = chunk.pos.z;
 
     // SmallRng is fine — dungeon placement doesn't need Java-exact RNG sequences.
     // XOR with a constant to decorrelate from ore placement (same base seed).
-    let mut rng = SmallRng::seed_from_u64((alpha_chunk_seed(world_seed, cx, cz) ^ 0x5A5A_5A5A) as u64);
+    let mut rng =
+        SmallRng::seed_from_u64((alpha_chunk_seed(world_seed, cx, cz) ^ 0x5A5A_5A5A) as u64);
 
     // 8 attempts per chunk (matching Alpha)
     for _ in 0..8 {
@@ -1243,13 +1318,13 @@ fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
             continue;
         }
 
-        // Validate: floor and ceiling are solid
+        // Validate: floor and ceiling are solid (Alpha rejects air and liquids)
         let mut solid_envelope = true;
         'envelope: for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
             for vz in (local_z - half_z - 1)..=(local_z + half_z + 1) {
                 let floor_b = chunk.block(vx as u8, (y - 1) as u8, vz as u8);
                 let ceil_b = chunk.block(vx as u8, (y + room_height + 1) as u8, vz as u8);
-                if floor_b == AIR_ID || ceil_b == AIR_ID {
+                if !is_solid_for_dungeon(floor_b) || !is_solid_for_dungeon(ceil_b) {
                     solid_envelope = false;
                     break 'envelope;
                 }
@@ -1292,9 +1367,9 @@ fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
                         || vz == local_z + half_z + 1;
 
                     if on_boundary {
-                        // Walls/floor/ceiling: cobblestone or mossy
+                        // Walls/floor/ceiling: cobblestone or mossy (only replace solid blocks)
                         let existing = chunk.block(vx as u8, vy as u8, vz as u8);
-                        if existing != AIR_ID {
+                        if is_solid_for_dungeon(existing) {
                             let wall_block = if vy == y - 1 && rng.gen_range(0..4) != 0 {
                                 MOSSY_COBBLESTONE_ID
                             } else {
@@ -1359,7 +1434,6 @@ impl ChunkData {
         self.blocks[idx] = block_id;
     }
 
-    #[cfg(test)]
     #[must_use]
     pub fn block_light(&self, local_x: u8, y: u8, local_z: u8) -> u8 {
         let idx = Self::index(local_x, y, local_z);
@@ -1371,7 +1445,6 @@ impl ChunkData {
         self.block_light.set(idx, value);
     }
 
-    #[cfg(test)]
     #[must_use]
     pub fn sky_light(&self, local_x: u8, y: u8, local_z: u8) -> u8 {
         let idx = Self::index(local_x, y, local_z);
@@ -1449,6 +1522,22 @@ impl ChunkData {
             let y_u8 = y as u8;
             let block_id = self.block(local_x, y_u8, local_z);
             self.set_block_light(local_x, y_u8, local_z, registry.emitted_light_of(block_id));
+        }
+    }
+
+    pub fn apply_light_channels(
+        &mut self,
+        sky_light: &[u8; CHUNK_VOLUME],
+        block_light: &[u8; CHUNK_VOLUME],
+    ) {
+        for local_x in 0..CHUNK_WIDTH as u8 {
+            for local_z in 0..CHUNK_DEPTH as u8 {
+                for y in 0..CHUNK_HEIGHT as u8 {
+                    let index = Self::index(local_x, y, local_z);
+                    self.set_sky_light(local_x, y, local_z, sky_light[index]);
+                    self.set_block_light(local_x, y, local_z, block_light[index]);
+                }
+            }
         }
     }
 
@@ -1555,7 +1644,6 @@ impl NibbleStorage {
         }
     }
 
-    #[cfg(test)]
     fn get(&self, index: usize) -> u8 {
         let byte = self.bytes[index / 2];
         if index & 1 == 0 {
@@ -1768,7 +1856,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_underground_air, "no underground air found in 5x5 region — caves not working");
+        assert!(
+            found_underground_air,
+            "no underground air found in 5x5 region — caves not working"
+        );
     }
 
     #[test]
@@ -1809,7 +1900,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_coal, "no coal ore found in chunk — ore placement not working");
+        assert!(
+            found_coal,
+            "no coal ore found in chunk — ore placement not working"
+        );
     }
 
     #[test]
@@ -1866,7 +1960,13 @@ mod tests {
                 }
             }
         }
-        assert!(found_cobble, "no cobblestone found — dungeon stubs not placing walls");
-        assert!(found_spawner, "no mob spawner found — dungeon stubs not placing spawners");
+        assert!(
+            found_cobble,
+            "no cobblestone found — dungeon stubs not placing walls"
+        );
+        assert!(
+            found_spawner,
+            "no mob spawner found — dungeon stubs not placing spawners"
+        );
     }
 }

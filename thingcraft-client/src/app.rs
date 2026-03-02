@@ -161,6 +161,7 @@ pub fn run() -> Result<()> {
         bootstrap_mesh_indices = bootstrap_mesh.indices.len(),
         stream_view_radius = residency_config.view_radius,
         stream_gen_budget = residency_config.max_generation_dispatch,
+        stream_light_budget = residency_config.max_lighting_dispatch,
         stream_mesh_budget = residency_config.max_meshing_dispatch,
         "thingcraft client booted"
     );
@@ -260,7 +261,10 @@ pub fn run() -> Result<()> {
                                 evicting_chunks = residency.evicting,
                                 dirty_chunks = residency.dirty_chunks,
                                 remesh_enqueued = residency.remesh_enqueued,
+                                relight_enqueued = residency.relight_enqueued,
+                                relight_dropped_stale = residency.relight_dropped_stale,
                                 in_flight_generation = residency.in_flight_generation,
+                                in_flight_lighting = residency.in_flight_lighting,
                                 in_flight_meshing = residency.in_flight_meshing,
                                 visible_chunks = renderer.visible_chunk_count(),
                                 "runtime stats"
@@ -279,7 +283,10 @@ pub fn run() -> Result<()> {
                                 evicting_chunks = residency.evicting,
                                 dirty_chunks = residency.dirty_chunks,
                                 remesh_enqueued = residency.remesh_enqueued,
+                                relight_enqueued = residency.relight_enqueued,
+                                relight_dropped_stale = residency.relight_dropped_stale,
                                 in_flight_generation = residency.in_flight_generation,
+                                in_flight_lighting = residency.in_flight_lighting,
                                 in_flight_meshing = residency.in_flight_meshing,
                                 visible_chunks = renderer.visible_chunk_count(),
                                 "runtime stats"
@@ -605,6 +612,9 @@ fn resolve_residency_config() -> ResidencyConfig {
     }
     if let Some(parsed) = parse_env_u32("THINGCRAFT_GEN_BUDGET") {
         config.max_generation_dispatch = parsed as usize;
+    }
+    if let Some(parsed) = parse_env_u32("THINGCRAFT_LIGHT_BUDGET") {
+        config.max_lighting_dispatch = parsed as usize;
     }
     if let Some(parsed) = parse_env_u32("THINGCRAFT_MESH_BUDGET") {
         config.max_meshing_dispatch = parsed as usize;

@@ -25,6 +25,7 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Oak log top/bottom face atlas mapping added (cap texture on `+Y/-Y`, side texture on lateral faces).
 - [x] Chunk residency manager added with lifecycle states (`Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`) around a camera-centered radius.
 - [x] Background generation and meshing workers added (main thread now schedules jobs and applies async results).
+- [x] Background lighting worker added: bounded relight dispatch, queue-based block/sky propagation with cardinal-neighbor snapshots, stale-result dropping, and relight metrics.
 - [x] Renderer now supports incremental per-chunk mesh uploads/removals (avoids full merged scene re-upload on each boundary crossing).
 - [x] Incremental streaming meshing now includes cardinal neighbor context and neighbor remesh triggers (prevents interior seam faces between loaded chunks).
 - [x] Dirty/remesh propagation groundwork added: geometry dirty tracking per chunk, edge-propagated neighbor remesh marking, and remesh counters in runtime metrics.

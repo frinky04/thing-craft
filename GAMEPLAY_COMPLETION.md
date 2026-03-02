@@ -14,7 +14,7 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [~] Structures: Dungeon rooms with mob spawner blocks placed (chest inventory and spawner entity config require M7 entity/inventory systems).
 
 ## Graphics and Lighting
-- [ ] Lighting Engine: Strict, blocky, per-block lighting (no Smooth Lighting/Ambient Occlusion).
+- [~] Lighting Engine: Async queue-based propagation foundation is in place; strict parity validation and full rendered-light usage remain.
 - [ ] Light Levels: 16 levels of light (0 to 15).
 - [ ] Light Spread: Sunlight drops by 1 per block horizontally and vertically. Block light (torches, glowstone) spreads identically.
 

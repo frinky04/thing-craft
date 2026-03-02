@@ -40,7 +40,8 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 
 - Runtime chunk residency is managed with explicit states: `Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`.
 - Residency targets are derived from the camera chunk position with a configurable square radius.
-- Chunk generation and chunk meshing run on dedicated worker threads.
+- Chunk generation, chunk lighting, and chunk meshing run on dedicated worker threads.
+- Lighting jobs run a queue-based sunlight/block-light propagation pass against immutable chunk snapshots (center + cardinal neighbors), then return packed nibble-channel updates to the main thread.
 - Meshing jobs include cardinal neighbor chunk snapshots so chunk-boundary face culling remains correct with incremental uploads.
 - The main thread only:
   - computes residency deltas,
@@ -49,6 +50,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
   - applies per-chunk render updates (GPU upsert/remove) from worker results.
 - This keeps heavy world build steps off the render path while preserving deterministic state ownership on the main thread.
 - Residency entries now track dirty state, and geometry remesh requests can propagate to cardinal neighbors for boundary edits.
+- Lighting dirtiness tracks a per-chunk revision. In-flight lighting results are dropped if the chunk was re-dirtied before apply.
 - Meshing results are now applied only when the target chunk is still clean; stale in-flight meshes are dropped if new edits arrived while meshing.
 
 ## Networking-Ready Input Pattern

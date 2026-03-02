@@ -8,6 +8,7 @@
 - M3 complete: chunk residency manager tracks requested/generating/meshing/ready/evicting plus dirty/remesh propagation states around the camera.
 - M4 complete: deterministic biome/climate fields, surface terrain, cave carving (Alpha worm algorithm), ore vein placement (7 ore types), and dungeon stubs implemented.
 - M5 complete: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, fixed-tick block interaction requests (raycast break/place + dirty remesh propagation), per-edit column height/light refresh, and renderer frustum culling are implemented.
+- M6 in progress: async lighting worker lane added (bounded dispatch, queue-based sky/block propagation, stale-result dropping, relight metrics, and geometry remesh integration after light apply).
 
 ## M0 - Repository Foundation
 
@@ -145,6 +146,7 @@ Implement asynchronous block-light and sunlight propagation.
 ### Exit Criteria
 - Block/light changes update nearby regions without main-thread stalls
 - Lighting correctness matches strict per-block Alpha-style expectations
+- Foundation status: async lighting queue plumbing is implemented; remaining work is parity tuning/validation and full rendered-light integration.
 
 ## M7 - Alpha 1.2.6 Feature Waves
 
