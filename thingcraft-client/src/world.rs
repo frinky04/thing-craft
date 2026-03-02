@@ -483,6 +483,15 @@ impl BlockRegistry {
     }
 
     #[must_use]
+    pub fn sprite_index_for_face(&self, block_id: u8, face_offset: [i32; 3]) -> u16 {
+        match (block_id, face_offset[1]) {
+            (GRASS_ID, 1) => 0,
+            (GRASS_ID, -1) => self.sprite_index_of(DIRT_ID),
+            _ => self.sprite_index_of(block_id),
+        }
+    }
+
+    #[must_use]
     pub fn is_defined_block(&self, block_id: u8) -> bool {
         self.get(block_id).is_some()
     }
@@ -988,6 +997,14 @@ mod tests {
         assert!(registry.get(26).is_none());
         assert!(registry.get(31).is_none());
         assert!(registry.get(33).is_none());
+    }
+
+    #[test]
+    fn grass_uses_alpha_face_sprites() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert_eq!(registry.sprite_index_for_face(GRASS_ID, [0, 1, 0]), 0);
+        assert_eq!(registry.sprite_index_for_face(GRASS_ID, [0, -1, 0]), 2);
+        assert_eq!(registry.sprite_index_for_face(GRASS_ID, [1, 0, 0]), 3);
     }
 
     #[test]

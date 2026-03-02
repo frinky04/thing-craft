@@ -164,7 +164,7 @@ where
                         y as f32,
                         local_z as f32 + chunk_origin_z,
                         face,
-                        registry.sprite_index_of(block_id),
+                        registry.sprite_index_for_face(block_id, face.offset),
                         registry.emitted_light_of(block_id),
                     );
                 }
