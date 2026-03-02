@@ -9,6 +9,7 @@ use wgpu::{CompositeAlphaMode, PresentMode, SurfaceError};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use crate::hud::{HudUniform, HudVertex};
 use crate::mesh::{ChunkMesh, MeshVertex};
 use crate::streaming::{ChunkDebugState, ChunkResidencyState};
 use crate::world::ChunkPos;
@@ -36,6 +37,11 @@ pub struct Renderer<'w> {
     chunk_border_debug_enabled: bool,
     camera_frustum: Option<FrustumPlanes>,
     visible_chunk_meshes: usize,
+    hud_pipeline: wgpu::RenderPipeline,
+    hud_uniform_buffer: wgpu::Buffer,
+    hud_bind_group: wgpu::BindGroup,
+    hud_vertex_buffer: Option<wgpu::Buffer>,
+    hud_vertex_count: u32,
 }
 
 struct SceneMeshGpu {
@@ -328,6 +334,90 @@ impl<'w> Renderer<'w> {
             multiview: None,
         });
 
+        // HUD pipeline: 2D overlay with orthographic projection, no depth test.
+        let hud_uniform = HudUniform {
+            screen_width: config.width as f32,
+            screen_height: config.height as f32,
+            _pad: [0.0; 2],
+        };
+        let hud_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("thingcraft-hud-uniform-buffer"),
+            contents: bytemuck::bytes_of(&hud_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let hud_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-hud-bind-group-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let hud_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thingcraft-hud-bind-group"),
+            layout: &hud_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: hud_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let hud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-hud-shader"),
+            source: wgpu::ShaderSource::Wgsl(HUD_SHADER.into()),
+        });
+
+        let hud_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("thingcraft-hud-pipeline-layout"),
+            bind_group_layouts: &[&hud_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-hud-pipeline"),
+            layout: Some(&hud_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hud_shader,
+                entry_point: "vs_main",
+                buffers: &[HudVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None, // No depth test for HUD.
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hud_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+
         Ok(Self {
             surface,
             device,
@@ -349,6 +439,11 @@ impl<'w> Renderer<'w> {
             chunk_border_debug_enabled: false,
             camera_frustum: None,
             visible_chunk_meshes: 0,
+            hud_pipeline,
+            hud_uniform_buffer,
+            hud_bind_group,
+            hud_vertex_buffer: None,
+            hud_vertex_count: 0,
         })
     }
 
@@ -474,6 +569,41 @@ impl<'w> Renderer<'w> {
         let (depth_texture, depth_view) = create_depth_resources(&self.device, &self.config);
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
+        self.update_hud_uniform();
+    }
+
+    /// Upload new HUD vertices. Call each frame (or when hotbar state changes).
+    pub fn update_hud(&mut self, vertices: &[HudVertex]) {
+        if vertices.is_empty() {
+            self.hud_vertex_buffer = None;
+            self.hud_vertex_count = 0;
+            return;
+        }
+
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("thingcraft-hud-vertex-buffer"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        self.hud_vertex_buffer = Some(buffer);
+        self.hud_vertex_count = vertices.len() as u32;
+    }
+
+    pub fn screen_size(&self) -> (f32, f32) {
+        (self.size.width as f32, self.size.height as f32)
+    }
+
+    fn update_hud_uniform(&mut self) {
+        let uniform = HudUniform {
+            screen_width: self.size.width as f32,
+            screen_height: self.size.height as f32,
+            _pad: [0.0; 2],
+        };
+        self.queue
+            .write_buffer(&self.hud_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
     pub fn reconfigure(&mut self) {
@@ -585,6 +715,29 @@ impl<'w> Renderer<'w> {
                     render_pass.draw(0..chunk_border_mesh.vertex_count, 0..1);
                 }
             }
+        }
+
+        // HUD pass: draw 2D overlay on top of the scene (no depth test, alpha blending).
+        if let Some(hud_vb) = &self.hud_vertex_buffer {
+            let mut hud_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("thingcraft-hud-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            hud_pass.set_pipeline(&self.hud_pipeline);
+            hud_pass.set_bind_group(0, &self.hud_bind_group, &[]);
+            hud_pass.set_vertex_buffer(0, hud_vb.slice(..));
+            hud_pass.draw(0..self.hud_vertex_count, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -1012,6 +1165,43 @@ fn vs_main(input: VertexIn) -> VertexOut {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(input.color, 1.0);
+}
+"#;
+
+const HUD_SHADER: &str = r#"
+struct HudScreen {
+    screen_width: f32,
+    screen_height: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> screen: HudScreen;
+
+struct VertexIn {
+    @location(0) position: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    // Convert screen-pixel coords to NDC: x: [0, width] -> [-1, 1], y: [0, height] -> [1, -1].
+    let ndc_x = (input.position.x / screen.screen_width) * 2.0 - 1.0;
+    let ndc_y = 1.0 - (input.position.y / screen.screen_height) * 2.0;
+
+    var out: VertexOut;
+    out.clip_pos = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    out.color = input.color;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    return input.color;
 }
 "#;
 

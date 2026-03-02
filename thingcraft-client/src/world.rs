@@ -27,6 +27,8 @@ const GRAVEL_ID: u8 = 13;
 const GOLD_ORE_ID: u8 = 14;
 const IRON_ORE_ID: u8 = 15;
 const COAL_ORE_ID: u8 = 16;
+const OAK_LOG_ID: u8 = 17;
+const OAK_LEAVES_ID: u8 = 18;
 const MOSSY_COBBLESTONE_ID: u8 = 48;
 const MOB_SPAWNER_ID: u8 = 52;
 const DIAMOND_ORE_ID: u8 = 56;
@@ -799,7 +801,10 @@ impl OverworldChunkGenerator {
         carve_caves(&mut chunk, self.seed);
         populate_ores(&mut chunk, self.seed);
         place_dungeon_stubs(&mut chunk, self.seed);
-
+        // Height map needed by place_trees for O(1) surface lookups.
+        chunk.recalculate_height_map(registry);
+        place_trees(&mut chunk, self.seed, &self.biome_source);
+        // Re-run after trees to account for new log/leaf blocks.
         chunk.recalculate_height_map(registry);
         chunk.seed_emitted_light(registry);
         chunk
@@ -1390,6 +1395,179 @@ fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Oak tree placement  (translated from TreeFeature.java / BiomeDecorator.java)
+// ---------------------------------------------------------------------------
+
+/// Returns the number of trees to attempt for the given biome.
+/// Alpha's BiomeDecorator applies: `treesPerChunk` which defaults to 0, then
+/// Forest/Rainforest/Taiga add +5, SeasonalForest +2, and Desert/Tundra/Plains
+/// effectively get near-zero (the decorator has `treesPerChunk + offset`, where
+/// offset is drawn from `rng.gen_range(0..10)`, and the decorator only places
+/// a tree if the random roll < treesPerChunk, so low-tree biomes still get
+/// occasional strays).
+fn trees_per_chunk(biome: BiomeKind) -> i32 {
+    match biome {
+        BiomeKind::Forest | BiomeKind::Rainforest | BiomeKind::Taiga => 10,
+        BiomeKind::SeasonalForest | BiomeKind::Swampland => 4,
+        BiomeKind::Shrubland | BiomeKind::Savanna => 1,
+        BiomeKind::Plains => 0,
+        BiomeKind::Desert | BiomeKind::IceDesert | BiomeKind::Tundra => -1,
+    }
+}
+
+fn place_trees(chunk: &mut ChunkData, world_seed: u64, biome_source: &BiomeSource) {
+    let cx = chunk.pos.x;
+    let cz = chunk.pos.z;
+
+    // XOR with a constant to decorrelate from dungeon/ore placement.
+    let mut rng =
+        SmallRng::seed_from_u64((alpha_chunk_seed(world_seed, cx, cz) ^ 0xBEEF_CAFE) as u64);
+
+    // Sample biome at chunk center to determine tree density.
+    let center_x = cx * CHUNK_WIDTH as i32 + 8;
+    let center_z = cz * CHUNK_DEPTH as i32 + 8;
+    let biome_sample = biome_source.sample(center_x, center_z);
+    let base_count = trees_per_chunk(biome_sample.biome);
+
+    // Alpha adds a random 0..10 offset, then attempts that many trees.
+    let attempt_count = base_count + rng.gen_range(0..10_i32);
+    if attempt_count <= 0 {
+        return;
+    }
+
+    for _ in 0..attempt_count {
+        let local_x = rng.gen_range(0..CHUNK_WIDTH as i32);
+        let local_z = rng.gen_range(0..CHUNK_DEPTH as i32);
+        let trunk_height = rng.gen_range(0..3_i32) + 4; // 4-6 blocks
+
+        if let Some(surface_y) = find_surface_y(chunk, local_x as u8, local_z as u8) {
+            try_place_tree(chunk, &mut rng, local_x, surface_y, local_z, trunk_height);
+        }
+    }
+}
+
+/// Find the y of the highest non-air block at this column using the
+/// precomputed height map. Returns the y of the topmost solid block.
+fn find_surface_y(chunk: &ChunkData, local_x: u8, local_z: u8) -> Option<i32> {
+    let h = chunk.height_at(local_x, local_z);
+    if h == 0 {
+        None
+    } else {
+        Some(h as i32 - 1)
+    }
+}
+
+/// Attempt to place an oak tree at the given position. Validates ground block
+/// and clearance, then places trunk and leaf canopy.
+fn try_place_tree(
+    chunk: &mut ChunkData,
+    rng: &mut SmallRng,
+    local_x: i32,
+    surface_y: i32,
+    local_z: i32,
+    trunk_height: i32,
+) {
+    let ground_block = chunk.block(local_x as u8, surface_y as u8, local_z as u8);
+    if ground_block != GRASS_ID && ground_block != DIRT_ID {
+        return;
+    }
+
+    let trunk_base = surface_y + 1;
+    let trunk_top = trunk_base + trunk_height - 1;
+
+    // The total tree height must fit in the chunk.
+    if trunk_top + 1 >= CHUNK_HEIGHT as i32 {
+        return;
+    }
+
+    // Check clearance: trunk column and leaf radius must be mostly air/leaves.
+    // We check a 5x5 area around the trunk from (trunk_top - 3) to (trunk_top + 1).
+    let canopy_bottom = trunk_top - 3;
+    let canopy_top = trunk_top + 1;
+    for cy in canopy_bottom..=canopy_top {
+        if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
+            return;
+        }
+        // Radius is 2 for lower canopy layers, 1 for upper layers
+        let radius = if cy >= trunk_top { 1 } else { 2 };
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                let bx = local_x + dx;
+                let bz = local_z + dz;
+                if !(0..CHUNK_WIDTH as i32).contains(&bx) || !(0..CHUNK_DEPTH as i32).contains(&bz) {
+                    // Out-of-chunk blocks: skip (acceptable clipping for single-chunk gen).
+                    continue;
+                }
+                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                if existing != AIR_ID && existing != OAK_LEAVES_ID {
+                    return;
+                }
+            }
+        }
+    }
+
+    // Replace ground with dirt (matching Alpha behavior).
+    chunk.set_block(local_x as u8, surface_y as u8, local_z as u8, DIRT_ID);
+
+    // Place leaf canopy: layers from (trunk_top - 3) to (trunk_top + 1).
+    // Lower layers (trunk_top-3, trunk_top-2): radius 2, corners randomly pruned.
+    // Upper layers (trunk_top-1, trunk_top): radius 1, no corner pruning.
+    // Top layer (trunk_top+1): no leaves (trunk doesn't extend there either).
+    for cy in (trunk_top - 3)..=(trunk_top) {
+        let layer_from_top = trunk_top - cy;
+        let radius = if layer_from_top >= 2 { 2 } else { 1 };
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                let bx = local_x + dx;
+                let bz = local_z + dz;
+                if !(0..CHUNK_WIDTH as i32).contains(&bx) || !(0..CHUNK_DEPTH as i32).contains(&bz) {
+                    continue;
+                }
+                if cy < 0 || cy >= CHUNK_HEIGHT as i32 {
+                    continue;
+                }
+                // Skip the trunk column (trunk pass overwrites center anyway).
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                // Prune corners on wide layers.
+                if radius == 2
+                    && dx.abs() == 2
+                    && dz.abs() == 2
+                    && rng.gen_range(0..2_i32) == 0
+                {
+                    continue;
+                }
+                let existing = chunk.block(bx as u8, cy as u8, bz as u8);
+                if existing == AIR_ID {
+                    chunk.set_block(bx as u8, cy as u8, bz as u8, OAK_LEAVES_ID);
+                }
+            }
+        }
+    }
+
+    // Place leaves at trunk_top + 1 (small crown cap): just the center column.
+    let cap_y = trunk_top + 1;
+    if cap_y < CHUNK_HEIGHT as i32
+        && (0..CHUNK_WIDTH as i32).contains(&local_x)
+        && (0..CHUNK_DEPTH as i32).contains(&local_z)
+    {
+        let existing = chunk.block(local_x as u8, cap_y as u8, local_z as u8);
+        if existing == AIR_ID {
+            chunk.set_block(local_x as u8, cap_y as u8, local_z as u8, OAK_LEAVES_ID);
+        }
+    }
+
+    // Place trunk (overwrites any leaves at trunk column).
+    for ty in trunk_base..=trunk_top {
+        if ty >= CHUNK_HEIGHT as i32 {
+            break;
+        }
+        chunk.set_block(local_x as u8, ty as u8, local_z as u8, OAK_LOG_ID);
+    }
+}
+
 fn normalize_noise(value: f64) -> f64 {
     ((value + 1.0) * 0.5).clamp(0.0, 1.0)
 }
@@ -1924,6 +2102,68 @@ mod tests {
                             }
                             if b == GOLD_ORE_ID {
                                 assert!(y < 36, "gold ore found at y={y}, expected < 36");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trees_appear_in_forest_biome() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let gen = OverworldChunkGenerator::new(42);
+        let mut found_log = false;
+        let mut found_leaves = false;
+        // Forest biomes should have trees. Check a 5x5 region.
+        'outer: for cx in -2..=2 {
+            for cz in -2..=2 {
+                let chunk = gen.generate_chunk(ChunkPos { x: cx, z: cz }, &registry);
+                for lx in 0..16_u8 {
+                    for lz in 0..16_u8 {
+                        for y in 1..128_u8 {
+                            let b = chunk.block(lx, y, lz);
+                            if b == OAK_LOG_ID {
+                                found_log = true;
+                            }
+                            if b == OAK_LEAVES_ID {
+                                found_leaves = true;
+                            }
+                            if found_log && found_leaves {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_log, "no oak log found — tree placement not working");
+        assert!(
+            found_leaves,
+            "no oak leaves found — tree placement not working"
+        );
+    }
+
+    #[test]
+    fn tree_trunks_sit_on_dirt_or_grass() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let gen = OverworldChunkGenerator::new(12345);
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                let chunk = gen.generate_chunk(ChunkPos { x: cx, z: cz }, &registry);
+                for lx in 0..16_u8 {
+                    for lz in 0..16_u8 {
+                        // Find the lowest LOG in each column.
+                        for y in 1..127_u8 {
+                            if chunk.block(lx, y, lz) == OAK_LOG_ID {
+                                let below = chunk.block(lx, y - 1, lz);
+                                // Below a trunk base should be dirt (tree replaces grass with dirt).
+                                assert!(
+                                    below == DIRT_ID || below == OAK_LOG_ID,
+                                    "block below trunk at ({lx},{y},{lz}) is {below}, expected dirt or log"
+                                );
+                                break;
                             }
                         }
                     }

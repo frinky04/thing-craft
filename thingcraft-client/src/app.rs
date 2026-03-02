@@ -11,6 +11,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
 use crate::ecs::EcsRuntime;
+use crate::hud;
 use crate::mesh::{build_region_mesh, ChunkMesh};
 use crate::renderer::{RenderError, Renderer};
 use crate::streaming::{
@@ -18,7 +19,7 @@ use crate::streaming::{
     ResidencyConfig,
 };
 use crate::time_step::FixedStepClock;
-use crate::world::{BootstrapWorld, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
+use crate::world::{BlockRegistry, BootstrapWorld, ChunkPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH};
 
 const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
     "wgpu_core=warn",
@@ -57,6 +58,15 @@ struct BlockRayHit {
 struct HotbarSlot {
     block_id: u8,
     count: u8,
+}
+
+impl Default for HotbarSlot {
+    fn default() -> Self {
+        Self {
+            block_id: AIR_BLOCK_ID,
+            count: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -138,6 +148,11 @@ impl HotbarInventory {
 
         slot.count += 1;
         true
+    }
+
+    /// Lightweight snapshot of all slot counts for dirty-checking.
+    fn snapshot_counts(&self) -> [u8; HOTBAR_BLOCK_IDS.len()] {
+        std::array::from_fn(|i| self.slots[i].count)
     }
 }
 
@@ -277,12 +292,8 @@ pub fn run() -> Result<()> {
     let mut edit_latency_tracker = EditLatencyTracker::default();
     let mut hotbar_inventory = HotbarInventory::alpha_defaults();
     let mut selected_hotbar_slot = 0_usize;
-    let selected_slot = hotbar_inventory
-        .slot(selected_hotbar_slot)
-        .unwrap_or(HotbarSlot {
-            block_id: AIR_BLOCK_ID,
-            count: 0,
-        });
+    let mut hud_dirty = true;
+    let selected_slot = hotbar_inventory.slot(selected_hotbar_slot).unwrap_or_default();
 
     info!(
         tick_hz = fixed_config.tick_hz,
@@ -311,8 +322,14 @@ pub fn run() -> Result<()> {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
-                WindowEvent::Resized(size) => renderer.resize(size),
-                WindowEvent::ScaleFactorChanged { .. } => renderer.resize(window.inner_size()),
+                WindowEvent::Resized(size) => {
+                    renderer.resize(size);
+                    hud_dirty = true;
+                }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    renderer.resize(window.inner_size());
+                    hud_dirty = true;
+                }
                 WindowEvent::RedrawRequested => {
                     let now = Instant::now();
                     let frame_delta = now.saturating_duration_since(last_frame_start);
@@ -325,12 +342,23 @@ pub fn run() -> Result<()> {
                     let fixed_dt_seconds = fixed_clock.tick_dt().as_secs_f64();
                     for _ in 0..ticks_to_run {
                         ecs_runtime.run_fixed(fixed_dt_seconds);
+                        let fly_mode = ecs_runtime.is_fly_mode();
+                        resolve_player_physics(
+                            &mut ecs_runtime,
+                            &chunk_streamer,
+                            &bootstrap_world.registry,
+                            fly_mode,
+                        );
+                        let pre_inv = hotbar_inventory.snapshot_counts();
                         process_block_interaction_requests(
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
                             &mut edit_latency_tracker,
                             &mut hotbar_inventory,
                         );
+                        if hotbar_inventory.snapshot_counts() != pre_inv {
+                            hud_dirty = true;
+                        }
                     }
                     let tick_duration = tick_timer_start.elapsed();
 
@@ -374,6 +402,22 @@ pub fn run() -> Result<()> {
                             }
                             edit_latency_tracker.observe_render_update(update_pos);
                         }
+                    }
+
+                    // Build and upload HUD vertices only when state changes.
+                    if hud_dirty {
+                        let (sw, sh) = renderer.screen_size();
+                        let mut hud_verts = hud::build_crosshair_vertices(sw, sh);
+                        let slot_counts: [u8; HOTBAR_BLOCK_IDS.len()] =
+                            std::array::from_fn(|i| hotbar_inventory.slot(i).map_or(0, |s| s.count));
+                        hud_verts.extend(hud::build_hotbar_vertices(
+                            sw,
+                            sh,
+                            selected_hotbar_slot,
+                            &slot_counts,
+                        ));
+                        renderer.update_hud(&hud_verts);
+                        hud_dirty = false;
                     }
 
                     match renderer.render() {
@@ -466,10 +510,8 @@ pub fn run() -> Result<()> {
                         if is_pressed && !event.repeat {
                             if let Some(slot) = hotbar_slot_for_key(code) {
                                 selected_hotbar_slot = slot;
-                                let slot_state = hotbar_inventory.slot(slot).unwrap_or(HotbarSlot {
-                                    block_id: AIR_BLOCK_ID,
-                                    count: 0,
-                                });
+                                hud_dirty = true;
+                                let slot_state = hotbar_inventory.slot(slot).unwrap_or_default();
                                 let block_id = slot_state.block_id;
                                 let count = slot_state.count;
                                 if bootstrap_world.registry.is_defined_block(block_id) {
@@ -588,8 +630,14 @@ fn enqueue_block_interaction_request(
         return;
     }
 
+    // In physics mode, position is at feet. Raycast from eye height.
+    let mut origin = snapshot.authoritative.position;
+    if !snapshot.fly_mode {
+        origin.y += snapshot.physics.eye_height;
+    }
+
     queue.push_back(BlockInteractionRequest {
-        origin: snapshot.authoritative.position,
+        origin,
         direction,
         kind,
     });
@@ -910,6 +958,260 @@ fn parse_env_u32(key: &str) -> Option<u32> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Player AABB physics resolution (from Entity.move() in Alpha)
+// ---------------------------------------------------------------------------
+
+/// Resolve player physics: sweep AABB against world blocks, update position.
+/// Called after `ecs_runtime.run_fixed()` each tick when fly_mode is off.
+fn resolve_player_physics(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    fly_mode: bool,
+) {
+    if fly_mode {
+        return;
+    }
+    let Some((transform, physics)) = ecs_runtime.player_physics() else {
+        return;
+    };
+
+    let half_w = physics.width / 2.0;
+    let height = physics.height;
+
+    // The position that apply_player_motion_system already wrote includes velocity.
+    // We need to resolve collisions against the world.
+    let target_pos = transform.position;
+    // Reconstruct pre-move position from prev_position (which was saved before velocity applied).
+    let start_pos = transform.prev_position;
+    let mut delta = target_pos - start_pos;
+
+    let mut pos = start_pos;
+    let original_delta = delta;
+
+    // Reusable scratch buffer for collecting block AABBs (avoids allocation per axis).
+    let mut scratch = Vec::with_capacity(32);
+
+    // Y axis first (gravity is the most important axis to resolve).
+    let expanded_min_y = DVec3::new(
+        pos.x - half_w,
+        pos.y.min(pos.y + delta.y),
+        pos.z - half_w,
+    );
+    let expanded_max_y = DVec3::new(
+        pos.x + half_w,
+        (pos.y + height).max(pos.y + height + delta.y),
+        pos.z + half_w,
+    );
+    collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, expanded_min_y, expanded_max_y);
+    delta.y = resolve_axis(pos, half_w, height, delta.y, &scratch, 1);
+    pos.y += delta.y;
+
+    // X axis.
+    let expanded_min_x = DVec3::new(
+        pos.x.min(pos.x + delta.x) - half_w,
+        pos.y,
+        pos.z - half_w,
+    );
+    let expanded_max_x = DVec3::new(
+        pos.x.max(pos.x + delta.x) + half_w,
+        pos.y + height,
+        pos.z + half_w,
+    );
+    collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, expanded_min_x, expanded_max_x);
+    delta.x = resolve_axis(pos, half_w, height, delta.x, &scratch, 0);
+    pos.x += delta.x;
+
+    // Z axis.
+    let expanded_min_z = DVec3::new(
+        pos.x - half_w,
+        pos.y,
+        pos.z.min(pos.z + delta.z) - half_w,
+    );
+    let expanded_max_z = DVec3::new(
+        pos.x + half_w,
+        pos.y + height,
+        pos.z.max(pos.z + delta.z) + half_w,
+    );
+    collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, expanded_min_z, expanded_max_z);
+    delta.z = resolve_axis(pos, half_w, height, delta.z, &scratch, 2);
+    pos.z += delta.z;
+
+    // Step-up: if horizontal movement was blocked and on_ground, try stepping up.
+    let h_blocked =
+        (original_delta.x - delta.x).abs() > 1e-10 || (original_delta.z - delta.z).abs() > 1e-10;
+    let was_on_ground = physics.on_ground;
+    if h_blocked && was_on_ground {
+        let step = physics.step_height;
+        // Try movement at +step_height offset.
+        let step_pos = DVec3::new(start_pos.x, start_pos.y + step, start_pos.z);
+        let mut step_delta = original_delta;
+        step_delta.y = 0.0;
+
+        // Resolve X at stepped height.
+        let smin_x = DVec3::new(
+            step_pos.x.min(step_pos.x + step_delta.x) - half_w,
+            step_pos.y,
+            step_pos.z - half_w,
+        );
+        let smax_x = DVec3::new(
+            step_pos.x.max(step_pos.x + step_delta.x) + half_w,
+            step_pos.y + height,
+            step_pos.z + half_w,
+        );
+        collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, smin_x, smax_x);
+        step_delta.x = resolve_axis(step_pos, half_w, height, step_delta.x, &scratch, 0);
+        let mut spos = DVec3::new(step_pos.x + step_delta.x, step_pos.y, step_pos.z);
+
+        let smin_z = DVec3::new(
+            spos.x - half_w,
+            spos.y,
+            spos.z.min(spos.z + step_delta.z) - half_w,
+        );
+        let smax_z = DVec3::new(
+            spos.x + half_w,
+            spos.y + height,
+            spos.z.max(spos.z + step_delta.z) + half_w,
+        );
+        collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, smin_z, smax_z);
+        step_delta.z = resolve_axis(spos, half_w, height, step_delta.z, &scratch, 2);
+        spos.z += step_delta.z;
+
+        // Drop back down by step height.
+        let smin_drop = DVec3::new(spos.x - half_w, spos.y - step, spos.z - half_w);
+        let smax_drop = DVec3::new(spos.x + half_w, spos.y + height, spos.z + half_w);
+        collect_solid_block_aabbs(&mut scratch, chunk_streamer, registry, smin_drop, smax_drop);
+        let drop_dy = resolve_axis(spos, half_w, height, -step, &scratch, 1);
+        spos.y += drop_dy;
+
+        // Accept step-up if it resulted in more horizontal movement.
+        let stepped_h_sq = step_delta.x * step_delta.x + step_delta.z * step_delta.z;
+        let original_h_sq = delta.x * delta.x + delta.z * delta.z;
+        if stepped_h_sq > original_h_sq {
+            pos = spos;
+            delta.x = step_delta.x;
+            delta.z = step_delta.z;
+        }
+    }
+
+    // Update on_ground: blocked downward means on ground.
+    let on_ground = original_delta.y < -1e-10 && (original_delta.y - delta.y).abs() > 1e-10;
+
+    // Fall distance tracking.
+    let mut fall_distance = physics.fall_distance;
+    if delta.y < 0.0 {
+        fall_distance -= delta.y;
+    } else {
+        fall_distance = 0.0;
+    }
+    if on_ground {
+        fall_distance = 0.0;
+    }
+
+    // Velocity: zero out any component that was collision-clamped.
+    let mut velocity = physics.velocity;
+    if (original_delta.x - delta.x).abs() > 1e-10 {
+        velocity.x = 0.0;
+    }
+    if (original_delta.y - delta.y).abs() > 1e-10 {
+        velocity.y = 0.0;
+    }
+    if (original_delta.z - delta.z).abs() > 1e-10 {
+        velocity.z = 0.0;
+    }
+
+    ecs_runtime.apply_resolved_physics(pos, velocity, on_ground, fall_distance);
+}
+
+/// Collect AABBs of all solid blocks overlapping the given region into `out`.
+/// Clears `out` before filling — reuse across calls to avoid allocation.
+fn collect_solid_block_aabbs(
+    out: &mut Vec<[f64; 6]>,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    min: DVec3,
+    max: DVec3,
+) {
+    out.clear();
+    let bx_min = min.x.floor() as i32;
+    let bx_max = max.x.floor() as i32;
+    let by_min = min.y.floor() as i32;
+    let by_max = max.y.floor() as i32;
+    let bz_min = min.z.floor() as i32;
+    let bz_max = max.z.floor() as i32;
+
+    for bx in bx_min..=bx_max {
+        for by in by_min..=by_max {
+            if by < 0 || by >= CHUNK_HEIGHT as i32 {
+                continue;
+            }
+            for bz in bz_min..=bz_max {
+                if let Some(block_id) = chunk_streamer.block_at_world(bx, by, bz) {
+                    if registry.get(block_id).is_some_and(|b| b.solid) {
+                        out.push([
+                            bx as f64,
+                            by as f64,
+                            bz as f64,
+                            bx as f64 + 1.0,
+                            by as f64 + 1.0,
+                            bz as f64 + 1.0,
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve movement along a single axis against block AABBs. Returns clamped delta.
+/// `axis`: 0=X, 1=Y, 2=Z. The perpendicular axes are checked for overlap.
+fn resolve_axis(
+    pos: DVec3,
+    half_w: f64,
+    height: f64,
+    mut delta: f64,
+    aabbs: &[[f64; 6]],
+    axis: usize,
+) -> f64 {
+    // Player extent on each axis: [min, max].
+    let player_min = [pos.x - half_w, pos.y, pos.z - half_w];
+    let player_max = [pos.x + half_w, pos.y + height, pos.z + half_w];
+
+    // The two axes perpendicular to `axis`.
+    let perp = match axis {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+
+    for aabb in aabbs {
+        // Check overlap on perpendicular axes.
+        if player_max[perp[0]] <= aabb[perp[0]]
+            || player_min[perp[0]] >= aabb[perp[0] + 3]
+            || player_max[perp[1]] <= aabb[perp[1]]
+            || player_min[perp[1]] >= aabb[perp[1] + 3]
+        {
+            continue;
+        }
+
+        if delta < 0.0 {
+            // Moving negative: clamp so our min face doesn't pass block max face.
+            let gap = aabb[axis + 3] - player_min[axis];
+            if gap <= 0.0 && delta < gap {
+                delta = gap;
+            }
+        } else if delta > 0.0 {
+            // Moving positive: clamp so our max face doesn't pass block min face.
+            let gap = aabb[axis] - player_max[axis];
+            if gap >= 0.0 && delta > gap {
+                delta = gap;
+            }
+        }
+    }
+    delta
+}
+
 #[cfg(test)]
 mod tests {
     use glam::DVec3;
@@ -917,8 +1219,8 @@ mod tests {
 
     use super::{
         affected_chunks_for_block_edit, has_target_directive, hotbar_slot_for_key, parse_env_u32,
-        raycast_first_solid_block, BlockRayHit, HotbarInventory, AIR_BLOCK_ID, HOTBAR_BLOCK_IDS,
-        HOTBAR_STACK_LIMIT,
+        raycast_first_solid_block, resolve_axis, BlockRayHit, HotbarInventory, AIR_BLOCK_ID,
+        HOTBAR_BLOCK_IDS, HOTBAR_STACK_LIMIT,
     };
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
 
@@ -1055,5 +1357,56 @@ mod tests {
             |_x, _y, _z| Some(AIR_BLOCK_ID),
         );
         assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn aabb_resolve_y_clamps_downward_movement() {
+        // Player at y=5.0, falling down. Block at y=4 (top face at y=5).
+        let pos = DVec3::new(5.0, 5.0, 5.0);
+        let half_w = 0.3;
+        let height = 1.8;
+        let block = [4.0, 4.0, 4.0, 5.5, 5.0, 5.5]; // block from (4,4,4) to (5.5,5,5.5)
+        let dy = resolve_axis(pos, half_w, height, -1.0, &[block], 1);
+        // Should clamp to exactly 0 (already resting on block top).
+        assert!((dy - 0.0).abs() < 1e-10, "expected dy=0, got {dy}");
+    }
+
+    #[test]
+    fn aabb_resolve_y_allows_free_fall_when_no_block_below() {
+        let pos = DVec3::new(5.0, 10.0, 5.0);
+        let half_w = 0.3;
+        let height = 1.8;
+        let dy = resolve_axis(pos, half_w, height, -0.5, &[], 1);
+        assert!((dy - (-0.5)).abs() < 1e-10, "expected free fall, got {dy}");
+    }
+
+    #[test]
+    fn aabb_resolve_x_clamps_into_wall() {
+        let pos = DVec3::new(5.0, 5.0, 5.0);
+        let half_w = 0.3;
+        let height = 1.8;
+        // Wall block at x=6 (from x=6 to x=7, ahead of player).
+        let wall = [6.0, 4.0, 4.0, 7.0, 7.0, 6.0];
+        let dx = resolve_axis(pos, half_w, height, 2.0, &[wall], 0);
+        // Player right edge at 5.3, wall starts at x=6. Gap = 6.0 - 5.3 = 0.7.
+        assert!(
+            (dx - 0.7).abs() < 1e-10,
+            "expected dx=0.7, got {dx}"
+        );
+    }
+
+    #[test]
+    fn aabb_resolve_z_clamps_into_wall() {
+        let pos = DVec3::new(5.0, 5.0, 5.0);
+        let half_w = 0.3;
+        let height = 1.8;
+        // Wall block at z=6.
+        let wall = [4.0, 4.0, 6.0, 6.0, 7.0, 7.0];
+        let dz = resolve_axis(pos, half_w, height, 2.0, &[wall], 2);
+        // Player front edge at 5.3, wall starts at z=6. Gap = 6.0 - 5.3 = 0.7.
+        assert!(
+            (dz - 0.7).abs() < 1e-10,
+            "expected dz=0.7, got {dz}"
+        );
     }
 }

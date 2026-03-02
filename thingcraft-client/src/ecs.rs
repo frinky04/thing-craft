@@ -45,11 +45,39 @@ pub struct RenderTransform {
     pub pitch: f32,
 }
 
+/// Physics body for gravity, friction, and AABB collision.
+/// `position` in `Transform64` represents the player's feet when physics is active.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PhysicsBody {
+    pub width: f64,
+    pub height: f64,
+    pub eye_height: f64,
+    pub velocity: DVec3,
+    pub on_ground: bool,
+    pub fall_distance: f64,
+    pub step_height: f64,
+}
+
+impl Default for PhysicsBody {
+    fn default() -> Self {
+        Self {
+            width: 0.6,
+            height: 1.8,
+            eye_height: 1.62,
+            velocity: DVec3::ZERO,
+            on_ground: false,
+            fall_distance: 0.0,
+            step_height: 0.5,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum SimCommandEvent {
     MoveIntent { x: f32, y: f32, z: f32 },
     LookDelta { yaw: f32, pitch: f32 },
     ToggleFly,
+    Jump,
 }
 
 #[derive(Resource, Debug, Default)]
@@ -81,6 +109,8 @@ impl Default for FixedTickConfig {
 pub struct PlayerIntentState {
     movement: Vec3,
     look_delta: Vec2,
+    jump_requested: bool,
+    toggle_fly_requested: bool,
 }
 
 #[derive(Resource, Debug, Clone, Copy, Default)]
@@ -100,6 +130,7 @@ pub struct CameraSnapshot {
     pub authoritative: Transform64,
     pub interpolated: RenderTransform,
     pub fly_mode: bool,
+    pub physics: PhysicsBody,
 }
 
 pub struct EcsRuntime {
@@ -128,6 +159,7 @@ impl EcsRuntime {
                 fly_mode: true,
             },
             RenderTransform::default(),
+            PhysicsBody::default(),
         ));
 
         let mut input_schedule = Schedule::default();
@@ -182,16 +214,60 @@ impl EcsRuntime {
     }
 
     pub fn camera_snapshot(&mut self) -> Option<CameraSnapshot> {
-        let mut query = self
-            .world
-            .query_filtered::<(&Transform64, &RenderTransform, &FlyCamera), With<Player>>();
-        let (transform, render_transform, fly_camera) = query.iter(&self.world).next()?;
+        let mut query = self.world.query_filtered::<(
+            &Transform64,
+            &RenderTransform,
+            &FlyCamera,
+            &PhysicsBody,
+        ), With<Player>>();
+        let (transform, render_transform, fly_camera, physics) =
+            query.iter(&self.world).next()?;
 
         Some(CameraSnapshot {
             authoritative: *transform,
             interpolated: *render_transform,
             fly_mode: fly_camera.fly_mode,
+            physics: *physics,
         })
+    }
+
+    /// Check if the player is currently in fly mode.
+    pub fn is_fly_mode(&mut self) -> bool {
+        let mut query = self
+            .world
+            .query_filtered::<&FlyCamera, With<Player>>();
+        query
+            .iter(&self.world)
+            .next()
+            .is_none_or(|cam| cam.fly_mode)
+    }
+
+    /// Direct access to the player's physics body for collision resolution.
+    pub fn player_physics(&mut self) -> Option<(Transform64, PhysicsBody)> {
+        let mut query = self
+            .world
+            .query_filtered::<(&Transform64, &PhysicsBody), With<Player>>();
+        let (transform, physics) = query.iter(&self.world).next()?;
+        Some((*transform, *physics))
+    }
+
+    /// Write back resolved position and physics state after collision.
+    pub fn apply_resolved_physics(
+        &mut self,
+        position: DVec3,
+        velocity: DVec3,
+        on_ground: bool,
+        fall_distance: f64,
+    ) {
+        let mut query = self
+            .world
+            .query_filtered::<(&mut Transform64, &mut PhysicsBody), With<Player>>();
+        if let Some((mut transform, mut physics)) = query.iter_mut(&mut self.world).next() {
+            transform.position = position;
+            physics.velocity = velocity;
+            physics.on_ground = on_ground;
+            physics.fall_distance = fall_distance;
+        }
     }
 
     #[cfg(test)]
@@ -223,13 +299,16 @@ fn capture_input_system(
         queue.0.push_back(SimCommandEvent::ToggleFly);
     }
 
+    if raw_input.pressed.contains(&KeyCode::Space) {
+        queue.0.push_back(SimCommandEvent::Jump);
+    }
+
     raw_input.just_pressed.clear();
 }
 
 fn consume_commands_system(
     mut queue: ResMut<'_, SimCommandQueue>,
     mut intent: ResMut<'_, PlayerIntentState>,
-    mut cameras: Query<'_, '_, &mut FlyCamera, With<Player>>,
 ) {
     while let Some(command) = queue.0.pop_front() {
         match command {
@@ -240,20 +319,47 @@ fn consume_commands_system(
                 intent.look_delta += Vec2::new(yaw, pitch);
             }
             SimCommandEvent::ToggleFly => {
-                for mut camera in &mut cameras {
-                    camera.fly_mode = !camera.fly_mode;
-                }
+                // Handled by apply_player_motion_system so it can adjust position.
+                intent.toggle_fly_requested = true;
+            }
+            SimCommandEvent::Jump => {
+                intent.jump_requested = true;
             }
         }
     }
 }
 
+// Alpha physics constants (from Entity.java / MobEntity.java).
+const GRAVITY: f64 = 0.08;
+const AIR_DRAG_Y: f64 = 0.98;
+const GROUND_SLIPPERINESS: f64 = 0.6;
+const AIR_FRICTION_H: f64 = 0.91;
+const GROUND_FRICTION: f64 = GROUND_SLIPPERINESS * AIR_FRICTION_H; // 0.546
+const GROUND_ACCELERATION: f64 = 0.1; // Alpha: 0.1 * (f^3 / f^3), where f = GROUND_FRICTION
+const AIR_ACCELERATION: f64 = 0.02;
+const JUMP_VELOCITY: f64 = 0.42;
+
 fn apply_player_motion_system(
     fixed_dt: Res<'_, FixedDeltaSeconds>,
     mut intent: ResMut<'_, PlayerIntentState>,
-    mut players: Query<'_, '_, (&mut Transform64, &FlyCamera), With<Player>>,
+    mut players: Query<'_, '_, (&mut Transform64, &mut FlyCamera, &mut PhysicsBody), With<Player>>,
 ) {
-    for (mut transform, camera) in &mut players {
+    for (mut transform, mut camera, mut physics) in &mut players {
+        // Handle fly toggle with position adjustment to prevent coordinate-space jump.
+        // In fly mode, position = camera (eye). In physics mode, position = feet.
+        if intent.toggle_fly_requested {
+            camera.fly_mode = !camera.fly_mode;
+            if camera.fly_mode {
+                // Switching to fly: position was at feet, move up to eye level.
+                transform.position.y += physics.eye_height;
+            } else {
+                // Switching to walk: position was at eye, move down to feet.
+                transform.position.y -= physics.eye_height;
+                physics.velocity = DVec3::ZERO;
+                physics.on_ground = false;
+            }
+        }
+
         transform.prev_position = transform.position;
         transform.prev_yaw = transform.yaw;
         transform.prev_pitch = transform.pitch;
@@ -272,32 +378,86 @@ fn apply_player_motion_system(
         let flat_forward = DVec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
         let right = flat_forward.cross(DVec3::Y).normalize_or_zero();
 
-        let mut desired_direction =
-            right * f64::from(intent.movement.x) + flat_forward * f64::from(intent.movement.z);
         if camera.fly_mode {
+            // Fly mode: direct position control (original behavior).
+            let mut desired_direction =
+                right * f64::from(intent.movement.x) + flat_forward * f64::from(intent.movement.z);
             desired_direction += DVec3::Y * f64::from(intent.movement.y);
-        }
 
-        if desired_direction.length_squared() > 0.0 {
-            desired_direction = desired_direction.normalize();
-        }
+            if desired_direction.length_squared() > 0.0 {
+                desired_direction = desired_direction.normalize();
+            }
 
-        transform.position += desired_direction * camera.speed * fixed_dt.0;
+            transform.position += desired_direction * camera.speed * fixed_dt.0;
+            physics.velocity = DVec3::ZERO;
+        } else {
+            // Physics mode: Alpha-faithful gravity + friction + acceleration.
+            // The system computes velocity; collision resolution is done in app.rs.
+
+            // Gravity.
+            physics.velocity.y -= GRAVITY;
+
+            // Jump: apply impulse if on_ground and jump requested.
+            if intent.jump_requested && physics.on_ground {
+                physics.velocity.y = JUMP_VELOCITY;
+                physics.on_ground = false;
+            }
+
+            // Horizontal input acceleration (Alpha formulas).
+            let mut move_dir =
+                right * f64::from(intent.movement.x) + flat_forward * f64::from(intent.movement.z);
+            if move_dir.length_squared() > 0.0 {
+                move_dir = move_dir.normalize();
+            }
+
+            let acceleration = if physics.on_ground {
+                GROUND_ACCELERATION
+            } else {
+                AIR_ACCELERATION
+            };
+
+            physics.velocity.x += move_dir.x * acceleration;
+            physics.velocity.z += move_dir.z * acceleration;
+
+            // Apply friction / drag.
+            physics.velocity.y *= AIR_DRAG_Y;
+            let h_friction = if physics.on_ground {
+                GROUND_FRICTION
+            } else {
+                AIR_FRICTION_H
+            };
+            physics.velocity.x *= h_friction;
+            physics.velocity.z *= h_friction;
+
+            // Apply velocity to position (collision resolution happens in app.rs).
+            transform.position += physics.velocity;
+        }
     }
 
     intent.look_delta = Vec2::ZERO;
+    intent.jump_requested = false;
+    intent.toggle_fly_requested = false;
 }
 
 fn interpolate_render_transform_system(
     alpha: Res<'_, RenderAlpha>,
-    mut players: Query<'_, '_, (&Transform64, &mut RenderTransform), With<Player>>,
+    mut players: Query<
+        '_,
+        '_,
+        (&Transform64, &mut RenderTransform, &FlyCamera, &PhysicsBody),
+        With<Player>,
+    >,
 ) {
-    for (transform, mut render_transform) in &mut players {
+    for (transform, mut render_transform, fly_camera, physics) in &mut players {
         let blend = f64::from(alpha.0);
-        render_transform.position = transform
-            .prev_position
-            .lerp(transform.position, blend)
-            .as_vec3();
+        let mut pos = transform.prev_position.lerp(transform.position, blend);
+
+        // In physics mode, position is at feet. Camera goes at eye height.
+        if !fly_camera.fly_mode {
+            pos.y += physics.eye_height;
+        }
+
+        render_transform.position = pos.as_vec3();
         render_transform.yaw =
             (transform.prev_yaw + (transform.yaw - transform.prev_yaw) * blend) as f32;
         render_transform.pitch =
