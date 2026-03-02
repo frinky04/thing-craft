@@ -7,7 +7,7 @@
 - M2 complete: fly camera, interpolation, and screen-space strafe controls are functioning.
 - M3 in progress: chunk residency manager now tracks requested/generating/meshing/ready/evicting plus dirty/remesh propagation states around the camera.
 - M4 started: deterministic biome/climate and startup overworld generation scaffold implemented.
-- M5 in progress: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, and fixed-tick block interaction requests (raycast break/place + dirty remesh propagation) are implemented.
+- M5 in progress: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, fixed-tick block interaction requests (raycast break/place + dirty remesh propagation), per-edit column height/light refresh, and renderer frustum culling are implemented.
 
 ## M0 - Repository Foundation
 

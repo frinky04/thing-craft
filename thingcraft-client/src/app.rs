@@ -253,6 +253,7 @@ pub fn run() -> Result<()> {
                                 camera_z = snapshot.authoritative.position.z,
                                 fly_mode = snapshot.fly_mode,
                                 resident_chunks = residency.total,
+                                resident_chunks_gpu = renderer.chunk_mesh_count(),
                                 ready_chunks = residency.ready,
                                 generating_chunks = residency.generating,
                                 meshing_chunks = residency.meshing,
@@ -261,7 +262,7 @@ pub fn run() -> Result<()> {
                                 remesh_enqueued = residency.remesh_enqueued,
                                 in_flight_generation = residency.in_flight_generation,
                                 in_flight_meshing = residency.in_flight_meshing,
-                                gpu_chunk_meshes = renderer.chunk_mesh_count(),
+                                visible_chunks = renderer.visible_chunk_count(),
                                 "runtime stats"
                             );
                         } else {
@@ -271,6 +272,7 @@ pub fn run() -> Result<()> {
                                 avg_frame_ms = report.avg_frame_ms,
                                 avg_tick_ms = report.avg_tick_ms,
                                 resident_chunks = residency.total,
+                                resident_chunks_gpu = renderer.chunk_mesh_count(),
                                 ready_chunks = residency.ready,
                                 generating_chunks = residency.generating,
                                 meshing_chunks = residency.meshing,
@@ -279,7 +281,7 @@ pub fn run() -> Result<()> {
                                 remesh_enqueued = residency.remesh_enqueued,
                                 in_flight_generation = residency.in_flight_generation,
                                 in_flight_meshing = residency.in_flight_meshing,
-                                gpu_chunk_meshes = renderer.chunk_mesh_count(),
+                                visible_chunks = renderer.visible_chunk_count(),
                                 "runtime stats"
                             );
                         }

@@ -94,7 +94,6 @@ struct MeshingJob {
 #[derive(Debug)]
 struct MeshingResult {
     pos: ChunkPos,
-    chunk: ChunkData,
     mesh: ChunkMesh,
 }
 
@@ -155,14 +154,7 @@ impl ChunkStreamer {
                     };
                     let mesh =
                         build_chunk_mesh_with_neighbors(&job.chunk, &meshing_registry, &neighbors);
-                    if meshing_result_tx
-                        .send(MeshingResult {
-                            pos,
-                            chunk: job.chunk,
-                            mesh,
-                        })
-                        .is_err()
-                    {
+                    if meshing_result_tx.send(MeshingResult { pos, mesh }).is_err() {
                         break;
                     }
                 }
@@ -291,6 +283,7 @@ impl ChunkStreamer {
         };
 
         if changed {
+            self.refresh_columns_after_block_edit(pos, local_x, local_z);
             self.mark_block_geometry_dirty(pos, local_x, local_z);
         }
         changed
@@ -505,13 +498,13 @@ impl ChunkStreamer {
                     }
 
                     if let Some(slot) = self.slots.get_mut(&result.pos) {
-                        slot.chunk = Some(result.chunk);
+                        if slot.dirty.geometry {
+                            slot.state = ChunkResidencyState::Meshing;
+                            continue;
+                        }
+
                         slot.mesh = Some(result.mesh);
-                        slot.state = if slot.dirty.geometry {
-                            ChunkResidencyState::Meshing
-                        } else {
-                            ChunkResidencyState::Ready
-                        };
+                        slot.state = ChunkResidencyState::Ready;
                         self.mesh_dirty = true;
                         if let Some(mesh) = &slot.mesh {
                             self.render_updates.push(RenderMeshUpdate::Upsert {
@@ -610,6 +603,65 @@ impl ChunkStreamer {
             slot.state = ChunkResidencyState::Meshing;
             self.remesh_enqueued_total = self.remesh_enqueued_total.saturating_add(1);
         }
+    }
+
+    fn refresh_columns_after_block_edit(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
+        self.refresh_single_column(pos, local_x, local_z);
+
+        if local_x == 0 {
+            self.refresh_single_column(
+                ChunkPos {
+                    x: pos.x - 1,
+                    z: pos.z,
+                },
+                (CHUNK_WIDTH as u8) - 1,
+                local_z,
+            );
+        }
+        if local_x == (CHUNK_WIDTH as u8) - 1 {
+            self.refresh_single_column(
+                ChunkPos {
+                    x: pos.x + 1,
+                    z: pos.z,
+                },
+                0,
+                local_z,
+            );
+        }
+        if local_z == 0 {
+            self.refresh_single_column(
+                ChunkPos {
+                    x: pos.x,
+                    z: pos.z - 1,
+                },
+                local_x,
+                (CHUNK_DEPTH as u8) - 1,
+            );
+        }
+        if local_z == (CHUNK_DEPTH as u8) - 1 {
+            self.refresh_single_column(
+                ChunkPos {
+                    x: pos.x,
+                    z: pos.z + 1,
+                },
+                local_x,
+                0,
+            );
+        }
+    }
+
+    fn refresh_single_column(&mut self, pos: ChunkPos, local_x: u8, local_z: u8) {
+        let Some(slot) = self.slots.get_mut(&pos) else {
+            return;
+        };
+        if slot.state == ChunkResidencyState::Evicting {
+            return;
+        }
+        let Some(chunk) = slot.chunk.as_mut() else {
+            return;
+        };
+        chunk.recalculate_column_height_and_sky_light(local_x, local_z, &self.registry);
+        chunk.reseed_column_emitted_light(local_x, local_z, &self.registry);
     }
 }
 
@@ -968,6 +1020,62 @@ mod tests {
         assert_eq!(
             streamer.slot_state(ChunkPos { x: 1, z: 0 }),
             Some(ChunkResidencyState::Meshing)
+        );
+    }
+
+    #[test]
+    fn in_flight_meshing_result_does_not_overwrite_block_edits() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 1,
+                max_meshing_dispatch: 1,
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut target = None;
+        for _ in 0..500 {
+            streamer.tick(center);
+
+            if target.is_none() {
+                'search: for y in (0..CHUNK_HEIGHT as i32).rev() {
+                    for z in 0..CHUNK_DEPTH as i32 {
+                        for x in 0..CHUNK_WIDTH as i32 {
+                            if streamer.block_at_world(x, y, z).is_some_and(|id| id != 0) {
+                                target = Some((x, y, z));
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if target.is_some() && streamer.meshing_in_flight.contains(&center) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let (x, y, z) = target.expect("expected a mutable solid block");
+        assert!(streamer.meshing_in_flight.contains(&center));
+        assert!(streamer.set_block_at_world(x, y, z, 0));
+
+        for _ in 0..500 {
+            streamer.tick(center);
+            if streamer.metrics().ready == 1 && streamer.metrics().in_flight_meshing == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(streamer.block_at_world(x, y, z), Some(0));
+        assert_eq!(
+            streamer.slot_state(center),
+            Some(ChunkResidencyState::Ready)
         );
     }
 }

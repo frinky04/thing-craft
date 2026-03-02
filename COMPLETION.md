@@ -27,6 +27,8 @@
 - [x] Incremental streaming meshing now includes cardinal neighbor context and neighbor remesh triggers (prevents interior seam faces between loaded chunks).
 - [x] Dirty/remesh propagation groundwork added: geometry dirty tracking per chunk, edge-propagated neighbor remesh marking, and remesh counters in runtime metrics.
 - [x] Block interaction vertical slice added: camera voxel raycast emits break/place requests, fixed-tick world mutation applies them, and edited chunks trigger boundary-safe remesh propagation.
+- [x] Block edits now refresh per-column height/sky and emitted-light seeds (including touched boundary-neighbor columns) to keep chunk metadata coherent after runtime world mutation.
+- [x] Renderer now frustum-culls chunk draw calls per frame and exposes `visible_chunks` runtime stats for resident-vs-visible perf tracking.
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
 

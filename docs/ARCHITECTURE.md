@@ -49,6 +49,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
   - applies per-chunk render updates (GPU upsert/remove) from worker results.
 - This keeps heavy world build steps off the render path while preserving deterministic state ownership on the main thread.
 - Residency entries now track dirty state, and geometry remesh requests can propagate to cardinal neighbors for boundary edits.
+- Meshing results are now applied only when the target chunk is still clean; stale in-flight meshes are dropped if new edits arrived while meshing.
 
 ## Networking-Ready Input Pattern
 
@@ -61,6 +62,12 @@ This allows future network packets to feed the same command path without forking
 - Requests are consumed during fixed simulation ticks, preserving deterministic simulation ownership and keeping input/render paths side-effect free.
 - Interaction targeting uses a voxel DDA raycast from the authoritative camera transform.
 - Chunk edits are applied through `ChunkStreamer` world-coordinate mutation APIs, which immediately mark edited chunk geometry dirty and propagate boundary remesh to cardinal neighbors when needed.
+- Edited columns immediately refresh chunk-local height/sky data and emitted-light seeds, with boundary-neighbor column refresh at chunk edges.
+
+## Renderer Culling
+
+- Chunk mesh draw calls are frustum-culled on CPU using camera view-projection planes and Alpha chunk AABBs (`16x16x128`).
+- Runtime debug stats now include visible chunk count so GPU-resident vs on-screen chunk pressure can be tracked during exploration.
 
 ## Early Pitfalls to Avoid
 

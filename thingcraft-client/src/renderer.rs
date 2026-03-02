@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use glam::Mat4;
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 use wgpu::{CompositeAlphaMode, PresentMode, SurfaceError};
@@ -27,12 +28,19 @@ pub struct Renderer<'w> {
     depth_view: wgpu::TextureView,
     scene_mesh: Option<SceneMeshGpu>,
     chunk_meshes: HashMap<ChunkPos, SceneMeshGpu>,
+    camera_frustum: Option<FrustumPlanes>,
+    visible_chunk_meshes: usize,
 }
 
 struct SceneMeshGpu {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrustumPlanes {
+    planes: [[f32; 4]; 6],
 }
 
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -247,6 +255,8 @@ impl<'w> Renderer<'w> {
             depth_view,
             scene_mesh: None,
             chunk_meshes: HashMap::new(),
+            camera_frustum: None,
+            visible_chunk_meshes: 0,
         })
     }
 
@@ -258,10 +268,12 @@ impl<'w> Renderer<'w> {
         }
     }
 
-    pub fn update_camera(&self, view_proj: [[f32; 4]; 4]) {
+    pub fn update_camera(&mut self, view_proj: [[f32; 4]; 4]) {
         let uniform = CameraUniform { view_proj };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        let matrix = Mat4::from_cols_array_2d(&view_proj);
+        self.camera_frustum = Some(FrustumPlanes::from_view_proj(matrix));
     }
 
     pub fn set_scene_mesh(&mut self, mesh: &ChunkMesh) {
@@ -332,6 +344,11 @@ impl<'w> Renderer<'w> {
     #[must_use]
     pub fn chunk_mesh_count(&self) -> usize {
         self.chunk_meshes.len()
+    }
+
+    #[must_use]
+    pub fn visible_chunk_count(&self) -> usize {
+        self.visible_chunk_meshes
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -427,20 +444,97 @@ impl<'w> Renderer<'w> {
                 render_pass.set_pipeline(&self.render_pipeline);
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 render_pass.set_bind_group(1, &self.terrain_bind_group, &[]);
-                for chunk_mesh in self.chunk_meshes.values() {
+                let frustum = self.camera_frustum.as_ref();
+                let mut visible = 0_usize;
+                for (pos, chunk_mesh) in &self.chunk_meshes {
+                    if frustum.is_some_and(|view| !view.intersects_chunk(*pos)) {
+                        continue;
+                    }
+
                     render_pass.set_vertex_buffer(0, chunk_mesh.vertex_buffer.slice(..));
                     render_pass.set_index_buffer(
                         chunk_mesh.index_buffer.slice(..),
                         wgpu::IndexFormat::Uint32,
                     );
                     render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
+                    visible += 1;
                 }
+                self.visible_chunk_meshes = visible;
+            } else {
+                self.visible_chunk_meshes = 0;
             }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
+    }
+}
+
+impl FrustumPlanes {
+    fn from_view_proj(view_proj: Mat4) -> Self {
+        let m = view_proj.to_cols_array();
+        let row1 = [m[0], m[4], m[8], m[12]];
+        let row2 = [m[1], m[5], m[9], m[13]];
+        let row3 = [m[2], m[6], m[10], m[14]];
+        let row4 = [m[3], m[7], m[11], m[15]];
+
+        let mut planes = [
+            add_plane(row4, row1), // left
+            sub_plane(row4, row1), // right
+            add_plane(row4, row2), // bottom
+            sub_plane(row4, row2), // top
+            add_plane(row4, row3), // near
+            sub_plane(row4, row3), // far
+        ];
+
+        for plane in &mut planes {
+            normalize_plane(plane);
+        }
+
+        Self { planes }
+    }
+
+    fn intersects_chunk(&self, pos: ChunkPos) -> bool {
+        let (min, max) = chunk_aabb(pos);
+        self.intersects_aabb(min, max)
+    }
+
+    fn intersects_aabb(&self, min: [f32; 3], max: [f32; 3]) -> bool {
+        for plane in &self.planes {
+            let px = if plane[0] >= 0.0 { max[0] } else { min[0] };
+            let py = if plane[1] >= 0.0 { max[1] } else { min[1] };
+            let pz = if plane[2] >= 0.0 { max[2] } else { min[2] };
+            let distance = plane[0] * px + plane[1] * py + plane[2] * pz + plane[3];
+            if distance < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn chunk_aabb(pos: ChunkPos) -> ([f32; 3], [f32; 3]) {
+    let min = [pos.x as f32 * 16.0, 0.0, pos.z as f32 * 16.0];
+    let max = [min[0] + 16.0, 128.0, min[2] + 16.0];
+    (min, max)
+}
+
+fn add_plane(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+}
+
+fn sub_plane(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]]
+}
+
+fn normalize_plane(plane: &mut [f32; 4]) {
+    let length = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
+    if length > 0.0 {
+        plane[0] /= length;
+        plane[1] /= length;
+        plane[2] /= length;
+        plane[3] /= length;
     }
 }
 
@@ -608,3 +702,28 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(texel.rgb * light, texel.a);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use glam::{Mat4, Vec3};
+
+    use super::{chunk_aabb, FrustumPlanes};
+    use crate::world::ChunkPos;
+
+    #[test]
+    fn frustum_includes_origin_chunk_and_rejects_far_chunk() {
+        let view = Mat4::look_to_rh(Vec3::new(8.0, 64.0, 8.0), Vec3::new(0.0, 0.0, 1.0), Vec3::Y);
+        let proj = Mat4::perspective_rh_gl(70_f32.to_radians(), 16.0 / 9.0, 0.05, 128.0);
+        let frustum = FrustumPlanes::from_view_proj(proj * view);
+
+        assert!(frustum.intersects_chunk(ChunkPos { x: 0, z: 0 }));
+        assert!(!frustum.intersects_chunk(ChunkPos { x: 100, z: 100 }));
+    }
+
+    #[test]
+    fn chunk_aabb_uses_alpha_dimensions() {
+        let (min, max) = chunk_aabb(ChunkPos { x: -2, z: 3 });
+        assert_eq!(min, [-32.0, 0.0, 48.0]);
+        assert_eq!(max, [-16.0, 128.0, 64.0]);
+    }
+}

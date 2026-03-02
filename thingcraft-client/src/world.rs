@@ -867,33 +867,11 @@ impl ChunkData {
     pub fn recalculate_height_map(&mut self, registry: &BlockRegistry) {
         for local_x in 0..CHUNK_WIDTH {
             for local_z in 0..CHUNK_DEPTH {
-                let mut height = 0;
-                for y in (0..CHUNK_HEIGHT).rev() {
-                    let local_x_u8 = local_x as u8;
-                    let local_z_u8 = local_z as u8;
-                    let y_u8 = y as u8;
-                    let block_id = self.block(local_x_u8, y_u8, local_z_u8);
-
-                    if registry.opacity_of(block_id) > 0 {
-                        height = (y + 1) as u8;
-                        break;
-                    }
-                }
-                self.height_map[local_z * CHUNK_WIDTH + local_x] = height;
-
-                let mut sky_level = 15_u8;
-                for y in (0..CHUNK_HEIGHT).rev() {
-                    let local_x_u8 = local_x as u8;
-                    let local_z_u8 = local_z as u8;
-                    let y_u8 = y as u8;
-                    let block_id = self.block(local_x_u8, y_u8, local_z_u8);
-                    let opacity = registry.opacity_of(block_id);
-                    if opacity > 0 {
-                        let attenuation = opacity.clamp(1, 15);
-                        sky_level = sky_level.saturating_sub(attenuation);
-                    }
-                    self.set_sky_light(local_x_u8, y_u8, local_z_u8, sky_level);
-                }
+                self.recalculate_column_height_and_sky_light(
+                    local_x as u8,
+                    local_z as u8,
+                    registry,
+                );
             }
         }
     }
@@ -901,19 +879,57 @@ impl ChunkData {
     pub fn seed_emitted_light(&mut self, registry: &BlockRegistry) {
         for local_x in 0..CHUNK_WIDTH {
             for local_z in 0..CHUNK_DEPTH {
-                for y in 0..CHUNK_HEIGHT {
-                    let local_x_u8 = local_x as u8;
-                    let local_z_u8 = local_z as u8;
-                    let y_u8 = y as u8;
-                    let block_id = self.block(local_x_u8, y_u8, local_z_u8);
-                    self.set_block_light(
-                        local_x_u8,
-                        y_u8,
-                        local_z_u8,
-                        registry.emitted_light_of(block_id),
-                    );
-                }
+                self.reseed_column_emitted_light(local_x as u8, local_z as u8, registry);
             }
+        }
+    }
+
+    pub fn recalculate_column_height_and_sky_light(
+        &mut self,
+        local_x: u8,
+        local_z: u8,
+        registry: &BlockRegistry,
+    ) {
+        assert!(usize::from(local_x) < CHUNK_WIDTH, "local_x out of range");
+        assert!(usize::from(local_z) < CHUNK_DEPTH, "local_z out of range");
+
+        let mut height = 0;
+        for y in (0..CHUNK_HEIGHT).rev() {
+            let y_u8 = y as u8;
+            let block_id = self.block(local_x, y_u8, local_z);
+            if registry.opacity_of(block_id) > 0 {
+                height = (y + 1) as u8;
+                break;
+            }
+        }
+        self.height_map[usize::from(local_z) * CHUNK_WIDTH + usize::from(local_x)] = height;
+
+        let mut sky_level = 15_u8;
+        for y in (0..CHUNK_HEIGHT).rev() {
+            let y_u8 = y as u8;
+            let block_id = self.block(local_x, y_u8, local_z);
+            let opacity = registry.opacity_of(block_id);
+            if opacity > 0 {
+                let attenuation = opacity.clamp(1, 15);
+                sky_level = sky_level.saturating_sub(attenuation);
+            }
+            self.set_sky_light(local_x, y_u8, local_z, sky_level);
+        }
+    }
+
+    pub fn reseed_column_emitted_light(
+        &mut self,
+        local_x: u8,
+        local_z: u8,
+        registry: &BlockRegistry,
+    ) {
+        assert!(usize::from(local_x) < CHUNK_WIDTH, "local_x out of range");
+        assert!(usize::from(local_z) < CHUNK_DEPTH, "local_z out of range");
+
+        for y in 0..CHUNK_HEIGHT {
+            let y_u8 = y as u8;
+            let block_id = self.block(local_x, y_u8, local_z);
+            self.set_block_light(local_x, y_u8, local_z, registry.emitted_light_of(block_id));
         }
     }
 
@@ -1164,5 +1180,34 @@ mod tests {
         assert!((1..=CHUNK_HEIGHT as u8).contains(&center_height));
         assert_eq!(world.spawn_chunk.block(8, 0, 8), BEDROCK_ID);
         assert_eq!(world.spawn_chunk.sky_light(8, 127, 8), 15);
+    }
+
+    #[test]
+    fn column_recalculation_updates_height_and_sky_light_after_edit() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        chunk.set_block(2, 5, 3, STONE_ID);
+        chunk.recalculate_column_height_and_sky_light(2, 3, &registry);
+        assert_eq!(chunk.height_at(2, 3), 6);
+        assert_eq!(chunk.sky_light(2, 6, 3), 15);
+        assert_eq!(chunk.sky_light(2, 5, 3), 0);
+
+        chunk.set_block(2, 5, 3, AIR_ID);
+        chunk.recalculate_column_height_and_sky_light(2, 3, &registry);
+        assert_eq!(chunk.height_at(2, 3), 0);
+        assert_eq!(chunk.sky_light(2, 5, 3), 15);
+    }
+
+    #[test]
+    fn emitted_light_column_reseed_tracks_new_block_values() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        chunk.set_block(4, 10, 7, 50);
+        chunk.reseed_column_emitted_light(4, 7, &registry);
+        assert_eq!(chunk.block_light(4, 10, 7), 14);
+
+        chunk.set_block(4, 10, 7, AIR_ID);
+        chunk.reseed_column_emitted_light(4, 7, &registry);
+        assert_eq!(chunk.block_light(4, 10, 7), 0);
     }
 }
