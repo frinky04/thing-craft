@@ -12,6 +12,7 @@
 - [x] CPU chunk meshing scaffold added (face culling + atlas UV generation).
 - [x] `wgpu` scene pipeline now draws generated chunk geometry with camera uniforms.
 - [x] Alpha `terrain.png` texture atlas is loaded and sampled by the chunk render pipeline.
+- [x] Bootstrap now generates and renders a small chunk region (3x3 around spawn), not a single chunk.
 - [x] Reference tracking doc added (`docs/REFERENCES.md`) for copied constants/behaviors.
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.

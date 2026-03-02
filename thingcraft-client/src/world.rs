@@ -738,6 +738,28 @@ impl OverworldChunkGenerator {
         chunk.seed_emitted_light(registry);
         chunk
     }
+
+    #[must_use]
+    pub fn generate_region(
+        &self,
+        center_chunk: ChunkPos,
+        radius: i32,
+        registry: &BlockRegistry,
+    ) -> Vec<ChunkData> {
+        let mut chunks = Vec::new();
+        for chunk_z in (center_chunk.z - radius)..=(center_chunk.z + radius) {
+            for chunk_x in (center_chunk.x - radius)..=(center_chunk.x + radius) {
+                chunks.push(self.generate_chunk(
+                    ChunkPos {
+                        x: chunk_x,
+                        z: chunk_z,
+                    },
+                    registry,
+                ));
+            }
+        }
+        chunks
+    }
 }
 
 fn normalize_noise(value: f64) -> f64 {
@@ -914,6 +936,7 @@ impl NibbleStorage {
 pub struct BootstrapWorld {
     pub registry: BlockRegistry,
     pub spawn_chunk: ChunkData,
+    pub spawn_region: Vec<ChunkData>,
 }
 
 impl BootstrapWorld {
@@ -921,11 +944,17 @@ impl BootstrapWorld {
     pub fn alpha_bootstrap() -> Self {
         let registry = BlockRegistry::alpha_1_2_6();
         let generator = OverworldChunkGenerator::new(0xA126_0001);
-        let spawn_chunk = generator.generate_chunk(ChunkPos { x: 0, z: 0 }, &registry);
+        let spawn_region = generator.generate_region(ChunkPos { x: 0, z: 0 }, 1, &registry);
+        let spawn_chunk = spawn_region
+            .iter()
+            .find(|chunk| chunk.pos == ChunkPos { x: 0, z: 0 })
+            .cloned()
+            .unwrap_or_else(|| generator.generate_chunk(ChunkPos { x: 0, z: 0 }, &registry));
 
         Self {
             registry,
             spawn_chunk,
+            spawn_region,
         }
     }
 }
@@ -985,6 +1014,7 @@ mod tests {
     #[test]
     fn bootstrap_world_populates_height_map() {
         let world = BootstrapWorld::alpha_bootstrap();
+        assert_eq!(world.spawn_region.len(), 9);
         let center_height = world.spawn_chunk.height_at(8, 8);
         assert!((1..=CHUNK_HEIGHT as u8).contains(&center_height));
         assert_eq!(world.spawn_chunk.block(8, 0, 8), BEDROCK_ID);

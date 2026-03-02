@@ -102,6 +102,8 @@ const FACES: [FaceDef; 6] = [
 #[must_use]
 pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMesh {
     let mut mesh = ChunkMesh::default();
+    let chunk_origin_x = chunk.pos.x as f32 * CHUNK_WIDTH as f32;
+    let chunk_origin_z = chunk.pos.z as f32 * CHUNK_DEPTH as f32;
 
     for local_x in 0..CHUNK_WIDTH as i32 {
         for local_z in 0..CHUNK_DEPTH as i32 {
@@ -122,9 +124,9 @@ pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMes
 
                     append_face(
                         &mut mesh,
-                        local_x as f32,
+                        local_x as f32 + chunk_origin_x,
                         y as f32,
-                        local_z as f32,
+                        local_z as f32 + chunk_origin_z,
                         face,
                         registry.sprite_index_of(block_id),
                         registry.emitted_light_of(block_id),
@@ -135,6 +137,19 @@ pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMes
     }
 
     mesh
+}
+
+#[must_use]
+pub fn merge_meshes(meshes: &[ChunkMesh]) -> ChunkMesh {
+    let mut merged = ChunkMesh::default();
+    for mesh in meshes {
+        let base_index = merged.vertices.len() as u32;
+        merged.vertices.extend_from_slice(&mesh.vertices);
+        merged
+            .indices
+            .extend(mesh.indices.iter().map(|index| index + base_index));
+    }
+    merged
 }
 
 fn neighbor_block(chunk: &ChunkData, x: i32, y: i32, z: i32) -> u8 {
@@ -236,5 +251,31 @@ mod tests {
         assert!(!mesh.vertices.is_empty());
         assert!(!mesh.indices.is_empty());
         assert!(mesh.vertices.len() < CHUNK_VOLUME);
+    }
+
+    #[test]
+    fn merge_meshes_offsets_indices() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk_a = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        let mut chunk_b = ChunkData::new(ChunkPos { x: 1, z: 0 }, AIR_ID);
+        chunk_a.set_block(1, 1, 1, 1);
+        chunk_b.set_block(1, 1, 1, 1);
+
+        let mesh_a = build_chunk_mesh(&chunk_a, &registry);
+        let mesh_b = build_chunk_mesh(&chunk_b, &registry);
+        let merged = merge_meshes(&[mesh_a.clone(), mesh_b.clone()]);
+
+        assert_eq!(
+            merged.vertices.len(),
+            mesh_a.vertices.len() + mesh_b.vertices.len()
+        );
+        assert_eq!(
+            merged.indices.len(),
+            mesh_a.indices.len() + mesh_b.indices.len()
+        );
+        assert!(merged
+            .indices
+            .iter()
+            .any(|index| *index >= mesh_a.vertices.len() as u32));
     }
 }
