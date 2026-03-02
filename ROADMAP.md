@@ -7,7 +7,7 @@
 - M2 complete: fly camera, interpolation, and screen-space strafe controls are functioning.
 - M3 started: block registry and chunk core data model implemented.
 - M4 started: deterministic biome/climate and startup overworld generation scaffold implemented.
-- M5 in progress: chunk face-culling mesh extraction, region-aware boundary culling, GPU draw path, terrain-atlas sampling, face-aware grass texturing with biome-driven colormap tinting, directional face shading, and corrected face winding are implemented.
+- M5 in progress: chunk face-culling mesh extraction, region-aware boundary culling, GPU draw path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, and corrected face winding are implemented.
 
 ## M0 - Repository Foundation
 

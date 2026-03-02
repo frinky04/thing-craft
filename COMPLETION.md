@@ -20,6 +20,7 @@
 - [x] Face-aware atlas sampling added for grass (top/bottom/side textures now differ as in Alpha).
 - [x] Grass top now uses biome-driven tint sampled from Alpha `misc/grasscolor.png` (with fallback if missing).
 - [x] Alpha-style directional face shading added (top bright, sides darkened, bottom darkest).
+- [x] Oak log top/bottom face atlas mapping added (cap texture on `+Y/-Y`, side texture on lateral faces).
 
 > Note: Items below track Alpha 1.2.6 gameplay/content parity only.
 
