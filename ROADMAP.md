@@ -18,7 +18,8 @@
 - Fog parity follow-up landed during M7: clear-fog color is now multiplied by Alpha-style smoothed player-position fog brightness (`world.getBrightness` + view-distance bias + tick smoothing/interpolation), restoring underground/shadow fog darkening behavior.
 - Leaf rendering parity follow-up landed during M7: leaf vertices now carry a dedicated material marker and runtime `THINGCRAFT_FANCY_GRAPHICS` controls fancy cutout leaves (`true`) vs fast opaque leaves (`false`, with Alpha tile `+1` remap).
 - M7 Wave 5 landed: entity framework and dropped item entities. Breaking a block now spawns a physics-driven item entity (Alpha ItemEntity constants: gravity 0.04, bounce -0.5, ground friction 0.588, 10-tick pickup delay, 5-minute despawn) that the player collects by walking over it. Items render as Y-axis billboarded terrain atlas sprites with bobbing animation, drawn via the existing chunk shader pipeline in a single batched draw call.
-- Worldgen parity follow-up landed during M7: terrain generation now uses Alpha-exact 3D density field approach with 7 noise generators (`PerlinNoise` octave stacking of `ImprovedNoise`), trilinear interpolation across a 5x17x5 sample grid, climate-modulated height shaping, and a separate top-down surface builder (`buildSurfaces`). Biome source now uses `PerlinSimplexNoise` (octave-stacked simplex noise) instead of `Fbm<OpenSimplex>`, with Alpha-exact seeding order, post-processing transforms, and bulk region sampling. The IceDesert biome variant (which Alpha never produces) has been removed. Bedrock is now an irregular layer at y 0-4 (not flat y=0), and sand/gravel beaches generate from dedicated surface noise. Decoration features (lakes, flowers, cacti, sugar cane, snow cover, pumpkins, reed) are deferred to a follow-up pass.
+- Worldgen parity follow-up landed during M7: terrain generation now uses Alpha-exact 3D density field approach with 7 noise generators (`PerlinNoise` octave stacking of `ImprovedNoise`), trilinear interpolation across a 5x17x5 sample grid, climate-modulated height shaping, and a separate top-down surface builder (`buildSurfaces`). Biome source now uses `PerlinSimplexNoise` (octave-stacked simplex noise) instead of `Fbm<OpenSimplex>`, with Alpha-exact seeding order, post-processing transforms, and bulk region sampling. The IceDesert biome variant (which Alpha never produces) has been removed. Bedrock is now an irregular layer at y 0-4 (not flat y=0), and sand/gravel beaches generate from dedicated surface noise. Decoration features (lakes, flowers, cacti, sugar cane, snow cover, pumpkins, reed) are now integrated, with parity tuning ongoing.
+- Worldgen follow-up: surface lake population (`LakeFeature`-style water/lava passes) is now enabled again in region generation; decoration-rate parity validation for the full feature set remains in progress.
 
 ## M0 - Repository Foundation
 
@@ -183,70 +184,56 @@ Reach functional feature parity in controlled waves.
 
 ## Worldgen Decoration Pass (Follow-Up)
 
-### Status: Not Started
+### Status: Implemented (Parity Tuning In Progress)
 
-The core terrain shape (3D density field, surface builder, biome source) is now Alpha-exact. The following decoration features from Alpha's `OverworldChunkGenerator.populate()` and biome decorators are still missing. These run **after** terrain + surface + caves/ores/dungeons, during the per-chunk population pass.
+The core terrain shape (3D density field, surface builder, biome source) is now Alpha-exact. The decoration pass from Alpha's `OverworldChunkGenerator.populate()` is now wired into generation flow and runs **after** terrain + surface + caves/ores/dungeons.
 
-### Missing Features (Ordered by Impact)
+### Implemented Features (Parity Validation Ongoing)
 
 #### 1. Snow Cover
 - **Source**: `BiomeDecorator.java` — places SNOW on top of exposed solid blocks when biome temperature < 0.5
+- **Status**: Implemented
 - **Scope**: Iterate chunk surface, check temperature, place snow block (ID 78) on top face
-- **Depends on**: Biome temperature sampling (already implemented)
-- **Impact**: Visual — cold biomes (Tundra, Taiga) look bare without snow
 
 #### 2. Surface Lakes (Water & Lava)
 - **Source**: `LakeFeature.java` — carves and fills small surface/underground liquid pools
-- **Scope**: Water lakes: 1 attempt per chunk (1-in-4 chance). Lava lakes: 1 attempt per chunk (1-in-8 chance, lower Y). Carve an irregular blob, fill with liquid, validate no air below liquid.
-- **Impact**: Visual + gameplay — lakes are common landscape features in Alpha
+- **Status**: Implemented
+- **Scope**: Water lakes: 1 attempt per chunk (1-in-4 chance). Lava lakes: 1 attempt per chunk (1-in-8 chance, lower Y). Carve an irregular blob and fill with liquid.
 
 #### 3. Sugar Cane (Reed)
 - **Source**: `BiomeDecorator.java` — `reedPerChunk` (default 0, Swampland/Rainforest raise it)
+- **Status**: Implemented
 - **Scope**: Place 1-3 tall reed columns adjacent to water on sand/dirt/grass
-- **Impact**: Low — cosmetic vegetation
 
 #### 4. Flowers (Dandelion, Rose)
 - **Source**: `BiomeDecorator.java` — `flowersPerChunk` (default 2)
+- **Status**: Implemented
 - **Scope**: Place yellow flower (ID 37) or red flower (ID 38) on grass surface blocks
-- **Impact**: Low — cosmetic vegetation
 
 #### 5. Brown/Red Mushrooms
 - **Source**: `BiomeDecorator.java` — `mushroomsPerChunk` (default 0, +1-in-4 random chance)
+- **Status**: Implemented
 - **Scope**: Place mushroom blocks (IDs 39/40) on solid surfaces with low light level
-- **Impact**: Low — cosmetic, mostly underground
 
 #### 6. Cacti
 - **Source**: `BiomeDecorator.java` — `cactiPerChunk` (Desert=10, otherwise 0)
+- **Status**: Implemented
 - **Scope**: Place 1-3 tall cactus columns (ID 81) on sand, requires no adjacent solid blocks
-- **Depends on**: Cactus block definition in registry
-- **Impact**: Low — Desert biome character
 
 #### 7. Pumpkins
 - **Source**: `BiomeDecorator.java` — rare (1-in-32 chance per chunk)
+- **Status**: Implemented
 - **Scope**: Place pumpkin block (ID 86) on grass with random facing metadata
-- **Depends on**: Pumpkin block definition in registry
-- **Impact**: Very low — extremely rare decoration
 
 #### 8. Clay Discs
 - **Source**: `BiomeDecorator.java` — `clayPerChunk` (default 1)
+- **Status**: Implemented
 - **Scope**: Place disc-shaped clay deposits (ID 82) underwater in sand/dirt
-- **Depends on**: Clay block definition in registry
-- **Impact**: Low — subtle underwater feature
 
-### Implementation Strategy
+### Remaining Work
 
-All decoration features share the same pattern:
-1. Run during `populate_chunk` after caves/ores/dungeons
-2. Use per-chunk `JavaRandom` (seeded from chunk coordinates) for determinism
-3. Iterate N attempts, pick random XZ within chunk, find surface Y, validate placement rules, place blocks
+1. Validate exact Alpha attempt counts/distribution against decompiled reference across large seeds.
+2. Add targeted parity tests for lake shape constraints and frequency envelopes.
+3. Tune edge-case placement behavior (cross-chunk boundaries and biome-specific rates) where needed.
 
-The existing `populate_underground_features` method should be extended to call a new `populate_decorations` pass. Each feature can be a standalone function following the ore/dungeon placement pattern already established.
 
-### Block Registry Additions Needed
-- Snow Cover (ID 78)
-- Yellow Flower (ID 37), Red Flower (ID 38)
-- Brown Mushroom (ID 39), Red Mushroom (ID 40)
-- Cactus (ID 81)
-- Pumpkin (ID 86)
-- Clay (ID 82)
-- Sugar Cane / Reed (ID 83)

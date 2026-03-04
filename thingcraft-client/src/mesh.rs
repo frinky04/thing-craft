@@ -347,6 +347,8 @@ struct FaceAdjust {
     vertex_alpha: u8,
     y_offset: f32,
     side_y_shrink: f32,
+    /// Inset for side faces (cactus): side vertices move toward block center by this amount.
+    side_inset: f32,
 }
 
 impl FaceAdjust {
@@ -354,6 +356,23 @@ impl FaceAdjust {
         vertex_alpha: u8::MAX,
         y_offset: 0.0,
         side_y_shrink: 0.0,
+        side_inset: 0.0,
+    };
+
+    /// Cactus side faces are inset by 1/16 block. Top/bottom are full-size.
+    const CACTUS: Self = Self {
+        vertex_alpha: u8::MAX,
+        y_offset: 0.0,
+        side_y_shrink: 0.0,
+        side_inset: 1.0 / 16.0,
+    };
+
+    /// Snow layer: top face at 0.125 (2/16), side faces shrunk accordingly.
+    const SNOW_LAYER: Self = Self {
+        vertex_alpha: u8::MAX,
+        y_offset: 0.0,
+        side_y_shrink: -0.875,
+        side_inset: 0.0,
     };
 }
 
@@ -685,8 +704,34 @@ where
                             if face.offset[1] > 0 { flow_angle } else { None },
                         );
                     }
+                } else if registry.is_billboard_plant(block_id) {
+                    // === Billboard X-cross plant path ===
+                    let base_pos = [
+                        local_x as f32 + chunk_origin_x,
+                        y as f32,
+                        local_z as f32 + chunk_origin_z,
+                    ];
+                    let face_sky = neighbor_sky_light_lookup(local_x, y, local_z);
+                    let face_block_light = neighbor_block_light_lookup(local_x, y, local_z);
+                    let sprite = registry.sprite_index_of(block_id);
+                    let tint = [255_u8, 255, 255];
+                    append_billboard_cross(
+                        &mut split.transparent,
+                        base_pos,
+                        sprite,
+                        tint,
+                        face_sky,
+                        face_block_light,
+                    );
                 } else {
                     // === Standard opaque block path ===
+                    let face_adjust = if registry.is_cactus(block_id) {
+                        FaceAdjust::CACTUS
+                    } else if registry.is_snow_layer(block_id) {
+                        FaceAdjust::SNOW_LAYER
+                    } else {
+                        FaceAdjust::OPAQUE
+                    };
                     for face in FACES {
                         let nx = local_x + face.offset[0];
                         let ny = y + face.offset[1];
@@ -729,7 +774,7 @@ where
                             face_sky,
                             face_block_light,
                             registry.is_leaves(block_id),
-                            FaceAdjust::OPAQUE,
+                            face_adjust,
                         );
                     }
                 }
@@ -1208,15 +1253,31 @@ fn append_face(
         .round()
         .clamp(0.0, 255.0) as u8;
     for (corner, tex) in face.corners.iter().zip(uv.iter()) {
+        let mut pos_x = base_pos[0] + corner[0];
         let mut pos_y = base_pos[1] + corner[1];
+        let mut pos_z = base_pos[2] + corner[2];
         if adjust.y_offset != 0.0 {
             pos_y += adjust.y_offset;
         }
         if adjust.side_y_shrink != 0.0 && corner[1] > 0.5 {
             pos_y += adjust.side_y_shrink;
         }
+        // Cactus-style side inset: push side faces toward block center
+        if adjust.side_inset != 0.0 && face.offset[1] == 0 {
+            let inset = adjust.side_inset;
+            if face.offset[0] < 0 {
+                pos_x += inset;
+            } else if face.offset[0] > 0 {
+                pos_x -= inset;
+            }
+            if face.offset[2] < 0 {
+                pos_z += inset;
+            } else if face.offset[2] > 0 {
+                pos_z -= inset;
+            }
+        }
         mesh.vertices.push(MeshVertex {
-            position: [base_pos[0] + corner[0], pos_y, base_pos[2] + corner[2]],
+            position: [pos_x, pos_y, pos_z],
             uv: *tex,
             tint_rgba: [tint_rgb[0], tint_rgb[1], tint_rgb[2], adjust.vertex_alpha],
             light_data: [
@@ -1236,6 +1297,83 @@ fn append_face(
         base_index + 2,
         base_index + 3,
     ]);
+}
+
+/// Emit a billboard X-cross (two intersecting quads) for plants like flowers,
+/// mushrooms, and sugar cane. Double-sided for visibility from all angles.
+/// Each quad emits 4 vertices with both front and back index windings.
+fn append_billboard_cross(
+    mesh: &mut ChunkMesh,
+    base_pos: [f32; 3],
+    sprite_index: u16,
+    tint_rgb: [u8; 3],
+    neighbor_sky_light: u8,
+    neighbor_block_light: u8,
+) {
+    let atlas_tile = 1.0 / 16.0;
+    let sprite_x = f32::from(sprite_index % 16) * atlas_tile;
+    let sprite_y = f32::from(sprite_index / 16) * atlas_tile;
+
+    let u0 = sprite_x;
+    let u1 = sprite_x + atlas_tile;
+    let v0 = sprite_y;
+    let v1 = sprite_y + atlas_tile;
+
+    let face_scale = (0.8_f32 * 255.0).round() as u8;
+
+    // Two diagonals through the block center, forming an X
+    let cross_quads: [[[f32; 3]; 4]; 2] = [
+        // Diagonal 1: (0,0)→(1,1) in XZ
+        [
+            [0.15, 0.0, 0.85],
+            [0.15, 1.0, 0.85],
+            [0.85, 1.0, 0.15],
+            [0.85, 0.0, 0.15],
+        ],
+        // Diagonal 2: (1,0)→(0,1) in XZ
+        [
+            [0.85, 0.0, 0.85],
+            [0.85, 1.0, 0.85],
+            [0.15, 1.0, 0.15],
+            [0.15, 0.0, 0.15],
+        ],
+    ];
+    let uvs = [[u0, v1], [u0, v0], [u1, v0], [u1, v1]];
+
+    for quad in &cross_quads {
+        // 4 vertices, shared by front and back face (reverse winding only)
+        let base_index = mesh.vertices.len() as u32;
+        for (corner, tex) in quad.iter().zip(uvs.iter()) {
+            mesh.vertices.push(MeshVertex {
+                position: [
+                    base_pos[0] + corner[0],
+                    base_pos[1] + corner[1],
+                    base_pos[2] + corner[2],
+                ],
+                uv: *tex,
+                tint_rgba: [tint_rgb[0], tint_rgb[1], tint_rgb[2], 255],
+                light_data: [neighbor_sky_light, neighbor_block_light, face_scale, 0],
+            });
+        }
+        // Front face
+        mesh.indices.extend_from_slice(&[
+            base_index,
+            base_index + 1,
+            base_index + 2,
+            base_index,
+            base_index + 2,
+            base_index + 3,
+        ]);
+        // Back face (reverse winding, same vertices)
+        mesh.indices.extend_from_slice(&[
+            base_index + 2,
+            base_index + 1,
+            base_index,
+            base_index + 3,
+            base_index + 2,
+            base_index,
+        ]);
+    }
 }
 
 /// Emit a liquid face with per-corner interpolated heights and optional UV rotation.

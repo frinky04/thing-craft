@@ -9,3 +9,6 @@ license = "MIT"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+[profile.dev]
+opt-level = 1

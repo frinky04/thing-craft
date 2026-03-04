@@ -8,7 +8,7 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [x] Biomes: Alpha-exact `PerlinSimplexNoise` biome sampling with bulk region queries, quadratic temperature transform, and climate-to-biome classification matching Alpha's `computeBiome` logic.
 - [~] Biome Types: Overworld biome set is implemented (Rainforest, Swampland, Seasonal Forest, Forest, Savanna, Shrubland, Taiga, Desert, Plains, Tundra); IceDesert removed (Alpha never produces it). Hell/Nether biome parity is pending.
 - [x] Dynamic Colors: Grass and leaf colors shift dynamically based on biome temperature and humidity values.
-- [~] Terrain: Alpha-exact 3D density terrain generation is implemented (7 `PerlinNoise` generators with correct seeding order, 5x17x5 density grid with trilinear interpolation, climate-modulated scale/depth shaping, top-down `buildSurfaces` pass with bedrock/sand/gravel layers). Decoration features (lakes, flowers, cacti, sugar cane, snow cover, pumpkins, reed) still pending.
+- [~] Terrain: Alpha-exact 3D density terrain generation is implemented (7 `PerlinNoise` generators with correct seeding order, 5x17x5 density grid with trilinear interpolation, climate-modulated scale/depth shaping, top-down `buildSurfaces` pass with bedrock/sand/gravel layers). Surface lake population is re-enabled; broader parity validation for all decoration feature rates/distribution is still pending.
 - [x] Caves: Standard cave tunnels only (no ravines).
 - [x] Underground Generation: Dirt, gravel, coal, iron, gold, diamond, and redstone veins.
 - [~] Structures: Dungeon rooms with mob spawner blocks placed (chest inventory and spawner entity config require M7 entity/inventory systems).

@@ -2035,6 +2035,18 @@ impl ChunkStreamer {
         now_tick: u64,
         priority: FluidPriority,
     ) {
+        self.enqueue_liquid_tick_neighbors_only(world_x, world_y, world_z, now_tick, priority);
+        self.apply_lava_water_collision_around(world_x, world_y, world_z, now_tick);
+    }
+
+    fn enqueue_liquid_tick_neighbors_only(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        now_tick: u64,
+        priority: FluidPriority,
+    ) {
         let candidates = [
             (world_x, world_y, world_z),
             (world_x - 1, world_y, world_z),
@@ -2047,7 +2059,6 @@ impl ChunkStreamer {
         for (x, y, z) in candidates {
             self.enqueue_liquid_tick_at(x, y, z, now_tick, priority);
         }
-        self.apply_lava_water_collision_around(world_x, world_y, world_z, now_tick);
     }
 
     fn enqueue_liquid_tick_at(
@@ -2553,7 +2564,9 @@ impl ChunkStreamer {
         }
         // MC always triggers fizz + neighbor updates when lava touches water,
         // even for deep lava (meta > 4) that doesn't convert.
-        self.enqueue_liquid_tick_with_neighbors(x, y, z, sim_tick, FluidPriority::Normal);
+        // Keep this neighbor wake-up non-recursive; collision checks are
+        // already in progress for this area.
+        self.enqueue_liquid_tick_neighbors_only(x, y, z, sim_tick, FluidPriority::Normal);
     }
 }
 
@@ -4021,6 +4034,35 @@ mod tests {
         streamer.apply_lava_water_collision_around(8, 70, 8, 0);
 
         assert_eq!(streamer.block_at_world(8, 70, 8), Some(OBSIDIAN_ID));
+    }
+
+    #[test]
+    fn deep_lava_touching_water_does_not_recurse() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        // Deep lava (metadata > 4) should not convert, but collision handling
+        // must still complete without recursive re-entry.
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 8, FLOWING_LAVA_ID, 7));
+        assert!(streamer.set_block_with_metadata_at_world(9, 70, 8, WATER_ID, 0));
+
+        streamer.apply_lava_water_collision_around(8, 70, 8, 0);
+
+        assert_eq!(streamer.block_at_world(8, 70, 8), Some(FLOWING_LAVA_ID));
+        assert_eq!(streamer.block_metadata_at_world(8, 70, 8), Some(7));
     }
 
     #[test]
