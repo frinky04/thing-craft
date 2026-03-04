@@ -36,6 +36,7 @@ pub struct Renderer<'w> {
     transparent_pipeline: wgpu::RenderPipeline,
     debug_line_pipeline: wgpu::RenderPipeline,
     block_outline_pipeline: wgpu::RenderPipeline,
+    first_person_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     sunrise_pipeline: wgpu::RenderPipeline,
     stars_pipeline: wgpu::RenderPipeline,
@@ -43,6 +44,8 @@ pub struct Renderer<'w> {
     cloud_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    first_person_uniform_buffer: wgpu::Buffer,
+    first_person_bind_group: wgpu::BindGroup,
     sky_uniform_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
     sky_dome: SkyDome,
@@ -94,6 +97,9 @@ pub struct Renderer<'w> {
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_bind_group: wgpu::BindGroup,
     entity_shadow_mesh: Option<SceneMeshGpu>,
+    first_person_item_mesh: Option<SceneMeshGpu>,
+    first_person_arm_mesh: Option<SceneMeshGpu>,
+    first_person_skin_bind_group: wgpu::BindGroup,
 }
 
 struct SceneMeshGpu {
@@ -118,6 +124,13 @@ struct CloudLayer {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct FirstPersonUniform {
+    view_proj: [[f32; 4]; 4],
+    brightness: [f32; 4],
 }
 
 struct WaterSpriteAnimator {
@@ -723,6 +736,38 @@ impl<'w> Renderer<'w> {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
+        let first_person_uniform = FirstPersonUniform {
+            view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            brightness: [1.0, 0.0, 0.0, 0.0],
+        };
+        let first_person_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("thingcraft-first-person-uniform-buffer"),
+                contents: bytemuck::bytes_of(&first_person_uniform),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let first_person_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-first-person-bind-group-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let first_person_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thingcraft-first-person-bind-group"),
+            layout: &first_person_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: first_person_uniform_buffer.as_entire_binding(),
+            }],
+        });
 
         let sky_uniform = SkyUniform {
             sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
@@ -979,6 +1024,14 @@ impl<'w> Renderer<'w> {
             &terrain_bind_group_layout,
             Path::new("resources/minecraft-a1.2.6-client/terrain.png"),
         );
+        let first_person_skin_bind_group = create_texture_bind_group(
+            &device,
+            &queue,
+            &terrain_bind_group_layout,
+            Path::new("resources/minecraft-a1.2.6-client/mob/char.png"),
+            "thingcraft-first-person-skin",
+            wgpu::FilterMode::Nearest,
+        );
         let cloud_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("thingcraft-cloud-bind-group-layout"),
@@ -1112,6 +1165,59 @@ impl<'w> Renderer<'w> {
             }),
             multiview: None,
         });
+        let first_person_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-first-person-shader"),
+            source: wgpu::ShaderSource::Wgsl(FIRST_PERSON_SHADER.into()),
+        });
+        let first_person_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("thingcraft-first-person-pipeline-layout"),
+                bind_group_layouts: &[&first_person_bind_group_layout, &terrain_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let first_person_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("thingcraft-first-person-pipeline"),
+                layout: Some(&first_person_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &first_person_shader,
+                    entry_point: "vs_main",
+                    buffers: &[MeshVertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &first_person_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview: None,
+            });
 
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("thingcraft-sky-shader"),
@@ -1864,6 +1970,7 @@ impl<'w> Renderer<'w> {
             transparent_pipeline,
             debug_line_pipeline,
             block_outline_pipeline,
+            first_person_pipeline,
             sky_pipeline,
             sunrise_pipeline,
             stars_pipeline,
@@ -1871,6 +1978,8 @@ impl<'w> Renderer<'w> {
             cloud_pipeline,
             camera_buffer,
             camera_bind_group,
+            first_person_uniform_buffer,
+            first_person_bind_group,
             sky_uniform_buffer,
             sky_bind_group,
             sky_dome,
@@ -1921,6 +2030,9 @@ impl<'w> Renderer<'w> {
             shadow_pipeline,
             shadow_bind_group,
             entity_shadow_mesh: None,
+            first_person_item_mesh: None,
+            first_person_arm_mesh: None,
+            first_person_skin_bind_group,
         })
     }
 
@@ -2011,6 +2123,26 @@ impl<'w> Renderer<'w> {
     /// Upload entity shadow geometry for this frame (ground-projected discs).
     pub fn update_entity_shadows(&mut self, mesh: &ChunkMesh) {
         self.entity_shadow_mesh = self.upload_mesh(mesh, "thingcraft-entity-shadow");
+    }
+
+    pub fn update_first_person_item_mesh(&mut self, mesh: &ChunkMesh) {
+        self.first_person_item_mesh = self.upload_mesh(mesh, "thingcraft-first-person-item");
+    }
+
+    pub fn update_first_person_arm_mesh(&mut self, mesh: &ChunkMesh) {
+        self.first_person_arm_mesh = self.upload_mesh(mesh, "thingcraft-first-person-arm");
+    }
+
+    pub fn set_first_person_camera(&mut self, view_proj: [[f32; 4]; 4], brightness: f32) {
+        let uniform = FirstPersonUniform {
+            view_proj,
+            brightness: [brightness.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
+        };
+        self.queue.write_buffer(
+            &self.first_person_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
     }
 
     fn upload_mesh(&self, mesh: &ChunkMesh, label_prefix: &str) -> Option<SceneMeshGpu> {
@@ -2651,6 +2783,46 @@ impl<'w> Renderer<'w> {
             }
         }
 
+        // First-person hand/item pass: clear depth so it renders on top like Alpha.
+        if self.first_person_item_mesh.is_some() || self.first_person_arm_mesh.is_some() {
+            let mut fp_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("thingcraft-first-person-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            fp_pass.set_pipeline(&self.first_person_pipeline);
+            fp_pass.set_bind_group(0, &self.first_person_bind_group, &[]);
+            if let Some(item_mesh) = &self.first_person_item_mesh {
+                fp_pass.set_bind_group(1, &self.terrain_atlas.bind_group, &[]);
+                fp_pass.set_vertex_buffer(0, item_mesh.vertex_buffer.slice(..));
+                fp_pass
+                    .set_index_buffer(item_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                fp_pass.draw_indexed(0..item_mesh.index_count, 0, 0..1);
+            } else if let Some(arm_mesh) = &self.first_person_arm_mesh {
+                fp_pass.set_bind_group(1, &self.first_person_skin_bind_group, &[]);
+                fp_pass.set_vertex_buffer(0, arm_mesh.vertex_buffer.slice(..));
+                fp_pass
+                    .set_index_buffer(arm_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                fp_pass.draw_indexed(0..arm_mesh.index_count, 0, 0..1);
+            }
+        }
+
         // HUD pass: draw 2D overlay on top of the scene (no depth test, alpha blending).
         if let Some(hud_vb) = &self.hud_vertex_buffer {
             let mut hud_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2942,6 +3114,75 @@ fn create_texture_from_rgba(
         },
     );
     texture
+}
+
+fn create_texture_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    path: &Path,
+    label_prefix: &str,
+    filter: wgpu::FilterMode,
+) -> wgpu::BindGroup {
+    let (width, height, rgba) = load_png_rgba(path);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&format!("{label_prefix}-texture")),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some(&format!("{label_prefix}-sampler")),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: filter,
+        min_filter: filter,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(&format!("{label_prefix}-bind-group")),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
 }
 
 /// Create the sky dome geometry: a flat grid at Y=+16 (light dome) and Y=-16 (dark dome).
@@ -4205,6 +4446,54 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
     let color = mix(lit, camera.fog_color, fog_t);
     return vec4<f32>(color, alpha);
+}
+"#;
+
+const FIRST_PERSON_SHADER: &str = r#"
+struct FirstPerson {
+    view_proj: mat4x4<f32>,
+    brightness: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> first_person: FirstPerson;
+
+@group(1) @binding(0)
+var first_person_texture: texture_2d<f32>;
+
+@group(1) @binding(1)
+var first_person_sampler: sampler;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) tint: vec4<f32>,
+    @location(3) _light_data: vec4<u32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) tint: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.clip_pos = first_person.view_proj * vec4<f32>(input.position, 1.0);
+    out.uv = input.uv;
+    out.tint = input.tint;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(first_person_texture, first_person_sampler, input.uv);
+    if (texel.a <= 0.1) {
+        discard;
+    }
+    let lit = texel.rgb * input.tint.rgb * first_person.brightness.x;
+    return vec4<f32>(lit, texel.a * input.tint.a);
 }
 "#;
 

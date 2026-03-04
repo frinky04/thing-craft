@@ -12,7 +12,7 @@ use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
 use crate::ecs::EcsRuntime;
 use crate::hud;
-use crate::mesh::{build_region_mesh, ChunkMesh};
+use crate::mesh::{build_region_mesh, ChunkMesh, MeshVertex};
 use crate::renderer::{RenderError, Renderer};
 use crate::streaming::{
     world_block_to_chunk_pos_and_local, world_pos_to_chunk_pos, ChunkStreamer, RenderMeshUpdate,
@@ -173,6 +173,70 @@ impl HotbarInventory {
     /// Lightweight snapshot of all slot counts for dirty-checking.
     fn snapshot_counts(&self) -> [u8; HOTBAR_BLOCK_IDS.len()] {
         std::array::from_fn(|i| self.slots[i].count)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FirstPersonHandState {
+    shown_block_id: Option<u8>,
+    hand_height: f32,
+    last_hand_height: f32,
+    swing_ticks: u8,
+    swing_active: bool,
+}
+
+impl Default for FirstPersonHandState {
+    fn default() -> Self {
+        Self {
+            shown_block_id: None,
+            hand_height: 0.0,
+            last_hand_height: 0.0,
+            swing_ticks: 0,
+            swing_active: false,
+        }
+    }
+}
+
+impl FirstPersonHandState {
+    fn trigger_use(&mut self) {
+        self.hand_height = 0.0;
+        self.swing_ticks = 0;
+        self.swing_active = true;
+    }
+
+    fn tick(&mut self, selected_block_id: Option<u8>) {
+        self.last_hand_height = self.hand_height;
+        let target = if selected_block_id == self.shown_block_id {
+            1.0
+        } else {
+            0.0
+        };
+        let mut delta = target - self.hand_height;
+        delta = delta.clamp(-0.4, 0.4);
+        self.hand_height += delta;
+        if self.hand_height < 0.1 {
+            self.shown_block_id = selected_block_id;
+        }
+
+        if self.swing_active {
+            self.swing_ticks = self.swing_ticks.saturating_add(1);
+            if self.swing_ticks >= 8 {
+                self.swing_active = false;
+                self.swing_ticks = 0;
+            }
+        }
+    }
+
+    fn equip_progress(self, render_alpha: f32) -> f32 {
+        self.last_hand_height + (self.hand_height - self.last_hand_height) * render_alpha
+    }
+
+    fn attack_progress(self, render_alpha: f32) -> f32 {
+        if !self.swing_active {
+            0.0
+        } else {
+            (self.swing_ticks as f32 + render_alpha) / 8.0
+        }
     }
 }
 
@@ -382,6 +446,7 @@ pub fn run() -> Result<()> {
     let mut edit_latency_tracker = EditLatencyTracker::default();
     let mut hotbar_inventory = HotbarInventory::alpha_defaults();
     let mut selected_hotbar_slot = 0_usize;
+    let mut first_person_hand = FirstPersonHandState::default();
     let mut hud_dirty = true;
     let mut sim_ticks: u64 = 0;
     let mut time_offset_ticks: u64 = 0; // debug: accelerated by T key
@@ -507,6 +572,15 @@ pub fn run() -> Result<()> {
                         if hotbar_inventory.snapshot_counts() != pre_inv {
                             hud_dirty = true;
                         }
+                        let selected_for_hand =
+                            hotbar_inventory.slot(selected_hotbar_slot).and_then(|slot| {
+                                if slot.count > 0 {
+                                    Some(slot.block_id)
+                                } else {
+                                    None
+                                }
+                            });
+                        first_person_hand.tick(selected_for_hand);
                         if fluid_budget_remaining > 0 {
                             let ticks_left = usize::try_from(ticks_to_run - tick_index).unwrap_or(1);
                             let tick_budget_slice = fluid_budget_remaining.div_ceil(ticks_left);
@@ -650,6 +724,27 @@ pub fn run() -> Result<()> {
                             render_distance_blocks * 0.25,
                             render_distance_blocks,
                         );
+                        let hand_view_proj = (projection * hurt_cam * view_bob).to_cols_array_2d();
+                        let hand_brightness = alpha_first_person_brightness(
+                            &chunk_streamer,
+                            snapshot.interpolated.position,
+                            ambient_darkness,
+                        );
+                        renderer.set_first_person_camera(hand_view_proj, hand_brightness);
+                        let held_block = first_person_hand.shown_block_id;
+                        let hand_item_mesh = build_first_person_item_mesh(
+                            held_block,
+                            &bootstrap_world.registry,
+                            first_person_hand.equip_progress(render_alpha),
+                            first_person_hand.attack_progress(render_alpha),
+                        );
+                        renderer.update_first_person_item_mesh(&hand_item_mesh);
+                        let hand_arm_mesh = build_first_person_arm_mesh(
+                            held_block.is_none(),
+                            first_person_hand.equip_progress(render_alpha),
+                            first_person_hand.attack_progress(render_alpha),
+                        );
+                        renderer.update_first_person_arm_mesh(&hand_arm_mesh);
                         camera_chunk = world_pos_to_chunk_pos(
                             snapshot.authoritative.position.x,
                             snapshot.authoritative.position.z,
@@ -920,6 +1015,7 @@ pub fn run() -> Result<()> {
                         mouse_captured = true;
                         set_mouse_capture(window, true);
                     } else {
+                        first_person_hand.trigger_use();
                         enqueue_block_interaction_request(
                             &mut ecs_runtime,
                             &mut block_interaction_requests,
@@ -935,6 +1031,7 @@ pub fn run() -> Result<()> {
                     if ecs_runtime.player_is_dead() {
                         return;
                     }
+                    first_person_hand.trigger_use();
                     enqueue_block_interaction_request(
                         &mut ecs_runtime,
                         &mut block_interaction_requests,
@@ -1564,6 +1661,247 @@ fn alpha_fog_brightness_target(
     let brightness = alpha_brightness_from_light_level(light_level);
     let distance_bias = (3.0 - f32::from(view_distance_setting.min(3))) / 3.0;
     brightness * (1.0 - distance_bias) + distance_bias
+}
+
+fn alpha_first_person_brightness(
+    chunk_streamer: &ChunkStreamer,
+    player_pos: Vec3,
+    ambient_darkness: u8,
+) -> f32 {
+    let world_x = player_pos.x.floor() as i32;
+    let world_y = player_pos.y.floor() as i32;
+    let world_z = player_pos.z.floor() as i32;
+    let sky_default = 15_u8.saturating_sub(ambient_darkness.min(15));
+    let light_level = chunk_streamer
+        .effective_light_at_world(world_x, world_y, world_z, ambient_darkness)
+        .unwrap_or(sky_default);
+    alpha_brightness_from_light_level(light_level)
+}
+
+fn build_first_person_item_mesh(
+    held_block: Option<u8>,
+    registry: &BlockRegistry,
+    equip_progress: f32,
+    attack_progress: f32,
+) -> ChunkMesh {
+    let Some(block_id) = held_block else {
+        return ChunkMesh::default();
+    };
+    if !registry.is_defined_block(block_id) {
+        return ChunkMesh::default();
+    }
+
+    let mut mesh = ChunkMesh::default();
+    let model = alpha_first_person_item_transform(equip_progress, attack_progress);
+    let cube_faces = [
+        (
+            [0, -1, 0],
+            [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, -0.5, 0.5],
+            ],
+            0.5_f32,
+        ),
+        (
+            [0, 1, 0],
+            [
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+            1.0_f32,
+        ),
+        (
+            [0, 0, -1],
+            [
+                [-0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [0.5, -0.5, -0.5],
+            ],
+            0.8_f32,
+        ),
+        (
+            [0, 0, 1],
+            [
+                [0.5, -0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [-0.5, -0.5, 0.5],
+            ],
+            0.8_f32,
+        ),
+        (
+            [-1, 0, 0],
+            [
+                [-0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [-0.5, 0.5, -0.5],
+                [-0.5, -0.5, -0.5],
+            ],
+            0.6_f32,
+        ),
+        (
+            [1, 0, 0],
+            [
+                [0.5, -0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [0.5, 0.5, 0.5],
+                [0.5, -0.5, 0.5],
+            ],
+            0.6_f32,
+        ),
+    ];
+
+    for (face, corners, shade) in cube_faces {
+        let sprite = registry.sprite_index_for_face(block_id, face);
+        let uv = terrain_sprite_uv(sprite);
+        let shade_u8 = (shade * 255.0).round() as u8;
+        push_first_person_quad(
+            &mut mesh,
+            &model,
+            corners,
+            uv,
+            [shade_u8, shade_u8, shade_u8, 255],
+        );
+    }
+
+    mesh
+}
+
+fn build_first_person_arm_mesh(
+    render_arm: bool,
+    equip_progress: f32,
+    attack_progress: f32,
+) -> ChunkMesh {
+    if !render_arm {
+        return ChunkMesh::default();
+    }
+
+    let mut mesh = ChunkMesh::default();
+    let model = alpha_first_person_arm_transform(equip_progress, attack_progress);
+
+    // Matches Alpha HumanoidModel rightArm: addBox(-3,-2,-2, 4,12,4) then setPos(-5,2,0).
+    let v = [
+        [-8.0, 0.0, -2.0],
+        [-4.0, 0.0, -2.0],
+        [-4.0, 12.0, -2.0],
+        [-8.0, 12.0, -2.0],
+        [-8.0, 0.0, 2.0],
+        [-4.0, 0.0, 2.0],
+        [-4.0, 12.0, 2.0],
+        [-8.0, 12.0, 2.0],
+    ]
+    .map(|p| [p[0] / 16.0, p[1] / 16.0, p[2] / 16.0]);
+    let faces = [
+        ([5, 1, 2, 6], skin_uv_rect(48.0, 20.0, 52.0, 32.0)),
+        ([0, 4, 7, 3], skin_uv_rect(40.0, 20.0, 44.0, 32.0)),
+        ([5, 4, 0, 1], skin_uv_rect(44.0, 16.0, 48.0, 20.0)),
+        ([2, 3, 7, 6], skin_uv_rect(48.0, 16.0, 52.0, 20.0)),
+        ([1, 0, 3, 2], skin_uv_rect(44.0, 20.0, 48.0, 32.0)),
+        ([4, 5, 6, 7], skin_uv_rect(52.0, 20.0, 56.0, 32.0)),
+    ];
+    for (idx, uv) in faces {
+        let corners = [v[idx[0]], v[idx[1]], v[idx[2]], v[idx[3]]];
+        push_first_person_quad(&mut mesh, &model, corners, uv, [255, 255, 255, 255]);
+    }
+
+    mesh
+}
+
+fn alpha_first_person_item_transform(equip_progress: f32, attack_progress: f32) -> Mat4 {
+    let attack = attack_progress.clamp(0.0, 1.0);
+    let attack_sqrt = attack.sqrt();
+    let swing_sin = (attack * std::f32::consts::PI).sin();
+    let swing_sin_sqrt = (attack_sqrt * std::f32::consts::PI).sin();
+    let swing_sin_sqrt_twice = (attack_sqrt * std::f32::consts::TAU).sin();
+    let swing_sin_sq = (attack * attack * std::f32::consts::PI).sin();
+    let equip = equip_progress.clamp(0.0, 1.0);
+    let h = 0.8_f32;
+
+    Mat4::from_translation(Vec3::new(
+        -swing_sin_sqrt * 0.4,
+        swing_sin_sqrt_twice * 0.2,
+        -swing_sin * 0.2,
+    )) * Mat4::from_translation(Vec3::new(
+        0.7 * h,
+        -0.65 * h - (1.0 - equip) * 0.6,
+        -0.9 * h,
+    )) * Mat4::from_rotation_y(45.0_f32.to_radians())
+        * Mat4::from_rotation_y((-swing_sin_sq * 20.0).to_radians())
+        * Mat4::from_rotation_z((-swing_sin_sqrt * 20.0).to_radians())
+        * Mat4::from_rotation_x((-swing_sin_sqrt * 80.0).to_radians())
+        * Mat4::from_scale(Vec3::splat(0.4))
+}
+
+fn alpha_first_person_arm_transform(equip_progress: f32, attack_progress: f32) -> Mat4 {
+    let attack = attack_progress.clamp(0.0, 1.0);
+    let attack_sqrt = attack.sqrt();
+    let swing_sin = (attack * std::f32::consts::PI).sin();
+    let swing_sin_sqrt = (attack_sqrt * std::f32::consts::PI).sin();
+    let swing_sin_sqrt_twice = (attack_sqrt * std::f32::consts::TAU).sin();
+    let equip = equip_progress.clamp(0.0, 1.0);
+    let i = 0.8_f32;
+
+    Mat4::from_translation(Vec3::new(
+        -swing_sin_sqrt * 0.3,
+        swing_sin_sqrt_twice * 0.4,
+        -swing_sin * 0.4,
+    )) * Mat4::from_translation(Vec3::new(
+        0.8 * i,
+        -0.75 * i - (1.0 - equip) * 0.6,
+        -0.9 * i,
+    )) * Mat4::from_rotation_y(45.0_f32.to_radians())
+        * Mat4::from_rotation_y((swing_sin_sqrt * 70.0).to_radians())
+        * Mat4::from_rotation_z((-swing_sin * 20.0).to_radians())
+        * Mat4::from_translation(Vec3::new(-1.0, 3.6, 3.5))
+        * Mat4::from_rotation_z(120.0_f32.to_radians())
+        * Mat4::from_rotation_x(200.0_f32.to_radians())
+        * Mat4::from_rotation_y(-135.0_f32.to_radians())
+        * Mat4::from_translation(Vec3::new(5.6, 0.0, 0.0))
+}
+
+fn terrain_sprite_uv(sprite: u16) -> [[f32; 2]; 4] {
+    let texel = 1.0 / 256.0;
+    let u0 = (sprite % 16) as f32 * 16.0 * texel;
+    let v0 = (sprite / 16) as f32 * 16.0 * texel;
+    let u1 = u0 + 16.0 * texel;
+    let v1 = v0 + 16.0 * texel;
+    [[u0, v1], [u1, v1], [u1, v0], [u0, v0]]
+}
+
+fn skin_uv_rect(u0: f32, v0: f32, u1: f32, v1: f32) -> [[f32; 2]; 4] {
+    // Matches Polygon(u1,v1,u2,v2) mapping in Alpha's ModelPart (64x32 skin atlas).
+    [
+        [u1 / 64.0, v0 / 32.0],
+        [u0 / 64.0, v0 / 32.0],
+        [u0 / 64.0, v1 / 32.0],
+        [u1 / 64.0, v1 / 32.0],
+    ]
+}
+
+fn push_first_person_quad(
+    mesh: &mut ChunkMesh,
+    transform: &Mat4,
+    corners: [[f32; 3]; 4],
+    uv: [[f32; 2]; 4],
+    tint_rgba: [u8; 4],
+) {
+    let base = mesh.vertices.len() as u32;
+    for i in 0..4 {
+        let p = transform.transform_point3(Vec3::from_array(corners[i]));
+        mesh.vertices.push(MeshVertex {
+            position: p.to_array(),
+            uv: uv[i],
+            tint_rgba,
+            light_data: [0, 0, 0, 0],
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
 }
 
 fn alpha_sky_color(time_of_day: f32, temperature: f32) -> [f32; 3] {
