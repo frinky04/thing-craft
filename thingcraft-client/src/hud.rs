@@ -144,6 +144,9 @@ pub fn build_hud_vertices(
         let item_x = center_x - 90.0 + slot as f32 * 20.0 + 2.0;
         let item_y = gui_h - 16.0 - 3.0;
         push_hotbar_item_vertices(&mut verts, item_x, item_y, block_id, registry, scale);
+        if state.slot_counts[slot] > 1 {
+            push_stack_count_text(&mut verts, item_x, item_y, state.slot_counts[slot], scale);
+        }
     }
 
     // Armor row (icons.png, shown only when armor points > 0).
