@@ -43,8 +43,12 @@ const HUD_TEX_GUI: f32 = 0.0;
 const HUD_TEX_ICONS: f32 = 1.0;
 const HUD_TEX_TERRAIN: f32 = 2.0;
 pub const HUD_TEX_INVENTORY: f32 = 3.0;
+pub const HUD_TEX_FONT: f32 = 4.0;
 
 const TEX_SIZE_PX: f32 = 256.0;
+const FONT_TEX_SIZE_PX: f32 = 128.0;
+const FONT_GLYPH_PX: f32 = 8.0;
+const FONT_ADVANCE_PX: f32 = 6.0;
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 #[derive(Debug, Clone, Copy)]
@@ -411,6 +415,9 @@ pub fn build_inventory_vertices(
         let item_y = mouse_screen_pos[1] / layout.scale - 8.0;
         let ItemKey::Block(block_id) = cursor_stack.item;
         push_hotbar_item_vertices(&mut verts, item_x, item_y, block_id, registry, layout.scale);
+        if cursor_stack.count > 1 {
+            push_stack_count_text(&mut verts, item_x, item_y, cursor_stack.count, layout.scale);
+        }
     }
 
     verts
@@ -451,6 +458,57 @@ fn render_inventory_slot_item(
         registry,
         scale,
     );
+    if stack.count > 1 {
+        push_stack_count_text(verts, panel_left + sx, panel_top + sy, stack.count, scale);
+    }
+}
+
+fn push_stack_count_text(
+    verts: &mut Vec<HudVertex>,
+    item_x: f32,
+    item_y: f32,
+    count: u8,
+    scale: f32,
+) {
+    let text = count.to_string();
+    let width = text.chars().count() as f32 * FONT_ADVANCE_PX;
+    let x = item_x + 17.0 - width;
+    let y = item_y + 9.0;
+    push_ascii_text(verts, &text, x + 1.0, y + 1.0, scale, [0.0, 0.0, 0.0, 1.0]);
+    push_ascii_text(verts, &text, x, y, scale, WHITE);
+}
+
+fn push_ascii_text(
+    verts: &mut Vec<HudVertex>,
+    text: &str,
+    x: f32,
+    y: f32,
+    scale: f32,
+    color: [f32; 4],
+) {
+    for (i, ch) in text.chars().enumerate() {
+        let code = ch as u32;
+        if code > 255 {
+            continue;
+        }
+        let glyph = code as f32;
+        let u = (glyph % 16.0) * FONT_GLYPH_PX;
+        let v = (glyph / 16.0).floor() * FONT_GLYPH_PX;
+        push_textured_quad_gui(
+            verts,
+            x + i as f32 * FONT_ADVANCE_PX,
+            y,
+            FONT_GLYPH_PX,
+            FONT_GLYPH_PX,
+            u,
+            v,
+            FONT_GLYPH_PX,
+            FONT_GLYPH_PX,
+            HUD_TEX_FONT,
+            scale,
+            color,
+        );
+    }
 }
 
 fn push_hotbar_item_vertices(
@@ -674,10 +732,15 @@ fn push_textured_quad_gui(
     let x1 = ((gui_x + gui_w) * scale).floor();
     let y1 = ((gui_y + gui_h) * scale).floor();
 
-    let u0 = tex_x / TEX_SIZE_PX;
-    let v0 = tex_y / TEX_SIZE_PX;
-    let u1 = (tex_x + tex_w) / TEX_SIZE_PX;
-    let v1 = (tex_y + tex_h) / TEX_SIZE_PX;
+    let tex_size = if (texture_kind - HUD_TEX_FONT).abs() < 0.01 {
+        FONT_TEX_SIZE_PX
+    } else {
+        TEX_SIZE_PX
+    };
+    let u0 = tex_x / tex_size;
+    let v0 = tex_y / tex_size;
+    let u1 = (tex_x + tex_w) / tex_size;
+    let v1 = (tex_y + tex_h) / tex_size;
 
     let vtx0 = HudVertex {
         position: [x0, y0],

@@ -1687,6 +1687,16 @@ impl<'w> Renderer<'w> {
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
                         visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -1801,6 +1811,41 @@ impl<'w> Renderer<'w> {
                 depth_or_array_layers: 1,
             },
         );
+        let (font_w, font_h, font_rgba) =
+            load_png_rgba(Path::new("resources/minecraft-a1.2.6-client/font/default.png"));
+        let font_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thingcraft-hud-font-texture"),
+            size: wgpu::Extent3d {
+                width: font_w,
+                height: font_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &font_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &font_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * font_w),
+                rows_per_image: Some(font_h),
+            },
+            wgpu::Extent3d {
+                width: font_w,
+                height: font_h,
+                depth_or_array_layers: 1,
+            },
+        );
         let hud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("thingcraft-hud-sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -1815,6 +1860,7 @@ impl<'w> Renderer<'w> {
         let gui_view = gui_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let icons_view = icons_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let inventory_view = inventory_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let font_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let terrain_view = terrain_atlas
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1840,6 +1886,10 @@ impl<'w> Renderer<'w> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&font_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
                     resource: wgpu::BindingResource::Sampler(&hud_sampler),
                 },
             ],
@@ -4898,7 +4948,8 @@ var<uniform> screen: HudScreen;
 @group(1) @binding(1) var hud_icons_tex: texture_2d<f32>;
 @group(1) @binding(2) var hud_terrain_tex: texture_2d<f32>;
 @group(1) @binding(3) var hud_inventory_tex: texture_2d<f32>;
-@group(1) @binding(4) var hud_sampler: sampler;
+@group(1) @binding(4) var hud_font_tex: texture_2d<f32>;
+@group(1) @binding(5) var hud_sampler: sampler;
 
 struct VertexIn {
     @location(0) position: vec2<f32>,
@@ -4938,8 +4989,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         texel = textureSample(hud_icons_tex, hud_sampler, input.uv);
     } else if (input.texture_kind >= 1.5 && input.texture_kind < 2.5) {
         texel = textureSample(hud_terrain_tex, hud_sampler, input.uv);
-    } else if (input.texture_kind >= 2.5) {
+    } else if (input.texture_kind >= 2.5 && input.texture_kind < 3.5) {
         texel = textureSample(hud_inventory_tex, hud_sampler, input.uv);
+    } else if (input.texture_kind >= 3.5) {
+        texel = textureSample(hud_font_tex, hud_sampler, input.uv);
     }
     if (texel.a <= 0.01) {
         discard;
