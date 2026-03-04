@@ -34,6 +34,7 @@ pub struct Renderer<'w> {
     size: PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
+    crack_overlay_pipeline: wgpu::RenderPipeline,
     debug_line_pipeline: wgpu::RenderPipeline,
     block_outline_pipeline: wgpu::RenderPipeline,
     first_person_pipeline: wgpu::RenderPipeline,
@@ -69,6 +70,7 @@ pub struct Renderer<'w> {
     chunk_border_mesh_dirty: bool,
     chunk_border_debug_enabled: bool,
     block_outline_mesh: Option<OutlineMeshGpu>,
+    block_crack_mesh: Option<SceneMeshGpu>,
     camera_frustum: Option<FrustumPlanes>,
     cached_view_proj: [[f32; 4]; 4],
     /// View-proj with translation stripped — for sky dome and celestial bodies (infinite distance).
@@ -1165,6 +1167,56 @@ impl<'w> Renderer<'w> {
             }),
             multiview: None,
         });
+        let crack_overlay_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("thingcraft-crack-overlay-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[MeshVertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Dst,
+                                dst_factor: wgpu::BlendFactor::Src,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent::OVER,
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview: None,
+            });
         let first_person_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("thingcraft-first-person-shader"),
             source: wgpu::ShaderSource::Wgsl(FIRST_PERSON_SHADER.into()),
@@ -2070,6 +2122,7 @@ impl<'w> Renderer<'w> {
             size,
             render_pipeline,
             transparent_pipeline,
+            crack_overlay_pipeline,
             debug_line_pipeline,
             block_outline_pipeline,
             first_person_pipeline,
@@ -2105,6 +2158,7 @@ impl<'w> Renderer<'w> {
             chunk_border_mesh_dirty: true,
             chunk_border_debug_enabled: false,
             block_outline_mesh: None,
+            block_crack_mesh: None,
             camera_frustum: None,
             cached_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             cached_sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
@@ -2424,6 +2478,23 @@ impl<'w> Renderer<'w> {
             vertex_buffer,
             vertex_count: vertices.len() as u32,
         });
+    }
+
+    /// Set a block crack overlay mesh (Alpha destroy-stage style).
+    /// `progress` in `[0, 1)` selects destroy stage tiles `240..249`.
+    pub fn set_block_crack_overlay(&mut self, target_block: Option<[i32; 3]>, progress: f32) {
+        let Some(block) = target_block else {
+            self.block_crack_mesh = None;
+            return;
+        };
+        if progress <= 0.0 {
+            self.block_crack_mesh = None;
+            return;
+        }
+        let stage = (progress * 10.0).floor() as i32;
+        let stage = stage.clamp(0, 9) as u16;
+        let mesh = build_block_crack_mesh(block, 240 + stage);
+        self.block_crack_mesh = self.upload_mesh(&mesh, "thingcraft-block-crack-overlay");
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -2851,6 +2922,18 @@ impl<'w> Renderer<'w> {
                         render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
                     }
                 }
+            }
+
+            if let Some(crack_mesh) = &self.block_crack_mesh {
+                render_pass.set_pipeline(&self.crack_overlay_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.terrain_atlas.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, crack_mesh.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    crack_mesh.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..crack_mesh.index_count, 0, 0..1);
             }
 
             // Block outline: wireframe around targeted block.
@@ -3572,6 +3655,61 @@ fn build_block_outline_vertices(block: [i32; 3]) -> Vec<OutlineVertex> {
     line(p010, p011);
 
     verts
+}
+
+fn build_block_crack_mesh(block: [i32; 3], sprite: u16) -> ChunkMesh {
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+
+    let atlas_tile = 1.0 / 16.0;
+    let u0 = f32::from(sprite % 16) * atlas_tile;
+    let v0 = f32::from(sprite / 16) * atlas_tile;
+    let u1 = u0 + atlas_tile;
+    let v1 = v0 + atlas_tile;
+    let uv = [[u0, v1], [u0, v0], [u1, v0], [u1, v1]];
+
+    let bx = block[0] as f32;
+    let by = block[1] as f32;
+    let bz = block[2] as f32;
+    let e = 1.0 / 1024.0;
+    let x0 = bx - e;
+    let y0 = by - e;
+    let z0 = bz - e;
+    let x1 = bx + 1.0 + e;
+    let y1 = by + 1.0 + e;
+    let z1 = bz + 1.0 + e;
+    let tint = [255, 255, 255, 128];
+    let light = [15, 15, 255, 0];
+
+    let faces = [
+        // -X
+        [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
+        // +X
+        [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
+        // -Y
+        [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
+        // +Y
+        [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]],
+        // -Z
+        [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]],
+        // +Z
+        [[x1, y0, z1], [x1, y1, z1], [x0, y1, z1], [x0, y0, z1]],
+    ];
+
+    for corners in faces {
+        let base = vertices.len() as u32;
+        for (p, t) in corners.into_iter().zip(uv) {
+            vertices.push(MeshVertex {
+                position: p,
+                uv: t,
+                tint_rgba: tint,
+                light_data: light,
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    ChunkMesh { vertices, indices }
 }
 
 fn build_chunk_border_vertices<I>(chunk_positions: I) -> Vec<DebugLineVertex>

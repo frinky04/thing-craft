@@ -65,7 +65,6 @@ struct MiningTarget {
     x: i32,
     y: i32,
     z: i32,
-    face: [i32; 3],
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -98,6 +97,10 @@ impl MiningState {
         self.last_progress = 0.0;
         self.ticks = 0.0;
         self.cooldown_ticks = ALPHA_MINING_COOLDOWN_TICKS;
+    }
+
+    fn render_progress(self, alpha: f32) -> f32 {
+        self.last_progress + (self.progress - self.last_progress) * alpha
     }
 }
 
@@ -428,6 +431,7 @@ pub fn run() -> Result<()> {
     let mut loop_stats = LoopStats::default();
     let mut mouse_captured = false;
     let mut left_mouse_held = false;
+    let mut mining_swing_hold_ticks: u8 = 0;
     let mut mining_start_requested = false;
     let mut mining_state = MiningState::default();
     let mut inventory_open = false;
@@ -588,6 +592,7 @@ pub fn run() -> Result<()> {
 
                         if !mouse_captured || inventory_open || ecs_runtime.player_is_dead() {
                             left_mouse_held = false;
+                            mining_swing_hold_ticks = 0;
                             mining_start_requested = false;
                             mining_state.stop();
                         }
@@ -607,6 +612,11 @@ pub fn run() -> Result<()> {
                         }
 
                         if left_mouse_held {
+                            mining_swing_hold_ticks = mining_swing_hold_ticks.saturating_add(1);
+                            if mining_swing_hold_ticks >= 5 {
+                                first_person_hand.trigger_swing();
+                                mining_swing_hold_ticks = 0;
+                            }
                             if tick_block_mining(
                                 &mut ecs_runtime,
                                 &mut chunk_streamer,
@@ -618,6 +628,7 @@ pub fn run() -> Result<()> {
                                 hud_dirty = true;
                             }
                         } else {
+                            mining_swing_hold_ticks = 0;
                             mining_state.stop();
                         }
 
@@ -820,6 +831,11 @@ pub fn run() -> Result<()> {
                             |x, y, z| chunk_streamer.block_at_world(x, y, z),
                         );
                         renderer.set_block_outline(outline_hit.map(|h| h.block));
+                        let crack_target = mining_state.target.map(|t| [t.x, t.y, t.z]);
+                        renderer.set_block_crack_overlay(
+                            crack_target,
+                            mining_state.render_progress(render_alpha),
+                        );
 
                         if snapshot.vitals.health <= 0 && mouse_captured {
                             mouse_captured = false;
@@ -839,6 +855,7 @@ pub fn run() -> Result<()> {
                             alpha_apply_fog_brightness(fog_color, frame_fog_brightness);
                         renderer.set_day_night(fog_color, sky_color, ambient_darkness, render_sky);
                         renderer.set_block_outline(None);
+                        renderer.set_block_crack_overlay(None, 0.0);
                     }
 
                     chunk_streamer.tick(camera_chunk);
@@ -1068,6 +1085,7 @@ pub fn run() -> Result<()> {
                                 inventory_commands.push_back(InventoryCommand::CloseInventory);
                                 inventory_open = false;
                                 left_mouse_held = false;
+                                mining_swing_hold_ticks = 0;
                                 mining_state.stop();
                                 if !ecs_runtime.player_is_dead() {
                                     mouse_captured = true;
@@ -1076,6 +1094,7 @@ pub fn run() -> Result<()> {
                             } else {
                                 mouse_captured = false;
                                 left_mouse_held = false;
+                                mining_swing_hold_ticks = 0;
                                 mining_state.stop();
                                 set_mouse_capture(window, false);
                             }
@@ -1087,6 +1106,7 @@ pub fn run() -> Result<()> {
                             if inventory_open {
                                 mouse_captured = false;
                                 left_mouse_held = false;
+                                mining_swing_hold_ticks = 0;
                                 mining_state.stop();
                                 set_mouse_capture(window, false);
                                 ecs_runtime.clear_input_state();
@@ -1148,6 +1168,7 @@ pub fn run() -> Result<()> {
                     } else {
                         first_person_hand.trigger_swing();
                         left_mouse_held = true;
+                        mining_swing_hold_ticks = 0;
                         mining_start_requested = true;
                     }
                 },
@@ -1157,6 +1178,7 @@ pub fn run() -> Result<()> {
                     ..
                 } => {
                     left_mouse_held = false;
+                    mining_swing_hold_ticks = 0;
                     mining_start_requested = false;
                     mining_state.stop();
                 }
@@ -1364,7 +1386,6 @@ fn raycast_current_mining_target(
         x: hit.block[0],
         y: hit.block[1],
         z: hit.block[2],
-        face: hit.normal,
     })
 }
 
@@ -1399,53 +1420,6 @@ fn resolve_mining_tool_stub(_inventory: &PlayerInventoryState) -> MiningToolKind
     MiningToolKind::None
 }
 
-fn alpha_block_mining_time(block_id: u8) -> f32 {
-    match block_id {
-        7 | 90 => -1.0, // bedrock, portal
-        8 | 9 | 11 => 100.0, // water/lava source-like blocks
-        6 | 10 | 37 | 38 | 39 | 40 | 46 | 50 | 51 | 55 | 59 | 75 | 76 | 83 => 0.0,
-        1 => 1.5,
-        2 => 0.6,
-        3 => 0.5,
-        4 => 2.0,
-        5 => 2.0,
-        12 => 0.5,
-        13 => 0.6,
-        14 | 15 | 16 | 56 | 73 | 74 => 3.0,
-        17 => 2.0,
-        18 => 0.2,
-        19 => 0.6,
-        20 => 0.3,
-        35 => 0.8,
-        41 => 3.0,
-        42 | 57 => 5.0,
-        43 | 44 | 45 | 48 | 53 | 67 | 84 => 2.0,
-        47 => 1.5,
-        49 => 10.0,
-        52 => 5.0,
-        54 | 58 => 2.5,
-        60 => 0.6,
-        61 | 62 => 3.5,
-        63 | 68 => 1.0,
-        64 => 3.0,
-        65 => 0.4,
-        66 => 0.7,
-        69 | 70 | 72 | 77 => 0.5,
-        71 => 5.0,
-        78 => 0.1,
-        79 => 0.5,
-        80 => 0.2,
-        81 => 0.4,
-        82 => 0.6,
-        85 => 2.0,
-        86 | 91 => 1.0,
-        87 => 0.4,
-        88 => 0.5,
-        89 => 0.3,
-        _ => 1.0,
-    }
-}
-
 fn alpha_tool_mining_speed_stub(_tool: MiningToolKind, _block_id: u8) -> Option<f32> {
     // TODO(alpha-tools): return tool class/tier mining speed multiplier.
     None
@@ -1457,12 +1431,13 @@ fn alpha_can_harvest_block_stub(_tool: MiningToolKind, _block_id: u8) -> Option<
 }
 
 fn alpha_block_mining_progress_per_tick(
+    registry: &BlockRegistry,
     block_id: u8,
     inventory: &PlayerInventoryState,
     player_on_ground: bool,
     player_in_water: bool,
 ) -> f32 {
-    let mining_time = alpha_block_mining_time(block_id);
+    let mining_time = registry.mining_hardness_of(block_id);
     if mining_time < 0.0 {
         return 0.0;
     }
@@ -1508,6 +1483,7 @@ fn try_start_block_mining(
         .block_at_world(target.x, target.y, target.z)
         .unwrap_or(AIR_BLOCK_ID);
     let speed = alpha_block_mining_progress_per_tick(
+        registry,
         block_id,
         inventory,
         snapshot.physics.on_ground,
@@ -1566,6 +1542,7 @@ fn tick_block_mining(
     }
 
     mining_state.progress += alpha_block_mining_progress_per_tick(
+        registry,
         block_id,
         inventory,
         snapshot.physics.on_ground,
@@ -3007,7 +2984,9 @@ mod tests {
     #[test]
     fn alpha_mining_progress_matches_hand_stone_rate() {
         let inv = PlayerInventoryState::alpha_defaults();
+        let registry = BlockRegistry::alpha_1_2_6();
         let per_tick = alpha_block_mining_progress_per_tick(
+            &registry,
             1, // stone
             &inv,
             true,
@@ -3020,9 +2999,10 @@ mod tests {
     #[test]
     fn alpha_mining_progress_applies_water_and_airborne_penalties() {
         let inv = PlayerInventoryState::alpha_defaults();
-        let grounded = alpha_block_mining_progress_per_tick(3, &inv, true, false);
-        let in_water = alpha_block_mining_progress_per_tick(3, &inv, true, true);
-        let airborne = alpha_block_mining_progress_per_tick(3, &inv, false, false);
+        let registry = BlockRegistry::alpha_1_2_6();
+        let grounded = alpha_block_mining_progress_per_tick(&registry, 3, &inv, true, false);
+        let in_water = alpha_block_mining_progress_per_tick(&registry, 3, &inv, true, true);
+        let airborne = alpha_block_mining_progress_per_tick(&registry, 3, &inv, false, false);
         assert!((in_water - grounded / 5.0).abs() < 1e-6);
         assert!((airborne - grounded / 5.0).abs() < 1e-6);
     }

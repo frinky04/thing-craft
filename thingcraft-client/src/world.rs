@@ -76,10 +76,16 @@ pub enum MaterialKind {
     Dirt,
     Grass,
     Wood,
+    Decoration,
     Leaves,
     Cactus,
     Plant,
     Glass,
+    Ice,
+    Clay,
+    Pumpkin,
+    Tnt,
+    SnowLayer,
     Liquid,
     Metal,
     Sand,
@@ -95,7 +101,7 @@ pub enum BiomeTintKind {
     Foliage,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlockDef {
     pub id: u8,
     pub name: &'static str,
@@ -104,6 +110,12 @@ pub struct BlockDef {
     pub solid: bool,
     pub opacity: u8,
     pub emitted_light: u8,
+    pub mining_hardness: f32,
+    pub explosion_resistance: f32,
+    pub ticks_randomly: bool,
+    pub blocks_movement: bool,
+    pub has_collision: bool,
+    pub can_ray_trace: bool,
 }
 
 #[derive(Clone)]
@@ -299,7 +311,7 @@ impl BlockRegistry {
         );
         add(&mut by_id, 20, "glass", 49, MaterialKind::Glass, true, 0, 0);
         add(&mut by_id, 35, "wool", 64, MaterialKind::Wool, true, 255, 0);
-        add(&mut by_id, 46, "tnt", 8, MaterialKind::Wood, true, 255, 0);
+        add(&mut by_id, 46, "tnt", 8, MaterialKind::Tnt, true, 255, 0);
         add(
             &mut by_id,
             OBSIDIAN_ID,
@@ -325,7 +337,7 @@ impl BlockRegistry {
             50,
             "torch",
             80,
-            MaterialKind::Plant,
+            MaterialKind::Decoration,
             false,
             0,
             14,
@@ -416,7 +428,7 @@ impl BlockRegistry {
             65,
             "ladder",
             83,
-            MaterialKind::Wood,
+            MaterialKind::Decoration,
             false,
             0,
             0,
@@ -456,7 +468,7 @@ impl BlockRegistry {
             76,
             "redstone_torch",
             99,
-            MaterialKind::Plant,
+            MaterialKind::Decoration,
             false,
             0,
             7,
@@ -466,7 +478,7 @@ impl BlockRegistry {
             ICE_ID,
             "ice",
             67,
-            MaterialKind::Glass,
+            MaterialKind::Ice,
             true,
             3,
             0,
@@ -568,7 +580,7 @@ impl BlockRegistry {
             SNOW_LAYER_ID,
             "snow_layer",
             66,
-            MaterialKind::Plant,
+            MaterialKind::SnowLayer,
             false,
             0,
             0,
@@ -588,7 +600,7 @@ impl BlockRegistry {
             CLAY_ID,
             "clay",
             72,
-            MaterialKind::Stone,
+            MaterialKind::Clay,
             true,
             255,
             0,
@@ -608,11 +620,17 @@ impl BlockRegistry {
             PUMPKIN_ID,
             "pumpkin",
             118,
-            MaterialKind::Plant,
+            MaterialKind::Pumpkin,
             true,
             255,
             0,
         );
+
+        if let Some(block) = &mut by_id[91] {
+            block.material = MaterialKind::Pumpkin;
+        }
+
+        apply_alpha_block_property_overrides(&mut by_id);
 
         Self { by_id }
     }
@@ -630,6 +648,17 @@ impl BlockRegistry {
     #[must_use]
     pub fn emitted_light_of(&self, block_id: u8) -> u8 {
         self.get(block_id).map_or(0, |block| block.emitted_light)
+    }
+
+    #[must_use]
+    pub fn mining_hardness_of(&self, block_id: u8) -> f32 {
+        self.get(block_id).map_or(1.0, |block| block.mining_hardness)
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn ticks_randomly_of(&self, block_id: u8) -> bool {
+        self.get(block_id).is_some_and(|block| block.ticks_randomly)
     }
 
     #[must_use]
@@ -733,22 +762,13 @@ impl BlockRegistry {
 
     #[must_use]
     pub fn blocks_movement(&self, block_id: u8) -> bool {
-        let Some(block) = self.get(block_id) else {
-            return false;
-        };
-        !matches!(
-            block.material,
-            MaterialKind::Air
-                | MaterialKind::Liquid
-                | MaterialKind::Plant
-                | MaterialKind::Fire
-                | MaterialKind::Portal
-        )
+        self.get(block_id)
+            .is_some_and(|block| block.blocks_movement)
     }
 
     #[must_use]
     pub fn is_collidable(&self, block_id: u8) -> bool {
-        self.blocks_movement(block_id)
+        self.get(block_id).is_some_and(|block| block.has_collision)
     }
 
     #[must_use]
@@ -797,6 +817,11 @@ fn add(
     let slot = &mut by_id[usize::from(id)];
     assert!(slot.is_none(), "duplicate block id {id} for {name}");
 
+    let blocks_movement = alpha_material_blocks_movement(material);
+    let has_collision = blocks_movement;
+    let can_ray_trace = material != MaterialKind::Liquid;
+    let default_hardness = alpha_default_hardness_for_material(material);
+
     *slot = Some(BlockDef {
         id,
         name,
@@ -805,7 +830,117 @@ fn add(
         solid,
         opacity,
         emitted_light,
+        mining_hardness: default_hardness,
+        explosion_resistance: default_hardness,
+        ticks_randomly: false,
+        blocks_movement,
+        has_collision,
+        can_ray_trace,
     });
+}
+
+fn alpha_default_hardness_for_material(material: MaterialKind) -> f32 {
+    match material {
+        MaterialKind::Air
+        | MaterialKind::Plant
+        | MaterialKind::Decoration
+        | MaterialKind::Fire
+        | MaterialKind::Portal
+        | MaterialKind::SnowLayer => 0.0,
+        _ => 1.0,
+    }
+}
+
+fn alpha_material_blocks_movement(material: MaterialKind) -> bool {
+    !matches!(
+        material,
+        MaterialKind::Air
+            | MaterialKind::Liquid
+            | MaterialKind::Plant
+            | MaterialKind::Decoration
+            | MaterialKind::Fire
+            | MaterialKind::Portal
+            | MaterialKind::SnowLayer
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_alpha_block_properties(
+    by_id: &mut [Option<BlockDef>; 256],
+    id: u8,
+    hardness: f32,
+    explosion_resistance: f32,
+    ticks_randomly: bool,
+    blocks_movement: bool,
+    has_collision: bool,
+    can_ray_trace: bool,
+) {
+    let block = by_id[usize::from(id)]
+        .as_mut()
+        .unwrap_or_else(|| panic!("missing alpha block id {id}"));
+    block.mining_hardness = hardness;
+    block.explosion_resistance = explosion_resistance;
+    block.ticks_randomly = ticks_randomly;
+    block.blocks_movement = blocks_movement;
+    block.has_collision = has_collision;
+    block.can_ray_trace = can_ray_trace;
+}
+
+fn apply_alpha_block_property_overrides(by_id: &mut [Option<BlockDef>; 256]) {
+    set_alpha_block_properties(by_id, 0, 0.0, 0.0, false, false, false, false);
+    set_alpha_block_properties(by_id, 1, 1.5, 6.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 2, 0.6, 0.6, true, true, true, true);
+    set_alpha_block_properties(by_id, 3, 0.5, 0.5, false, true, true, true);
+    set_alpha_block_properties(by_id, 4, 2.0, 6.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 5, 2.0, 3.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 6, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 7, -1.0, 3_600_000.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 8, 100.0, 100.0, true, false, false, false);
+    set_alpha_block_properties(by_id, 9, 100.0, 100.0, false, false, false, false);
+    set_alpha_block_properties(by_id, 10, 0.0, 0.0, true, false, false, false);
+    set_alpha_block_properties(by_id, 11, 100.0, 100.0, true, false, false, false);
+    set_alpha_block_properties(by_id, 12, 0.5, 0.5, false, true, true, true);
+    set_alpha_block_properties(by_id, 13, 0.6, 0.6, false, true, true, true);
+    set_alpha_block_properties(by_id, 14, 3.0, 3.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 15, 3.0, 3.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 16, 3.0, 3.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 17, 2.0, 2.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 18, 0.2, 0.2, true, true, true, true);
+    set_alpha_block_properties(by_id, 20, 0.3, 0.3, false, true, true, true);
+    set_alpha_block_properties(by_id, 35, 0.8, 0.8, false, true, true, true);
+    set_alpha_block_properties(by_id, 37, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 38, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 39, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 40, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 46, 0.0, 0.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 48, 2.0, 6.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 49, 10.0, 1200.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 50, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 51, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 52, 5.0, 5.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 54, 2.5, 2.5, false, true, true, true);
+    set_alpha_block_properties(by_id, 56, 3.0, 3.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 58, 2.5, 2.5, false, true, true, true);
+    set_alpha_block_properties(by_id, 61, 3.5, 3.5, false, true, true, true);
+    set_alpha_block_properties(by_id, 62, 3.5, 3.5, false, true, true, true);
+    set_alpha_block_properties(by_id, 63, 1.0, 1.0, false, true, false, true);
+    set_alpha_block_properties(by_id, 64, 3.0, 3.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 65, 0.4, 0.4, false, false, true, true);
+    set_alpha_block_properties(by_id, 68, 1.0, 1.0, false, true, false, true);
+    set_alpha_block_properties(by_id, 73, 3.0, 3.0, false, true, true, true);
+    set_alpha_block_properties(by_id, 74, 3.0, 3.0, true, true, true, true);
+    set_alpha_block_properties(by_id, 76, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 78, 0.1, 0.1, true, false, false, true);
+    set_alpha_block_properties(by_id, 79, 0.5, 0.5, true, true, true, true);
+    set_alpha_block_properties(by_id, 81, 0.4, 0.4, true, true, true, true);
+    set_alpha_block_properties(by_id, 82, 0.6, 0.6, false, true, true, true);
+    set_alpha_block_properties(by_id, 83, 0.0, 0.0, true, false, false, true);
+    set_alpha_block_properties(by_id, 86, 1.0, 1.0, true, true, true, true);
+    set_alpha_block_properties(by_id, 87, 0.4, 0.4, false, true, true, true);
+    set_alpha_block_properties(by_id, 88, 0.5, 0.5, false, true, true, true);
+    set_alpha_block_properties(by_id, 89, 0.3, 0.3, false, true, true, true);
+    set_alpha_block_properties(by_id, 90, -1.0, 0.0, false, false, false, true);
+    set_alpha_block_properties(by_id, 91, 1.0, 1.0, true, true, true, true);
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3967,6 +4102,26 @@ mod tests {
         assert_eq!(registry.dropped_item_block_id(LAVA_ID), None);
         assert_eq!(registry.dropped_item_block_id(FLOWING_LAVA_ID), None);
         assert_eq!(registry.dropped_item_block_id(STONE_ID), Some(STONE_ID));
+    }
+
+    #[test]
+    fn alpha_registry_exposes_hardness_and_tick_flags() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert!((registry.mining_hardness_of(STONE_ID) - 1.5).abs() < f32::EPSILON);
+        assert!((registry.mining_hardness_of(OAK_LEAVES_ID) - 0.2).abs() < f32::EPSILON);
+        assert!((registry.mining_hardness_of(BEDROCK_ID) - (-1.0)).abs() < f32::EPSILON);
+        assert!(registry.ticks_randomly_of(GRASS_ID));
+        assert!(registry.ticks_randomly_of(FLOWING_WATER_ID));
+        assert!(!registry.ticks_randomly_of(WATER_ID));
+    }
+
+    #[test]
+    fn alpha_registry_collision_flags_cover_special_non_cube_blocks() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert!(registry.is_collidable(65), "ladders should have collision");
+        assert!(!registry.is_collidable(63), "standing signs should not collide");
+        assert!(!registry.is_collidable(50), "torches should not collide");
+        assert!(!registry.is_collidable(WATER_ID), "water should not collide");
     }
 
     #[test]
