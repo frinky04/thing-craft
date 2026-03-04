@@ -47,6 +47,7 @@ const FLUID_URGENT_SLICE_DIVISOR: usize = 8;
 const DAY_TICKS: u64 = 24_000;
 const WORLD_SEED: u64 = 0xA126_0001;
 const ALPHA_MINING_COOLDOWN_TICKS: u8 = 5;
+const FIRE_BLOCK_ID: u8 = 51;
 
 #[derive(Debug, Clone, Copy)]
 struct BlockInteractionRequest {
@@ -634,6 +635,8 @@ pub fn run() -> Result<()> {
 
                         // Block interactions (place-only in this queue path).
                         process_block_interaction_requests(
+                            &mut ecs_runtime,
+                            &bootstrap_world.registry,
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
                             &mut edit_latency_tracker,
@@ -748,19 +751,32 @@ pub fn run() -> Result<()> {
                         );
                         renderer.update_entity_shadows(&shadow_mesh);
 
+                        let submerged_in_lava = alpha_is_eye_submerged_in_material(
+                            snapshot.authoritative.position,
+                            &snapshot.physics,
+                            &chunk_streamer,
+                            &bootstrap_world.registry,
+                            EyeLiquid::Lava,
+                        );
                         let biome_sample = biome_source.sample(
                             snapshot.authoritative.position.x.floor() as i32,
                             snapshot.authoritative.position.z.floor() as i32,
                         );
                         let sky_color = alpha_sky_color(time_of_day, biome_sample.temperature as f32);
-                        let fog_color = alpha_clear_fog_color(
+                        let mut fog_color = alpha_clear_fog_color(
                             alpha_fog_color(time_of_day),
                             sky_color,
                             alpha_view_distance,
                         );
-                        let fog_color =
-                            alpha_apply_fog_brightness(fog_color, frame_fog_brightness);
+                        if snapshot.vitals.submerged_in_water {
+                            fog_color = [0.02, 0.02, 0.2];
+                        } else if submerged_in_lava {
+                            fog_color = [0.6, 0.1, 0.0];
+                        }
+                        fog_color = alpha_apply_fog_brightness(fog_color, frame_fog_brightness);
                         renderer.set_day_night(fog_color, sky_color, ambient_darkness, render_sky);
+                        renderer
+                            .set_submersion_fog(snapshot.vitals.submerged_in_water, submerged_in_lava);
 
                         let direction = direction_from_angles(
                             snapshot.interpolated.yaw,
@@ -792,6 +808,7 @@ pub fn run() -> Result<()> {
                         let hand_brightness = alpha_first_person_brightness(
                             &chunk_streamer,
                             snapshot.interpolated.position,
+                            &snapshot.physics,
                             ambient_darkness,
                         );
                         renderer.set_first_person_camera(hand_view_proj, hand_brightness);
@@ -828,7 +845,20 @@ pub fn run() -> Result<()> {
                             ray_origin,
                             ray_dir,
                             BLOCK_INTERACTION_REACH_BLOCKS,
-                            |x, y, z| chunk_streamer.block_at_world(x, y, z),
+                            |x, y, z| {
+                                let block_id = chunk_streamer.block_at_world(x, y, z)?;
+                                let allow_liquids =
+                                    selected_item_allows_liquid_targeting_stub(&inventory_state);
+                                let metadata =
+                                    chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+                                let can_hit = is_raycast_targetable_block(
+                                    &bootstrap_world.registry,
+                                    block_id,
+                                    metadata,
+                                    allow_liquids,
+                                );
+                                if can_hit { Some(block_id) } else { None }
+                            },
                         );
                         renderer.set_block_outline(outline_hit.map(|h| h.block));
                         let crack_target = mining_state.target.map(|t| [t.x, t.y, t.z]);
@@ -854,6 +884,7 @@ pub fn run() -> Result<()> {
                         let fog_color =
                             alpha_apply_fog_brightness(fog_color, frame_fog_brightness);
                         renderer.set_day_night(fog_color, sky_color, ambient_darkness, render_sky);
+                        renderer.set_submersion_fog(false, false);
                         renderer.set_block_outline(None);
                         renderer.set_block_crack_overlay(None, 0.0);
                     }
@@ -905,6 +936,17 @@ pub fn run() -> Result<()> {
                                 .map_or(300, |snapshot| snapshot.vitals.breath_capacity),
                             submerged_in_water: frame_camera
                                 .is_some_and(|snapshot| snapshot.vitals.submerged_in_water),
+                            view_yaw: frame_camera.map_or(0.0, |snapshot| snapshot.interpolated.yaw),
+                            view_pitch: frame_camera
+                                .map_or(0.0, |snapshot| snapshot.interpolated.pitch),
+                            overlay_brightness: frame_camera.map_or(1.0, |snapshot| {
+                                alpha_first_person_brightness(
+                                    &chunk_streamer,
+                                    snapshot.interpolated.position,
+                                    &snapshot.physics,
+                                    ambient_darkness,
+                                )
+                            }),
                             armor_points: 0,
                             is_dead: frame_camera
                                 .is_some_and(|snapshot| snapshot.vitals.health <= 0),
@@ -1210,12 +1252,16 @@ pub fn run() -> Result<()> {
                     if !mouse_captured {
                         return;
                     }
-                    first_person_hand.trigger_swing();
-                    first_person_hand.trigger_item_used();
-                    enqueue_block_interaction_request(
+                    if enqueue_block_interaction_request(
                         &mut ecs_runtime,
+                        &chunk_streamer,
+                        &bootstrap_world.registry,
+                        &inventory_state,
                         &mut block_interaction_requests,
-                    );
+                    ) {
+                        first_person_hand.trigger_swing();
+                        first_person_hand.trigger_item_used();
+                    }
                 },
                 WindowEvent::MouseWheel { delta, .. } => {
                     if inventory_open || ecs_runtime.player_is_dead() {
@@ -1366,10 +1412,13 @@ fn raycast_current_mining_target(
     chunk_streamer: &ChunkStreamer,
     registry: &BlockRegistry,
 ) -> Option<MiningTarget> {
-    let (origin, direction) = current_block_interaction_ray(ecs_runtime)?;
-    let hit = raycast_first_solid_block(origin, direction, BLOCK_INTERACTION_REACH_BLOCKS, |x, y, z| {
-        chunk_streamer.block_at_world(x, y, z)
-    })?;
+    let allow_liquids = false;
+    let hit = raycast_interaction_target(
+        ecs_runtime,
+        chunk_streamer,
+        registry,
+        allow_liquids,
+    )?;
     let block_id = chunk_streamer
         .block_at_world(hit.block[0], hit.block[1], hit.block[2])
         .unwrap_or(AIR_BLOCK_ID);
@@ -1570,19 +1619,111 @@ fn tick_block_mining(
 
 fn enqueue_block_interaction_request(
     ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    inventory: &PlayerInventoryState,
     queue: &mut VecDeque<BlockInteractionRequest>,
-) {
+) -> bool {
+    let allow_liquids = selected_item_allows_liquid_targeting_stub(inventory);
+    if raycast_interaction_target(ecs_runtime, chunk_streamer, registry, allow_liquids).is_none() {
+        return false;
+    }
+
     let Some((origin, direction)) = current_block_interaction_ray(ecs_runtime) else {
-        return;
+        return false;
     };
 
     queue.push_back(BlockInteractionRequest {
         origin,
         direction,
     });
+    true
+}
+
+fn selected_item_allows_liquid_targeting_stub(_inventory: &PlayerInventoryState) -> bool {
+    // TODO(alpha-bucket): return true only for empty/filled bucket interactions.
+    false
+}
+
+fn is_raycast_targetable_block(
+    registry: &BlockRegistry,
+    block_id: u8,
+    metadata: u8,
+    allow_liquids: bool,
+) -> bool {
+    if block_id == AIR_BLOCK_ID {
+        return false;
+    }
+    if registry.is_liquid(block_id) {
+        return allow_liquids && metadata == 0;
+    }
+    registry
+        .get(block_id)
+        .is_some_and(|block| block.can_ray_trace)
+}
+
+fn raycast_interaction_target(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    allow_liquids: bool,
+) -> Option<BlockRayHit> {
+    let (origin, direction) = current_block_interaction_ray(ecs_runtime)?;
+    raycast_first_solid_block(origin, direction, BLOCK_INTERACTION_REACH_BLOCKS, |x, y, z| {
+        let block_id = chunk_streamer.block_at_world(x, y, z)?;
+        let metadata = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+        let can_hit = is_raycast_targetable_block(registry, block_id, metadata, allow_liquids);
+        if can_hit { Some(block_id) } else { None }
+    })
+}
+
+fn placement_intersects_player(
+    ecs_runtime: &mut EcsRuntime,
+    registry: &BlockRegistry,
+    placing_block_id: u8,
+    place_x: i32,
+    place_y: i32,
+    place_z: i32,
+) -> bool {
+    if !registry.is_collidable(placing_block_id) {
+        return false;
+    }
+    let Some(snapshot) = ecs_runtime.camera_snapshot() else {
+        return false;
+    };
+    let half_w = snapshot.physics.width * 0.5;
+    let player_min_x = snapshot.authoritative.position.x - half_w;
+    let player_max_x = snapshot.authoritative.position.x + half_w;
+    let player_min_y = snapshot.authoritative.position.y;
+    let player_max_y = snapshot.authoritative.position.y + snapshot.physics.height;
+    let player_min_z = snapshot.authoritative.position.z - half_w;
+    let player_max_z = snapshot.authoritative.position.z + half_w;
+
+    let block_min_x = f64::from(place_x);
+    let block_max_x = block_min_x + 1.0;
+    let block_min_y = f64::from(place_y);
+    let block_max_y = block_min_y + 1.0;
+    let block_min_z = f64::from(place_z);
+    let block_max_z = block_min_z + 1.0;
+
+    player_min_x < block_max_x
+        && player_max_x > block_min_x
+        && player_min_y < block_max_y
+        && player_max_y > block_min_y
+        && player_min_z < block_max_z
+        && player_max_z > block_min_z
+}
+
+fn can_replace_block_for_placement(registry: &BlockRegistry, target_block_id: u8) -> bool {
+    registry.is_water(target_block_id)
+        || registry.is_lava(target_block_id)
+        || target_block_id == FIRE_BLOCK_ID
+        || registry.is_snow_layer(target_block_id)
 }
 
 fn process_block_interaction_requests(
+    ecs_runtime: &mut EcsRuntime,
+    registry: &BlockRegistry,
     chunk_streamer: &mut ChunkStreamer,
     queue: &mut VecDeque<BlockInteractionRequest>,
     edit_latency_tracker: &mut EditLatencyTracker,
@@ -1590,6 +1731,8 @@ fn process_block_interaction_requests(
 ) {
     while let Some(request) = queue.pop_front() {
         process_single_block_interaction_request(
+            ecs_runtime,
+            registry,
             chunk_streamer,
             request,
             edit_latency_tracker,
@@ -1599,16 +1742,24 @@ fn process_block_interaction_requests(
 }
 
 fn process_single_block_interaction_request(
+    ecs_runtime: &mut EcsRuntime,
+    registry: &BlockRegistry,
     chunk_streamer: &mut ChunkStreamer,
     request: BlockInteractionRequest,
     edit_latency_tracker: &mut EditLatencyTracker,
     inventory: &mut PlayerInventoryState,
 ) {
+    let allow_liquids = selected_item_allows_liquid_targeting_stub(inventory);
     let Some(hit) = raycast_first_solid_block(
         request.origin,
         request.direction,
         BLOCK_INTERACTION_REACH_BLOCKS,
-        |x, y, z| chunk_streamer.block_at_world(x, y, z),
+        |x, y, z| {
+            let block_id = chunk_streamer.block_at_world(x, y, z)?;
+            let metadata = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+            let can_hit = is_raycast_targetable_block(registry, block_id, metadata, allow_liquids);
+            if can_hit { Some(block_id) } else { None }
+        },
     ) else {
         return;
     };
@@ -1619,18 +1770,33 @@ fn process_single_block_interaction_request(
     let Some(block_id) = inventory.selected_block_id() else {
         return;
     };
+    let target_block_id = chunk_streamer
+        .block_at_world(hit.block[0], hit.block[1], hit.block[2])
+        .unwrap_or(AIR_BLOCK_ID);
     let [x, y, z] = hit.block;
-    let Some(place_x) = x.checked_add(hit.normal[0]) else {
-        return;
+    let (place_x, place_y, place_z) = if registry.is_snow_layer(target_block_id) {
+        (x, y, z)
+    } else {
+        let Some(px) = x.checked_add(hit.normal[0]) else {
+            return;
+        };
+        let Some(py) = y.checked_add(hit.normal[1]) else {
+            return;
+        };
+        let Some(pz) = z.checked_add(hit.normal[2]) else {
+            return;
+        };
+        (px, py, pz)
     };
-    let Some(place_y) = y.checked_add(hit.normal[1]) else {
+    if placement_intersects_player(ecs_runtime, registry, block_id, place_x, place_y, place_z) {
         return;
-    };
-    let Some(place_z) = z.checked_add(hit.normal[2]) else {
-        return;
-    };
+    }
 
-    if chunk_streamer.block_at_world(place_x, place_y, place_z) == Some(AIR_BLOCK_ID)
+    let place_target_block = chunk_streamer
+        .block_at_world(place_x, place_y, place_z)
+        .unwrap_or(AIR_BLOCK_ID);
+    if (place_target_block == AIR_BLOCK_ID
+        || can_replace_block_for_placement(registry, place_target_block))
         && chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id)
     {
         let _ = inventory.apply(InventoryCommand::ConsumeSelected { amount: 1 });
@@ -2038,17 +2204,63 @@ fn alpha_fog_brightness_target(
 
 fn alpha_first_person_brightness(
     chunk_streamer: &ChunkStreamer,
-    player_pos: Vec3,
+    camera_pos: Vec3,
+    physics: &crate::ecs::PhysicsBody,
     ambient_darkness: u8,
 ) -> f32 {
-    let world_x = player_pos.x.floor() as i32;
-    let world_y = player_pos.y.floor() as i32;
-    let world_z = player_pos.z.floor() as i32;
+    // Alpha Entity.getBrightness samples near eye/body center (not strict camera floor).
+    let world_x = camera_pos.x.floor() as i32;
+    let sample_y = f64::from(camera_pos.y) - physics.eye_height + physics.height * 0.66;
+    let world_y = sample_y.floor() as i32;
+    let world_z = camera_pos.z.floor() as i32;
     let sky_default = 15_u8.saturating_sub(ambient_darkness.min(15));
     let light_level = chunk_streamer
         .effective_light_at_world(world_x, world_y, world_z, ambient_darkness)
         .unwrap_or(sky_default);
     alpha_brightness_from_light_level(light_level)
+}
+
+fn alpha_liquid_height_loss(metadata: u8) -> f64 {
+    let level = if metadata >= 8 { 0 } else { metadata };
+    f64::from(level + 1) / 9.0
+}
+
+#[derive(Clone, Copy)]
+enum EyeLiquid {
+    Water,
+    Lava,
+}
+
+fn alpha_is_eye_submerged_in_material(
+    body_pos: DVec3,
+    physics: &crate::ecs::PhysicsBody,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    liquid: EyeLiquid,
+) -> bool {
+    // Alpha uses `entity.y + getEyeHeight()` in isSubmergedIn; player getEyeHeight() is 0.12f.
+    // This delays underwater FX until the camera is meaningfully submerged.
+    let eye_y = body_pos.y + physics.eye_height - physics.render_eye_height_sneak_offset + 0.12;
+    let world_x = body_pos.x.floor() as i32;
+    let world_y = eye_y.floor() as i32;
+    let world_z = body_pos.z.floor() as i32;
+    let Some(block_id) = chunk_streamer.block_at_world(world_x, world_y, world_z) else {
+        return false;
+    };
+    let is_target_liquid = match liquid {
+        EyeLiquid::Water => registry.is_water(block_id),
+        EyeLiquid::Lava => registry.is_lava(block_id),
+    };
+    if !is_target_liquid {
+        return false;
+    }
+
+    let metadata = chunk_streamer
+        .block_metadata_at_world(world_x, world_y, world_z)
+        .unwrap_or(0);
+    let liquid_surface_y =
+        (f64::from(world_y) + 1.0) - (alpha_liquid_height_loss(metadata) - 0.111_111_11);
+    eye_y < liquid_surface_y
 }
 
 fn build_first_person_item_mesh(
@@ -2366,14 +2578,13 @@ fn tick_player_survival(
         }
     }
 
-    // Approximate Alpha eye-level submersion check.
-    let eye_x = transform.position.x.floor() as i32;
-    let eye_y = (transform.position.y + physics.eye_height - physics.render_eye_height_sneak_offset)
-        .floor() as i32;
-    let eye_z = transform.position.z.floor() as i32;
-    let submerged_in_water = chunk_streamer
-        .block_at_world(eye_x, eye_y, eye_z)
-        .is_some_and(|block_id| registry.is_water(block_id));
+    let submerged_in_water = alpha_is_eye_submerged_in_material(
+        transform.position,
+        &physics,
+        chunk_streamer,
+        registry,
+        EyeLiquid::Water,
+    );
     vitals.submerged_in_water = submerged_in_water;
 
     if submerged_in_water {
@@ -2916,10 +3127,12 @@ mod tests {
         affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
         alpha_block_mining_progress_per_tick, alpha_brightness_from_light_level,
         alpha_fog_brightness_target, alpha_star_brightness, alpha_sunrise_color,
-        alpha_time_of_day, has_target_directive, hotbar_slot_for_key, parse_env_bool,
-        parse_env_u32, raycast_first_solid_block, resolve_axis,
+        alpha_time_of_day, has_target_directive, hotbar_slot_for_key,
+        can_replace_block_for_placement, is_raycast_targetable_block, parse_env_bool,
+        parse_env_u32, placement_intersects_player, raycast_first_solid_block, resolve_axis,
         AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID,
     };
+    use crate::ecs::EcsRuntime;
     use crate::inventory::PlayerInventoryState;
     use crate::streaming::{ChunkStreamer, ResidencyConfig};
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
@@ -3005,6 +3218,43 @@ mod tests {
         let airborne = alpha_block_mining_progress_per_tick(&registry, 3, &inv, false, false);
         assert!((in_water - grounded / 5.0).abs() < 1e-6);
         assert!((airborne - grounded / 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interaction_raycast_skips_liquids_without_bucket_mode() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        // water source
+        assert!(!is_raycast_targetable_block(&registry, 9, 0, false));
+        // flowing water / non-source
+        assert!(!is_raycast_targetable_block(&registry, 8, 4, true));
+        // source water is targetable only when allow_liquids is enabled (bucket-like path)
+        assert!(is_raycast_targetable_block(&registry, 9, 0, true));
+        // regular solid blocks are still targetable
+        assert!(is_raycast_targetable_block(&registry, 1, 0, false));
+    }
+
+    #[test]
+    fn placement_collision_rejects_blocks_inside_player() {
+        let mut ecs = EcsRuntime::new();
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert!(placement_intersects_player(&mut ecs, &registry, 1, 0, 72, 0));
+        assert!(!placement_intersects_player(&mut ecs, &registry, 1, 2, 72, 0));
+        // Torches have no collision shape in Alpha canPlace checks.
+        assert!(!placement_intersects_player(
+            &mut ecs, &registry, 50, 0, 72, 0
+        ));
+    }
+
+    #[test]
+    fn placement_replaces_alpha_replaceable_targets() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert!(can_replace_block_for_placement(&registry, 8)); // flowing water
+        assert!(can_replace_block_for_placement(&registry, 9)); // water
+        assert!(can_replace_block_for_placement(&registry, 10)); // flowing lava
+        assert!(can_replace_block_for_placement(&registry, 11)); // lava
+        assert!(can_replace_block_for_placement(&registry, 51)); // fire
+        assert!(can_replace_block_for_placement(&registry, 78)); // snow layer
+        assert!(!can_replace_block_for_placement(&registry, 1)); // stone
     }
 
     #[test]

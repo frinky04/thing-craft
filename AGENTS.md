@@ -10,3 +10,4 @@
 - **Avoid God Classes:** Minecraft Java relied heavily on singletons and "God classes" like World.java, which ended up being thousands of lines long and responsible for spawning particles, playing sounds, saving to disk, and simulating physics. Use an Entity Component System (ECS) like hecs or flecs. World should just be a container for components.
 - **What to Read:** WHAT.md is our north-star! Read it if you are lost, and before getting started!
 - **Completion Docs Split:** Keep both `BOOSTRAP_COMPLETION.md` (bootstrap/implementation) and `GAMEPLAY_COMPLETION.md` (Alpha gameplay parity) updated.
+- **Use Todo's:** You'll probably be writing a lot of stubs as we progressively rebuild. Ensure that if you leave a stub, you leave a todo. Generally leave todo's anywhere you leave something half finished.

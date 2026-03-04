@@ -44,6 +44,7 @@ const HUD_TEX_ICONS: f32 = 1.0;
 const HUD_TEX_TERRAIN: f32 = 2.0;
 pub const HUD_TEX_INVENTORY: f32 = 3.0;
 pub const HUD_TEX_FONT: f32 = 4.0;
+pub const HUD_TEX_WATER_OVERLAY: f32 = 5.0;
 
 const TEX_SIZE_PX: f32 = 256.0;
 const FONT_TEX_SIZE_PX: f32 = 128.0;
@@ -62,6 +63,9 @@ pub struct HudState {
     pub breath: i32,
     pub breath_capacity: i32,
     pub submerged_in_water: bool,
+    pub view_yaw: f32,
+    pub view_pitch: f32,
+    pub overlay_brightness: f32,
     pub armor_points: i32,
     pub is_dead: bool,
     pub death_ticks: i32,
@@ -82,6 +86,18 @@ pub fn build_hud_vertices(
     let center_x = (gui_w / 2.0).floor();
 
     let mut verts = Vec::with_capacity(512);
+
+    if state.submerged_in_water {
+        push_underwater_overlay(
+            &mut verts,
+            gui_w,
+            gui_h,
+            state.view_yaw,
+            state.view_pitch,
+            state.overlay_brightness,
+            scale,
+        );
+    }
 
     // Crosshair (icons.png: 0,0 -> 16x16).
     push_textured_quad_gui(
@@ -316,6 +332,40 @@ pub fn build_hud_vertices(
     }
 
     verts
+}
+
+fn push_underwater_overlay(
+    verts: &mut Vec<HudVertex>,
+    gui_w: f32,
+    gui_h: f32,
+    view_yaw: f32,
+    view_pitch: f32,
+    brightness: f32,
+    scale: f32,
+) {
+    // Alpha ItemInHandRenderer.renderInWaterEffect:
+    // UV spans 4x with yaw/pitch offsets, alpha 0.5 modulated by player brightness.
+    let u_off = -view_yaw / 64.0;
+    let v_off = view_pitch / 64.0;
+    // Alpha draws this on a perspective-space quad (z=-0.5), which effectively zooms it in
+    // compared to a pure screen-space blit. Scale down UV span to match that look.
+    let uv_span = 2.0;
+    let uv = [
+        [uv_span + u_off, uv_span + v_off],
+        [0.0 + u_off, uv_span + v_off],
+        [0.0 + u_off, 0.0 + v_off],
+        [uv_span + u_off, 0.0 + v_off],
+    ];
+    let points = [[0.0, 0.0], [gui_w, 0.0], [gui_w, gui_h], [0.0, gui_h]];
+    let b = brightness.clamp(0.0, 1.0);
+    push_textured_quad_points_gui(
+        verts,
+        points,
+        uv,
+        HUD_TEX_WATER_OVERLAY,
+        scale,
+        [b, b, b, 0.5],
+    );
 }
 
 #[must_use]
@@ -857,6 +907,9 @@ mod tests {
             breath: 300,
             breath_capacity: 300,
             submerged_in_water: false,
+            view_yaw: 0.0,
+            view_pitch: 0.0,
+            overlay_brightness: 1.0,
             armor_points: 0,
             is_dead: false,
             death_ticks: 0,
@@ -873,5 +926,32 @@ mod tests {
         assert!(verts
             .iter()
             .any(|v| (v.texture_kind - HUD_TEX_TERRAIN).abs() < 0.01));
+    }
+
+    #[test]
+    fn submerged_hud_emits_water_overlay_vertices() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let state = HudState {
+            selected_slot: 0,
+            slot_counts: [0; HOTBAR_SLOT_COUNT],
+            slot_block_ids: [0; HOTBAR_SLOT_COUNT],
+            health: 20,
+            prev_health: 20,
+            invulnerable_timer: 0,
+            breath: 300,
+            breath_capacity: 300,
+            submerged_in_water: true,
+            view_yaw: 32.0,
+            view_pitch: -16.0,
+            overlay_brightness: 0.75,
+            armor_points: 0,
+            is_dead: false,
+            death_ticks: 0,
+            sim_ticks: 0,
+        };
+        let verts = build_hud_vertices(1280.0, 720.0, &state, &registry);
+        assert!(verts
+            .iter()
+            .any(|v| (v.texture_kind - HUD_TEX_WATER_OVERLAY).abs() < 0.01));
     }
 }

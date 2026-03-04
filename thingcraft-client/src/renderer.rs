@@ -92,6 +92,8 @@ pub struct Renderer<'w> {
     star_brightness: f32,
     ambient_darkness: f32,
     leaf_cutout_enabled: f32,
+    fog_mode: f32,
+    fog_density: f32,
     camera_pos: [f32; 3],
     time_of_day: f32,
     mesh_buffer_pool: MeshBufferPool,
@@ -207,14 +209,12 @@ struct OutlineMeshGpu {
 #[repr(C)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
-    camera_pos: [f32; 3],
-    fog_start: f32,
-    fog_color: [f32; 3],
-    fog_end: f32,
-    ambient_darkness: f32,
-    leaf_cutout_enabled: f32,
-    _pad: [f32; 2],
+    camera_pos_fog_start: [f32; 4],
+    fog_color_fog_end: [f32; 4],
+    fog_params: [f32; 4],
 }
+
+const _: [(); 112] = [(); std::mem::size_of::<CameraUniform>()];
 
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -227,6 +227,7 @@ struct SkyUniform {
     _pad0: f32,
     dark_color: [f32; 3],
     _pad1: f32,
+    fog_mode_density: [f32; 4],
 }
 
 /// Vertex for the sky dome meshes: world-space position only (color is uniform).
@@ -701,13 +702,14 @@ impl<'w> Renderer<'w> {
 
         let camera_uniform = CameraUniform {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-            camera_pos: [0.0, 0.0, 0.0],
-            fog_start: 0.0,
-            fog_color: DEFAULT_FOG_COLOR,
-            fog_end: 1.0,
-            ambient_darkness: 0.0,
-            leaf_cutout_enabled: 1.0,
-            _pad: [0.0; 2],
+            camera_pos_fog_start: [0.0, 0.0, 0.0, 0.0],
+            fog_color_fog_end: [
+                DEFAULT_FOG_COLOR[0],
+                DEFAULT_FOG_COLOR[1],
+                DEFAULT_FOG_COLOR[2],
+                1.0,
+            ],
+            fog_params: [0.0, 1.0, 0.0, 0.0],
         };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("thingcraft-camera-buffer"),
@@ -779,6 +781,7 @@ impl<'w> Renderer<'w> {
             _pad0: 0.0,
             dark_color: [0.0; 3],
             _pad1: 0.0,
+            fog_mode_density: [0.0, 0.0, 0.0, 0.0],
         };
         let sky_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("thingcraft-sky-uniform-buffer"),
@@ -1145,7 +1148,9 @@ impl<'w> Renderer<'w> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false, // Reads depth but doesn't write
+                // Match Alpha-like ordering: translucent world still updates depth, so clouds and
+                // later passes don't punch in front of water surfaces.
+                depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -1749,6 +1754,16 @@ impl<'w> Renderer<'w> {
                     wgpu::BindGroupLayoutEntry {
                         binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -1899,6 +1914,41 @@ impl<'w> Renderer<'w> {
                 depth_or_array_layers: 1,
             },
         );
+        let (water_overlay_w, water_overlay_h, water_overlay_rgba) =
+            load_png_rgba(Path::new("resources/minecraft-a1.2.6-client/misc/water.png"));
+        let water_overlay_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thingcraft-hud-water-overlay-texture"),
+            size: wgpu::Extent3d {
+                width: water_overlay_w,
+                height: water_overlay_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &water_overlay_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &water_overlay_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * water_overlay_w),
+                rows_per_image: Some(water_overlay_h),
+            },
+            wgpu::Extent3d {
+                width: water_overlay_w,
+                height: water_overlay_h,
+                depth_or_array_layers: 1,
+            },
+        );
         let hud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("thingcraft-hud-sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -1914,6 +1964,8 @@ impl<'w> Renderer<'w> {
         let icons_view = icons_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let inventory_view = inventory_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let font_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let water_overlay_view =
+            water_overlay_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let terrain_view = terrain_atlas
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1943,6 +1995,10 @@ impl<'w> Renderer<'w> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&water_overlay_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
                     resource: wgpu::BindingResource::Sampler(&hud_sampler),
                 },
             ],
@@ -2179,6 +2235,8 @@ impl<'w> Renderer<'w> {
             star_brightness: 0.0,
             ambient_darkness: 0.0,
             leaf_cutout_enabled: 1.0,
+            fog_mode: 0.0,
+            fog_density: 0.0,
             camera_pos: [0.0; 3],
             time_of_day: 0.0,
             mesh_buffer_pool: MeshBufferPool::default(),
@@ -2211,13 +2269,19 @@ impl<'w> Renderer<'w> {
         let fog_end_clamped = fog_end.max(fog_start + 0.001);
         let uniform = CameraUniform {
             view_proj,
-            camera_pos,
-            fog_start,
-            fog_color: self.fog_color,
-            fog_end: fog_end_clamped,
-            ambient_darkness: self.ambient_darkness,
-            leaf_cutout_enabled: self.leaf_cutout_enabled,
-            _pad: [0.0; 2],
+            camera_pos_fog_start: [camera_pos[0], camera_pos[1], camera_pos[2], fog_start],
+            fog_color_fog_end: [
+                self.fog_color[0],
+                self.fog_color[1],
+                self.fog_color[2],
+                fog_end_clamped,
+            ],
+            fog_params: [
+                self.ambient_darkness,
+                self.leaf_cutout_enabled,
+                self.fog_mode,
+                self.fog_density,
+            ],
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -2240,6 +2304,21 @@ impl<'w> Renderer<'w> {
         self.sky_color = sky_color;
         self.render_sky = render_sky;
         self.ambient_darkness = f32::from(ambient_darkness.min(11));
+    }
+
+    pub fn set_submersion_fog(&mut self, in_water: bool, in_lava: bool) {
+        if in_water {
+            // Alpha GameRenderer.setupFog(): GL_EXP with density 0.1 in water.
+            self.fog_mode = 1.0;
+            self.fog_density = 0.1;
+        } else if in_lava {
+            // Alpha GameRenderer.setupFog(): GL_EXP with density 2.0 in lava.
+            self.fog_mode = 1.0;
+            self.fog_density = 2.0;
+        } else {
+            self.fog_mode = 0.0;
+            self.fog_density = 0.0;
+        }
     }
 
     pub fn set_leaf_cutout_enabled(&mut self, enabled: bool) {
@@ -2560,6 +2639,7 @@ impl<'w> Renderer<'w> {
             _pad0: 0.0,
             dark_color,
             _pad1: 0.0,
+            fog_mode_density: [self.fog_mode, self.fog_density, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -4564,13 +4644,9 @@ fn upload_dynamic_sprite(
 const SHADOW_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
-    camera_pos: vec3<f32>,
-    fog_start: f32,
-    fog_color: vec3<f32>,
-    fog_end: f32,
-    ambient_darkness: f32,
-    leaf_cutout_enabled: f32,
-    _pad: vec2<f32>,
+    camera_pos_fog_start: vec4<f32>,
+    fog_color_fog_end: vec4<f32>,
+    fog_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var shadow_tex: texture_2d<f32>;
@@ -4607,13 +4683,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 const CHUNK_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
-    camera_pos: vec3<f32>,
-    fog_start: f32,
-    fog_color: vec3<f32>,
-    fog_end: f32,
-    ambient_darkness: f32,
-    leaf_cutout_enabled: f32,
-    _pad: vec2<f32>,
+    camera_pos_fog_start: vec4<f32>,
+    fog_color_fog_end: vec4<f32>,
+    fog_params: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -4666,7 +4738,7 @@ fn alpha_brightness(level: f32) -> f32 {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-    let leaf_fast = input.leaf_marker > 0.5 && camera.leaf_cutout_enabled < 0.5;
+    let leaf_fast = input.leaf_marker > 0.5 && camera.fog_params.y < 0.5;
     var uv = input.uv;
     if (leaf_fast) {
         uv = input.uv + vec2<f32>(1.0 / 16.0, 0.0);
@@ -4675,16 +4747,22 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (texel.a <= 0.1 && !leaf_fast) {
         discard;
     }
-    let day_sky = max(input.sky_light - camera.ambient_darkness, 0.0);
+    let day_sky = max(input.sky_light - camera.fog_params.x, 0.0);
     let effective = max(input.block_light, day_sky);
     let brightness = alpha_brightness(effective);
     let shade = input.face_scale * brightness;
     let lit = texel.rgb * input.tint.rgb * shade;
     let alpha = select(texel.a * input.tint.a, input.tint.a, leaf_fast);
-    let distance_to_camera = distance(input.world_pos, camera.camera_pos);
-    let fog_span = max(camera.fog_end - camera.fog_start, 0.0001);
-    let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
-    let color = mix(lit, camera.fog_color, fog_t);
+    let distance_to_camera = distance(input.world_pos, camera.camera_pos_fog_start.xyz);
+    var fog_t: f32;
+    if (camera.fog_params.z > 0.5) {
+        // Alpha underwater/lava path uses GL_EXP fog.
+        fog_t = clamp(1.0 - exp(-camera.fog_params.w * distance_to_camera), 0.0, 1.0);
+    } else {
+        let fog_span = max(camera.fog_color_fog_end.w - camera.camera_pos_fog_start.w, 0.0001);
+        fog_t = clamp((distance_to_camera - camera.camera_pos_fog_start.w) / fog_span, 0.0, 1.0);
+    }
+    let color = mix(lit, camera.fog_color_fog_end.xyz, fog_t);
     return vec4<f32>(color, alpha);
 }
 "#;
@@ -4746,6 +4824,7 @@ struct Sky {
     _pad0: f32,
     dark_color: vec3<f32>,
     _pad1: f32,
+    fog_mode_density: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -4776,9 +4855,14 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     // Horizontal distance from dome center to this fragment.
     let dist = sqrt(input.local_pos.x * input.local_pos.x + input.local_pos.z * input.local_pos.z);
 
-    // MC Alpha sky fog: start=0, end=renderDistance*0.8
+    // MC Alpha sky fog: start=0, end=renderDistance*0.8 (or exp when submerged).
     let sky_fog_end = sky.fog_end * 0.8;
-    let fog_t = clamp(dist / max(sky_fog_end, 0.001), 0.0, 1.0);
+    var fog_t: f32;
+    if (sky.fog_mode_density.x > 0.5) {
+        fog_t = clamp(1.0 - exp(-sky.fog_mode_density.y * dist), 0.0, 1.0);
+    } else {
+        fog_t = clamp(dist / max(sky_fog_end, 0.001), 0.0, 1.0);
+    }
 
     // Select dome color based on whether this is light or dark dome.
     let dome_color = select(sky.dark_color, sky.color, input.dome_y > 0.0);
@@ -4927,13 +5011,9 @@ fn fs_main(_input: VertexOut) -> @location(0) vec4<f32> {
 const CLOUD_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
-    camera_pos: vec3<f32>,
-    fog_start: f32,
-    fog_color: vec3<f32>,
-    fog_end: f32,
-    ambient_darkness: f32,
-    leaf_cutout_enabled: f32,
-    _pad: vec2<f32>,
+    camera_pos_fog_start: vec4<f32>,
+    fog_color_fog_end: vec4<f32>,
+    fog_params: vec4<f32>,
 };
 
 struct Cloud {
@@ -4991,10 +5071,10 @@ fn vs_main(input: VertexIn) -> VertexOut {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     // Face visibility parity with Alpha fancy clouds.
-    if (input.face_kind < 0.5 && camera.camera_pos.y > 113.33) {
+    if (input.face_kind < 0.5 && camera.camera_pos_fog_start.y > 113.33) {
         discard;
     }
-    if (input.face_kind > 0.5 && input.face_kind < 1.5 && camera.camera_pos.y < 103.33) {
+    if (input.face_kind > 0.5 && input.face_kind < 1.5 && camera.camera_pos_fog_start.y < 103.33) {
         discard;
     }
     let texel = textureSample(cloud_texture, cloud_sampler, input.uv);
@@ -5003,10 +5083,15 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     }
     let alpha = texel.a * cloud.alpha;
     let base = texel.rgb * cloud.color * input.shade;
-    let distance_to_camera = distance(input.world_pos, camera.camera_pos);
-    let fog_span = max(camera.fog_end - camera.fog_start, 0.0001);
-    let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
-    let color = mix(base, camera.fog_color, fog_t);
+    let distance_to_camera = distance(input.world_pos, camera.camera_pos_fog_start.xyz);
+    var fog_t: f32;
+    if (camera.fog_params.z > 0.5) {
+        fog_t = clamp(1.0 - exp(-camera.fog_params.w * distance_to_camera), 0.0, 1.0);
+    } else {
+        let fog_span = max(camera.fog_color_fog_end.w - camera.camera_pos_fog_start.w, 0.0001);
+        fog_t = clamp((distance_to_camera - camera.camera_pos_fog_start.w) / fog_span, 0.0, 1.0);
+    }
+    let color = mix(base, camera.fog_color_fog_end.xyz, fog_t);
     return vec4<f32>(color, alpha);
 }
 "#;
@@ -5088,7 +5173,8 @@ var<uniform> screen: HudScreen;
 @group(1) @binding(2) var hud_terrain_tex: texture_2d<f32>;
 @group(1) @binding(3) var hud_inventory_tex: texture_2d<f32>;
 @group(1) @binding(4) var hud_font_tex: texture_2d<f32>;
-@group(1) @binding(5) var hud_sampler: sampler;
+@group(1) @binding(5) var hud_water_overlay_tex: texture_2d<f32>;
+@group(1) @binding(6) var hud_sampler: sampler;
 
 struct VertexIn {
     @location(0) position: vec2<f32>,
@@ -5130,8 +5216,11 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         texel = textureSample(hud_terrain_tex, hud_sampler, input.uv);
     } else if (input.texture_kind >= 2.5 && input.texture_kind < 3.5) {
         texel = textureSample(hud_inventory_tex, hud_sampler, input.uv);
-    } else if (input.texture_kind >= 3.5) {
+    } else if (input.texture_kind >= 3.5 && input.texture_kind < 4.5) {
         texel = textureSample(hud_font_tex, hud_sampler, input.uv);
+    } else if (input.texture_kind >= 4.5) {
+        // Alpha underwater overlay scrolls UV by yaw/pitch and repeats.
+        texel = textureSample(hud_water_overlay_tex, hud_sampler, fract(input.uv));
     }
     if (texel.a <= 0.01) {
         discard;
