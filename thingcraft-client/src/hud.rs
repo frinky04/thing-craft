@@ -577,27 +577,27 @@ fn push_alpha_item3d_block(
             registry.sprite_index_for_face(block_id, [0, -1, 0]),
         ),
         (
-            [3, 2, 6, 7],
+            [7, 6, 2, 3],
             [0.0, 1.0, 0.0],
             registry.sprite_index_for_face(block_id, [0, 1, 0]),
         ),
         (
-            [1, 0, 3, 2],
+            [0, 3, 2, 1],
             [0.0, 0.0, -1.0],
             registry.sprite_index_for_face(block_id, [0, 0, -1]),
         ),
         (
-            [4, 5, 6, 7],
+            [5, 6, 7, 4],
             [0.0, 0.0, 1.0],
             registry.sprite_index_for_face(block_id, [0, 0, 1]),
         ),
         (
-            [0, 4, 7, 3],
+            [4, 7, 3, 0],
             [-1.0, 0.0, 0.0],
             registry.sprite_index_for_face(block_id, [-1, 0, 0]),
         ),
         (
-            [5, 1, 2, 6],
+            [1, 2, 6, 5],
             [1.0, 0.0, 0.0],
             registry.sprite_index_for_face(block_id, [1, 0, 0]),
         ),
@@ -698,7 +698,7 @@ fn sprite_uv(sprite: u16) -> [[f32; 2]; 4] {
     let v = (sprite / 16) as f32 * 16.0 / TEX_SIZE_PX;
     let u1 = u + 16.0 / TEX_SIZE_PX;
     let v1 = v + 16.0 / TEX_SIZE_PX;
-    [[u, v], [u1, v], [u1, v1], [u, v1]]
+    [[u, v1], [u, v], [u1, v], [u1, v1]]
 }
 
 fn gui_scale(screen_w: f32, screen_h: f32) -> f32 {

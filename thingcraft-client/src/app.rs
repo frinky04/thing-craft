@@ -1947,7 +1947,7 @@ fn terrain_sprite_uv(sprite: u16) -> [[f32; 2]; 4] {
     let v0 = (sprite / 16) as f32 * 16.0 * texel;
     let u1 = u0 + 16.0 * texel;
     let v1 = v0 + 16.0 * texel;
-    [[u0, v1], [u1, v1], [u1, v0], [u0, v0]]
+    [[u0, v1], [u0, v0], [u1, v0], [u1, v1]]
 }
 
 fn skin_uv_rect(u0: f32, v0: f32, u1: f32, v1: f32) -> [[f32; 2]; 4] {
