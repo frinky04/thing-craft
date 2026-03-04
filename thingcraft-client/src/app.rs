@@ -982,6 +982,10 @@ pub fn run() -> Result<()> {
                             if inventory_open {
                                 inventory_commands.push_back(InventoryCommand::CloseInventory);
                                 inventory_open = false;
+                                if !ecs_runtime.player_is_dead() {
+                                    mouse_captured = true;
+                                    set_mouse_capture(window, true);
+                                }
                             } else {
                                 mouse_captured = false;
                                 set_mouse_capture(window, false);
@@ -997,6 +1001,10 @@ pub fn run() -> Result<()> {
                                 ecs_runtime.clear_input_state();
                             } else {
                                 inventory_commands.push_back(InventoryCommand::CloseInventory);
+                                if !ecs_runtime.player_is_dead() {
+                                    mouse_captured = true;
+                                    set_mouse_capture(window, true);
+                                }
                             }
                             hud_dirty = true;
                         }
