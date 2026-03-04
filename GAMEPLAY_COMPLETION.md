@@ -5,10 +5,10 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 ## World and Generation
 - [~] Dimensions: Overworld generation/streaming is implemented; Nether dimension generation/streaming is still pending.
 - [~] World Limits: Y=128 chunk height and sea level behavior at Y=64 are implemented in generation/runtime; full parity validation for practical X/Z behavior across extended travel is still pending.
-- [~] Biomes: 2D temperature/downfall biome sampling and biome classification are implemented; final parity tuning/coverage (including dimension-specific behavior) is still pending.
-- [~] Biome Types: Overworld biome set is implemented (Rainforest, Swampland, Seasonal Forest, Forest, Savanna, Shrubland, Taiga, Desert, Plains, Tundra, plus Ice Desert variant); Hell/Nether biome parity is pending.
+- [x] Biomes: Alpha-exact `PerlinSimplexNoise` biome sampling with bulk region queries, quadratic temperature transform, and climate-to-biome classification matching Alpha's `computeBiome` logic.
+- [~] Biome Types: Overworld biome set is implemented (Rainforest, Swampland, Seasonal Forest, Forest, Savanna, Shrubland, Taiga, Desert, Plains, Tundra); IceDesert removed (Alpha never produces it). Hell/Nether biome parity is pending.
 - [x] Dynamic Colors: Grass and leaf colors shift dynamically based on biome temperature and humidity values.
-- [~] Terrain: Deterministic terrain generation is implemented (surface shape + biome-dependent top blocks + cave/ore/dungeon/tree population), but strict Alpha-style 3D Perlin density/parity is not fully complete.
+- [~] Terrain: Alpha-exact 3D density terrain generation is implemented (7 `PerlinNoise` generators with correct seeding order, 5x17x5 density grid with trilinear interpolation, climate-modulated scale/depth shaping, top-down `buildSurfaces` pass with bedrock/sand/gravel layers). Decoration features (lakes, flowers, cacti, sugar cane, snow cover, pumpkins, reed) still pending.
 - [x] Caves: Standard cave tunnels only (no ravines).
 - [x] Underground Generation: Dirt, gravel, coal, iron, gold, diamond, and redstone veins.
 - [~] Structures: Dungeon rooms with mob spawner blocks placed (chest inventory and spawner entity config require M7 entity/inventory systems).

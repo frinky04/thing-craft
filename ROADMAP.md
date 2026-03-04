@@ -9,7 +9,7 @@
 - M4 complete: deterministic biome/climate fields, surface terrain, cave carving (Alpha worm algorithm), ore vein placement (7 ore types), and dungeon stubs implemented.
 - M5 complete: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, fixed-tick block interaction requests (raycast break/place + dirty remesh propagation), per-edit column height/light refresh, and renderer frustum culling are implemented.
 - M6 complete: async lighting worker lane plus Alpha-style rendered light integration are validated end-to-end (bounded dispatch, queue-based sky/block propagation, stale-result dropping, boundary-scoped neighbor invalidation, urgent edit relight/remesh lanes, neighbor-lighting-stable meshing, and brightness-table-based face shading from propagated light).
-- M7 in progress: Wave 1 includes hotbar-driven block placement (`1..9`), finite stack state for those slots (place consumes, break pickups refill matching slots), and torch placement wired through runtime relight/remesh propagation. Wave 2 adds oak tree generation (biome-density-driven), player physics (gravity, AABB collision, jumping, fly/walk toggle via `F`), and a basic HUD (crosshair + hotbar overlay). Wave 3 adds liquid rendering (semi-transparent water with alpha blending, opaque lava with correct atlas textures, split opaque/transparent meshing pipeline), foliage biome tinting (leaf blocks colored from Alpha `foliagecolor.png`), and birch/pine tree shape variants with biome-driven selection. Wave 4 adds fixed-tick day/night state (Alpha time curve + ambient darkness/fog) and budgeted liquid simulation (water/lava flow metadata, source/flowing transitions, downward+lateral spread, and lava-water obsidian/cobblestone reactions).
+- M7 in progress: Wave 1 includes hotbar-driven block placement (`1..9`), finite stack state for those slots (place consumes, break pickups refill matching slots), and torch placement wired through runtime relight/remesh propagation. Wave 2 adds oak tree generation (biome-density-driven), player physics (gravity, AABB collision, jumping, fly/walk toggle via `F`), and a basic HUD (crosshair + hotbar overlay). Wave 3 adds liquid rendering (semi-transparent water with alpha blending, opaque lava with correct atlas textures, split opaque/transparent meshing pipeline), foliage biome tinting (leaf blocks colored from Alpha `foliagecolor.png`), and birch/pine tree shape variants with biome-driven selection. Wave 4 adds fixed-tick day/night state (Alpha time curve + ambient darkness/fog) and budgeted liquid simulation (water/lava flow metadata, source/flowing transitions, downward+lateral spread, and lava-water obsidian/cobblestone reactions). Wave 5 adds entity framework and dropped item entities.
 - M7 fluid follow-up landed: liquid scheduling now prioritizes player-driven wakeups, chunk-load seeding is selective to reduce backlog, and frame-time-adaptive fluid budgets + regression harnesses guard against "blocked edits / all-at-once" updates.
 - Worldgen stability follow-up landed during M7: tree decoration now runs as a world-space population pass (vanilla-style source chunk influence with cross-chunk writes), eliminating chunk-border tree clipping/truncation artifacts.
 - Rendering/lighting parity follow-up landed during M7: linear fog + alpha-test discard in shader, section-level (`16x16x16`) meshing/upload path, per-lane worker pools, neighbor-edge snapshot job payloads, and GPU mesh buffer pooling.
@@ -18,6 +18,7 @@
 - Fog parity follow-up landed during M7: clear-fog color is now multiplied by Alpha-style smoothed player-position fog brightness (`world.getBrightness` + view-distance bias + tick smoothing/interpolation), restoring underground/shadow fog darkening behavior.
 - Leaf rendering parity follow-up landed during M7: leaf vertices now carry a dedicated material marker and runtime `THINGCRAFT_FANCY_GRAPHICS` controls fancy cutout leaves (`true`) vs fast opaque leaves (`false`, with Alpha tile `+1` remap).
 - M7 Wave 5 landed: entity framework and dropped item entities. Breaking a block now spawns a physics-driven item entity (Alpha ItemEntity constants: gravity 0.04, bounce -0.5, ground friction 0.588, 10-tick pickup delay, 5-minute despawn) that the player collects by walking over it. Items render as Y-axis billboarded terrain atlas sprites with bobbing animation, drawn via the existing chunk shader pipeline in a single batched draw call.
+- Worldgen parity follow-up landed during M7: terrain generation now uses Alpha-exact 3D density field approach with 7 noise generators (`PerlinNoise` octave stacking of `ImprovedNoise`), trilinear interpolation across a 5x17x5 sample grid, climate-modulated height shaping, and a separate top-down surface builder (`buildSurfaces`). Biome source now uses `PerlinSimplexNoise` (octave-stacked simplex noise) instead of `Fbm<OpenSimplex>`, with Alpha-exact seeding order, post-processing transforms, and bulk region sampling. The IceDesert biome variant (which Alpha never produces) has been removed. Bedrock is now an irregular layer at y 0-4 (not flat y=0), and sand/gravel beaches generate from dedicated surface noise. Decoration features (lakes, flowers, cacti, sugar cane, snow cover, pumpkins, reed) are deferred to a follow-up pass.
 
 ## M0 - Repository Foundation
 
@@ -107,20 +108,23 @@ Introduce chunk-addressed world storage and loading boundaries.
 ## M4 - Terrain Generation
 
 ### Goal
-Generate Alpha-like Overworld terrain and biome metadata.
+Generate Alpha-exact Overworld terrain and biome metadata.
 
 ### In Scope
-- 2D temperature/humidity biome fields
-- 3D terrain noise and cave carving
-- Core underground ore distribution and dungeon stubs
+- Alpha-exact `PerlinSimplexNoise` biome fields (temperature/downfall/biome)
+- Alpha-exact 3D density terrain (7 `PerlinNoise` generators, 5x17x5 trilinear interpolation)
+- Top-down surface builder (bedrock, sand/gravel beaches, biome surface blocks)
+- Cave carving and core underground ore distribution and dungeon stubs
 
 ### Out of Scope
+- Decoration features (lakes, flowers, cacti, sugar cane, snow cover, pumpkins, reed)
 - Full structure parity beyond dungeons
 - Nether content
 
 ### Exit Criteria
 - Generated chunks are deterministic for a given seed
 - Biome fields drive block/material selection predictably
+- Terrain shape uses 3D density with overhangs, not flat heightmap
 
 ## M5 - Meshing and Culling
 
@@ -174,3 +178,75 @@ Reach functional feature parity in controlled waves.
 - `GAMEPLAY_COMPLETION.md` reflects validated gameplay parity progress
 - `BOOSTRAP_COMPLETION.md` reflects validated bootstrap/implementation progress
 - Regressions covered by targeted tests and playtest checklists
+
+---
+
+## Worldgen Decoration Pass (Follow-Up)
+
+### Status: Not Started
+
+The core terrain shape (3D density field, surface builder, biome source) is now Alpha-exact. The following decoration features from Alpha's `OverworldChunkGenerator.populate()` and biome decorators are still missing. These run **after** terrain + surface + caves/ores/dungeons, during the per-chunk population pass.
+
+### Missing Features (Ordered by Impact)
+
+#### 1. Snow Cover
+- **Source**: `BiomeDecorator.java` — places SNOW on top of exposed solid blocks when biome temperature < 0.5
+- **Scope**: Iterate chunk surface, check temperature, place snow block (ID 78) on top face
+- **Depends on**: Biome temperature sampling (already implemented)
+- **Impact**: Visual — cold biomes (Tundra, Taiga) look bare without snow
+
+#### 2. Surface Lakes (Water & Lava)
+- **Source**: `LakeFeature.java` — carves and fills small surface/underground liquid pools
+- **Scope**: Water lakes: 1 attempt per chunk (1-in-4 chance). Lava lakes: 1 attempt per chunk (1-in-8 chance, lower Y). Carve an irregular blob, fill with liquid, validate no air below liquid.
+- **Impact**: Visual + gameplay — lakes are common landscape features in Alpha
+
+#### 3. Sugar Cane (Reed)
+- **Source**: `BiomeDecorator.java` — `reedPerChunk` (default 0, Swampland/Rainforest raise it)
+- **Scope**: Place 1-3 tall reed columns adjacent to water on sand/dirt/grass
+- **Impact**: Low — cosmetic vegetation
+
+#### 4. Flowers (Dandelion, Rose)
+- **Source**: `BiomeDecorator.java` — `flowersPerChunk` (default 2)
+- **Scope**: Place yellow flower (ID 37) or red flower (ID 38) on grass surface blocks
+- **Impact**: Low — cosmetic vegetation
+
+#### 5. Brown/Red Mushrooms
+- **Source**: `BiomeDecorator.java` — `mushroomsPerChunk` (default 0, +1-in-4 random chance)
+- **Scope**: Place mushroom blocks (IDs 39/40) on solid surfaces with low light level
+- **Impact**: Low — cosmetic, mostly underground
+
+#### 6. Cacti
+- **Source**: `BiomeDecorator.java` — `cactiPerChunk` (Desert=10, otherwise 0)
+- **Scope**: Place 1-3 tall cactus columns (ID 81) on sand, requires no adjacent solid blocks
+- **Depends on**: Cactus block definition in registry
+- **Impact**: Low — Desert biome character
+
+#### 7. Pumpkins
+- **Source**: `BiomeDecorator.java` — rare (1-in-32 chance per chunk)
+- **Scope**: Place pumpkin block (ID 86) on grass with random facing metadata
+- **Depends on**: Pumpkin block definition in registry
+- **Impact**: Very low — extremely rare decoration
+
+#### 8. Clay Discs
+- **Source**: `BiomeDecorator.java` — `clayPerChunk` (default 1)
+- **Scope**: Place disc-shaped clay deposits (ID 82) underwater in sand/dirt
+- **Depends on**: Clay block definition in registry
+- **Impact**: Low — subtle underwater feature
+
+### Implementation Strategy
+
+All decoration features share the same pattern:
+1. Run during `populate_chunk` after caves/ores/dungeons
+2. Use per-chunk `JavaRandom` (seeded from chunk coordinates) for determinism
+3. Iterate N attempts, pick random XZ within chunk, find surface Y, validate placement rules, place blocks
+
+The existing `populate_underground_features` method should be extended to call a new `populate_decorations` pass. Each feature can be a standalone function following the ore/dungeon placement pattern already established.
+
+### Block Registry Additions Needed
+- Snow Cover (ID 78)
+- Yellow Flower (ID 37), Red Flower (ID 38)
+- Brown Mushroom (ID 39), Red Mushroom (ID 40)
+- Cactus (ID 81)
+- Pumpkin (ID 86)
+- Clay (ID 82)
+- Sugar Cane / Reed (ID 83)

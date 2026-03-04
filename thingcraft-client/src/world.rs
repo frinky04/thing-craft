@@ -3,9 +3,10 @@ use std::f64::consts::PI;
 use std::fmt;
 use std::path::Path;
 
-use noise::{Fbm, MultiFractal, NoiseFn, OpenSimplex};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+
+use crate::noise::{JavaRandom, PerlinNoise, PerlinSimplexNoise};
 
 pub const CHUNK_WIDTH: usize = 16;
 pub const CHUNK_DEPTH: usize = 16;
@@ -662,7 +663,6 @@ pub enum BiomeKind {
     Taiga,
     Desert,
     Plains,
-    IceDesert,
     Tundra,
 }
 
@@ -680,10 +680,7 @@ impl BiomeKind {
             if temperature < 0.95 {
                 return Self::Savanna;
             }
-            if temperature < 0.98 {
-                return Self::Desert;
-            }
-            return Self::IceDesert;
+            return Self::Desert;
         }
         if adjusted_downfall > 0.5 && temperature < 0.7 {
             return Self::Swampland;
@@ -709,7 +706,7 @@ impl BiomeKind {
     #[must_use]
     fn surface_subsurface_blocks(self) -> (u8, u8) {
         match self {
-            Self::Desert | Self::IceDesert => (SAND_ID, SAND_ID),
+            Self::Desert => (SAND_ID, SAND_ID),
             _ => (GRASS_ID, DIRT_ID),
         }
     }
@@ -718,31 +715,27 @@ impl BiomeKind {
 #[derive(Debug, Clone, Copy)]
 pub struct BiomeSample {
     pub temperature: f64,
-    pub downfall: f64,
     pub biome: BiomeKind,
 }
 
 #[derive(Debug, Clone)]
 pub struct BiomeSource {
-    temperature_noise: Fbm<OpenSimplex>,
-    downfall_noise: Fbm<OpenSimplex>,
-    biome_noise: Fbm<OpenSimplex>,
+    temperature_noise: PerlinSimplexNoise,
+    downfall_noise: PerlinSimplexNoise,
+    biome_noise: PerlinSimplexNoise,
 }
 
 impl BiomeSource {
     #[must_use]
     pub fn new(seed: u64) -> Self {
-        let mut temperature_noise =
-            Fbm::<OpenSimplex>::new((seed.wrapping_mul(9_871) & 0xFFFF_FFFF) as u32);
-        temperature_noise = temperature_noise.set_octaves(4).set_frequency(0.025);
+        let mut temp_rng = JavaRandom::new(seed as i64 * 9871);
+        let temperature_noise = PerlinSimplexNoise::new(&mut temp_rng, 4);
 
-        let mut downfall_noise =
-            Fbm::<OpenSimplex>::new((seed.wrapping_mul(39_811) & 0xFFFF_FFFF) as u32);
-        downfall_noise = downfall_noise.set_octaves(4).set_frequency(0.05);
+        let mut down_rng = JavaRandom::new(seed as i64 * 39811);
+        let downfall_noise = PerlinSimplexNoise::new(&mut down_rng, 4);
 
-        let mut biome_noise =
-            Fbm::<OpenSimplex>::new((seed.wrapping_mul(543_321) & 0xFFFF_FFFF) as u32);
-        biome_noise = biome_noise.set_octaves(2).set_frequency(0.25);
+        let mut biome_rng = JavaRandom::new(seed as i64 * 543321);
+        let biome_noise = PerlinSimplexNoise::new(&mut biome_rng, 2);
 
         Self {
             temperature_noise,
@@ -751,42 +744,112 @@ impl BiomeSource {
         }
     }
 
+    /// Sample raw temperature and biome noise, returning post-processed values.
+    /// Shared by `get_biomes` (which also needs downfall) and temperature-only paths.
+    fn sample_climate_raw(
+        &self,
+        x: i32,
+        z: i32,
+        size_x: usize,
+        size_z: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let count = size_x * size_z;
+        let mut raw_temp = vec![0.0_f64; count];
+        let mut raw_biome = vec![0.0_f64; count];
+
+        self.temperature_noise.get_region(
+            &mut raw_temp,
+            x as f64,
+            z as f64,
+            size_x,
+            size_z,
+            0.025,
+            0.025,
+            0.25,
+        );
+        self.biome_noise.get_region(
+            &mut raw_biome,
+            x as f64,
+            z as f64,
+            size_x,
+            size_z,
+            0.25,
+            0.25,
+            0.5882352941176471,
+        );
+
+        (raw_temp, raw_biome)
+    }
+
+    /// Post-process a raw temperature sample with the biome blend factor.
+    fn post_process_temperature(raw_temp: f64, raw_biome: f64) -> f64 {
+        let d = raw_biome * 1.1 + 0.5;
+        let mut temp = (raw_temp * 0.15 + 0.7) * 0.99 + d * 0.01;
+        temp = 1.0 - (1.0 - temp) * (1.0 - temp);
+        temp.clamp(0.0, 1.0)
+    }
+
+    /// Bulk biome sampling — port of getBiomes (Java lines 81-116).
+    pub fn get_biomes(
+        &self,
+        x: i32,
+        z: i32,
+        size_x: usize,
+        size_z: usize,
+    ) -> (Vec<BiomeKind>, Vec<f64>, Vec<f64>) {
+        let count = size_x * size_z;
+        let (raw_temp, raw_biome) = self.sample_climate_raw(x, z, size_x, size_z);
+
+        let mut raw_down = vec![0.0_f64; count];
+        self.downfall_noise.get_region(
+            &mut raw_down,
+            x as f64,
+            z as f64,
+            size_x,
+            size_z,
+            0.05,
+            0.05,
+            1.0 / 3.0,
+        );
+
+        let mut temperatures = vec![0.0_f64; count];
+        let mut downfalls = vec![0.0_f64; count];
+        let mut biomes = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let d = raw_biome[i] * 1.1 + 0.5;
+            let temp = Self::post_process_temperature(raw_temp[i], raw_biome[i]);
+            let down = ((raw_down[i] * 0.15 + 0.5) * 0.998 + d * 0.002).clamp(0.0, 1.0);
+            temperatures[i] = temp;
+            downfalls[i] = down;
+            biomes.push(BiomeKind::from_climate(temp, down));
+        }
+
+        (biomes, temperatures, downfalls)
+    }
+
+    /// Convenience single-position sampling (for tree placement etc.).
     #[must_use]
     pub fn sample(&self, x: i32, z: i32) -> BiomeSample {
-        let x_f64 = f64::from(x);
-        let z_f64 = f64::from(z);
-
-        let raw_temperature = normalize_noise(self.temperature_noise.get([x_f64, z_f64]));
-        let raw_downfall = normalize_noise(self.downfall_noise.get([x_f64, z_f64]));
-        let blend_noise = self.biome_noise.get([x_f64, z_f64]) * 1.1 + 0.5;
-
-        let temp_mix_epsilon = 0.01;
-        let down_mix_epsilon = 0.002;
-
-        let mut temperature = (raw_temperature * 0.15 + 0.7) * (1.0 - temp_mix_epsilon)
-            + blend_noise * temp_mix_epsilon;
-        let mut downfall =
-            (raw_downfall * 0.15 + 0.5) * (1.0 - down_mix_epsilon) + blend_noise * down_mix_epsilon;
-
-        temperature = 1.0 - (1.0 - temperature) * (1.0 - temperature);
-        temperature = temperature.clamp(0.0, 1.0);
-        downfall = downfall.clamp(0.0, 1.0);
-
-        let biome = BiomeKind::from_climate(temperature, downfall);
+        let (biomes, temps, _downs) = self.get_biomes(x, z, 1, 1);
         BiomeSample {
-            temperature,
-            downfall,
-            biome,
+            temperature: temps[0],
+            biome: biomes[0],
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct OverworldChunkGenerator {
-    /// Retained for population passes (caves, ores, dungeons) since noise objects are opaque.
     seed: u64,
     biome_source: BiomeSource,
-    terrain_noise: Fbm<OpenSimplex>,
+    min_limit_noise: PerlinNoise,
+    max_limit_noise: PerlinNoise,
+    perlin_noise_1: PerlinNoise,
+    perlin_noise_2: PerlinNoise,
+    perlin_noise_3: PerlinNoise,
+    scale_noise: PerlinNoise,
+    depth_noise: PerlinNoise,
     grass_color_map: GrassColorMap,
     foliage_color_map: FoliageColorMap,
 }
@@ -795,9 +858,20 @@ impl OverworldChunkGenerator {
     #[must_use]
     pub fn new(seed: u64) -> Self {
         let biome_source = BiomeSource::new(seed);
-        let mut terrain_noise =
-            Fbm::<OpenSimplex>::new((seed.wrapping_mul(341_873_128_712) & 0xFFFF_FFFF) as u32);
-        terrain_noise = terrain_noise.set_octaves(8).set_frequency(1.0 / 684.412);
+
+        // All noise generators seeded from one sequential JavaRandom — order matters.
+        let mut rng = JavaRandom::new(seed as i64);
+        let min_limit_noise = PerlinNoise::new(&mut rng, 16);
+        let max_limit_noise = PerlinNoise::new(&mut rng, 16);
+        let perlin_noise_1 = PerlinNoise::new(&mut rng, 8);
+        let perlin_noise_2 = PerlinNoise::new(&mut rng, 4);
+        let perlin_noise_3 = PerlinNoise::new(&mut rng, 4);
+        let scale_noise = PerlinNoise::new(&mut rng, 10);
+        let depth_noise = PerlinNoise::new(&mut rng, 16);
+        // forest_noise consumes 8 octaves of RNG state for seeding order parity,
+        // but isn't used until decoration features are implemented.
+        let _forest_noise = PerlinNoise::new(&mut rng, 8);
+
         let grass_color_map = GrassColorMap::load(
             &["resources/minecraft-a1.2.6-client/misc/grasscolor.png"],
             [126, 201, 86],
@@ -810,7 +884,13 @@ impl OverworldChunkGenerator {
         Self {
             seed,
             biome_source,
-            terrain_noise,
+            min_limit_noise,
+            max_limit_noise,
+            perlin_noise_1,
+            perlin_noise_2,
+            perlin_noise_3,
+            scale_noise,
+            depth_noise,
             grass_color_map,
             foliage_color_map,
         }
@@ -840,8 +920,6 @@ impl OverworldChunkGenerator {
         let min_z = center_chunk.z - radius;
         let max_z = center_chunk.z + radius;
 
-        // Populate into an expanded support ring so tree placement can read/write
-        // across chunk borders like vanilla does.
         let support_min = ChunkPos {
             x: min_x - 1,
             z: min_z - 1,
@@ -855,8 +933,6 @@ impl OverworldChunkGenerator {
         let mut chunks =
             self.generate_base_region(support_min, support_max, target_min, target_max, registry);
 
-        // For each target chunk [x,z], vanilla-style tree roots come from source
-        // chunks [x-1..x] and [z-1..z].
         let source_min = ChunkPos {
             x: min_x - 1,
             z: min_z - 1,
@@ -919,67 +995,412 @@ impl OverworldChunkGenerator {
         chunks
     }
 
+    /// Generate a single chunk: 3D density → stone/water/air, then surface pass.
     fn generate_terrain_chunk(&self, chunk_pos: ChunkPos) -> ChunkData {
         let mut chunk = ChunkData::new(chunk_pos, AIR_ID);
+        let cx = chunk_pos.x;
+        let cz = chunk_pos.z;
 
-        for local_x in 0..CHUNK_WIDTH as u8 {
-            for local_z in 0..CHUNK_DEPTH as u8 {
-                let world_x = chunk_pos.x * CHUNK_WIDTH as i32 + i32::from(local_x);
-                let world_z = chunk_pos.z * CHUNK_DEPTH as i32 + i32::from(local_z);
-                let biome_sample = self.biome_source.sample(world_x, world_z);
-                let (surface_block, subsurface_block) =
-                    biome_sample.biome.surface_subsurface_blocks();
-                let grass_tint = self
-                    .grass_color_map
-                    .sample(biome_sample.temperature, biome_sample.downfall);
-                chunk.set_grass_tint(local_x, local_z, grass_tint);
-                let foliage_tint = self
-                    .foliage_color_map
-                    .sample(biome_sample.temperature, biome_sample.downfall);
-                chunk.set_foliage_tint(local_x, local_z, foliage_tint);
+        // Get biome data for this chunk region (computed once, reused everywhere)
+        let (biomes, temperatures, downfalls) =
+            self.biome_source.get_biomes(cx * 16, cz * 16, 16, 16);
 
-                let terrain_base = self
-                    .terrain_noise
-                    .get([f64::from(world_x), f64::from(world_z)]);
-                let mut surface_y =
-                    (64.0 + terrain_base * 18.0 + (biome_sample.temperature - 0.5) * 8.0
-                        - (biome_sample.downfall - 0.5) * 4.0)
-                        .round() as i32;
-                surface_y = surface_y.clamp(1, CHUNK_HEIGHT as i32 - 1);
+        // Phase 1: 3D density field → stone/water/air
+        self.build_terrain(&mut chunk, &temperatures, &downfalls);
 
-                for y in 0..=surface_y {
-                    let y_u8 = y as u8;
-                    let block_id = if y == 0 {
-                        BEDROCK_ID
-                    } else if y == surface_y {
-                        surface_block
-                    } else if y >= surface_y - 3 {
-                        subsurface_block
-                    } else {
-                        STONE_ID
-                    };
-                    chunk.set_block(local_x, y_u8, local_z, block_id);
-                }
+        // Phase 2: Surface building pass (top-down)
+        let mut chunk_rng = JavaRandom::new(
+            (cx as i64).wrapping_mul(341873128712_i64)
+                .wrapping_add((cz as i64).wrapping_mul(132897987541_i64)),
+        );
+        self.build_surfaces(&mut chunk, &biomes, &mut chunk_rng);
 
-                let water_level = 64;
-                if surface_y < water_level {
-                    for y in (surface_y + 1)..=water_level {
-                        if y >= CHUNK_HEIGHT as i32 {
-                            break;
-                        }
-                        let y_u8 = y as u8;
-                        let fill = if y == water_level && biome_sample.temperature < 0.5 {
-                            ICE_ID
-                        } else {
-                            WATER_ID
-                        };
-                        chunk.set_block(local_x, y_u8, local_z, fill);
-                    }
-                }
+        // Set grass/foliage tints per column
+        for local_z in 0..CHUNK_DEPTH as u8 {
+            for local_x in 0..CHUNK_WIDTH as u8 {
+                let col_idx = local_z as usize * CHUNK_WIDTH + local_x as usize;
+                let temp = temperatures[col_idx];
+                let down = downfalls[col_idx];
+                chunk.set_grass_tint(local_x, local_z, self.grass_color_map.sample(temp, down));
+                chunk.set_foliage_tint(
+                    local_x,
+                    local_z,
+                    self.foliage_color_map.sample(temp, down),
+                );
             }
         }
 
         chunk
+    }
+
+    /// Port of generateHeightMap (Java lines 206-281).
+    /// Samples a 5x17x5 density grid for a chunk.
+    fn generate_height_map(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        temperatures: &[f64],
+        downfalls: &[f64],
+    ) -> Vec<f64> {
+        let size_x = 5;
+        let size_y = 17;
+        let size_z = 5;
+        let count = size_x * size_y * size_z;
+
+        let x = (chunk_x * 4) as f64;
+        let z = (chunk_z * 4) as f64;
+
+        // Sample 2D noise buffers (5x5 = 25 values)
+        let mut scale_buf = vec![0.0_f64; 25];
+        let mut depth_buf = vec![0.0_f64; 25];
+        self.scale_noise
+            .get_region_2d(&mut scale_buf, x, z, 5, 5, 1.121, 1.121);
+        self.depth_noise
+            .get_region_2d(&mut depth_buf, x, z, 5, 5, 200.0, 200.0);
+
+        // Sample 3D noise buffers (5x17x5 = 425 values)
+        let mut perlin1_buf = vec![0.0_f64; count];
+        let mut min_buf = vec![0.0_f64; count];
+        let mut max_buf = vec![0.0_f64; count];
+        self.perlin_noise_1.get_region_3d(
+            &mut perlin1_buf,
+            x,
+            0.0,
+            z,
+            5,
+            17,
+            5,
+            684.412 / 80.0,
+            684.412 / 160.0,
+            684.412 / 80.0,
+        );
+        self.min_limit_noise.get_region_3d(
+            &mut min_buf,
+            x,
+            0.0,
+            z,
+            5,
+            17,
+            5,
+            684.412,
+            684.412,
+            684.412,
+        );
+        self.max_limit_noise.get_region_3d(
+            &mut max_buf,
+            x,
+            0.0,
+            z,
+            5,
+            17,
+            5,
+            684.412,
+            684.412,
+            684.412,
+        );
+
+        let mut density = vec![0.0_f64; count];
+        let mut idx_3d = 0;
+        let mut idx_2d = 0;
+
+        for l in 0..size_x {
+            for n in 0..size_z {
+                // Map to temperature/downfall at column center
+                // k = CHUNK_WIDTH / size_x = 16/5 = 3 (integer division)
+                let m_x = (l * 3 + 1) as usize; // column center X in chunk-local coords
+                let m_z = (n * 3 + 1) as usize; // column center Z in chunk-local coords
+                let temp_idx = m_z * 16 + m_x;
+                let temp = temperatures[temp_idx.min(temperatures.len() - 1)];
+                let down = downfalls[temp_idx.min(downfalls.len() - 1)];
+
+                // Scale calculation
+                let raw_scale = (scale_buf[idx_2d] + 256.0) / 512.0;
+                let climate_factor = 1.0 - (down * temp).powi(4);
+                let mut scale = climate_factor * raw_scale;
+                scale = scale.clamp(0.0, 1.0);
+                scale += 0.5;
+
+                // Depth calculation
+                let mut depth = depth_buf[idx_2d] / 8000.0;
+                if depth < 0.0 {
+                    depth *= -0.3;
+                }
+                depth = depth * 3.0 - 2.0;
+                if depth < 0.0 {
+                    depth /= 2.0;
+                    if depth < -1.0 {
+                        depth = -1.0;
+                    }
+                    depth /= 1.4;
+                    depth /= 2.0;
+                } else {
+                    if depth > 1.0 {
+                        depth = 1.0;
+                    }
+                    depth /= 8.0;
+                }
+
+                idx_2d += 1;
+
+                for s in 0..size_y {
+                    // Falloff calculation
+                    let center = size_y as f64 / 2.0 + depth * 4.0;
+                    let mut falloff = (s as f64 - center) * 12.0 / scale;
+                    if falloff < 0.0 {
+                        falloff *= 4.0;
+                    }
+
+                    // Interpolate between min and max limit noise
+                    let min_val = min_buf[idx_3d] / 512.0;
+                    let max_val = max_buf[idx_3d] / 512.0;
+                    let interp_t = ((perlin1_buf[idx_3d] / 10.0 + 1.0) / 2.0).clamp(0.0, 1.0);
+                    let mut val = min_val + (max_val - min_val) * interp_t;
+                    val -= falloff;
+
+                    // Top 4 layers blend toward -10.0
+                    if s > size_y - 4 {
+                        let blend = ((s as f64 - (size_y as f64 - 4.0)) / 3.0).clamp(0.0, 1.0);
+                        val = val * (1.0 - blend) + -10.0 * blend;
+                    }
+
+                    density[idx_3d] = val;
+                    idx_3d += 1;
+                }
+            }
+        }
+
+        density
+    }
+
+    /// Port of buildTerrain (Java lines 70-125).
+    /// Trilinear interpolation from 5x17x5 density to 16x128x16 blocks.
+    fn build_terrain(
+        &self,
+        chunk: &mut ChunkData,
+        temperatures: &[f64],
+        downfalls: &[f64],
+    ) {
+        let cx = chunk.pos.x;
+        let cz = chunk.pos.z;
+
+        let density = self.generate_height_map(cx, cz, temperatures, downfalls);
+
+        // Trilinear interpolation: 4x4 horizontal cells, 16 vertical subcells
+        // density grid is indexed [x][z][y] with x=5, z=5, y=17
+        for cell_x in 0..4_usize {
+            for cell_z in 0..4_usize {
+                for cell_y in 0..16_usize {
+                    // Get 8 corner density values
+                    let d000 = density[(cell_x * 5 + cell_z) * 17 + cell_y]; // (x, z, y)
+                    let d001 = density[(cell_x * 5 + cell_z) * 17 + cell_y + 1];
+                    let d010 = density[(cell_x * 5 + (cell_z + 1)) * 17 + cell_y];
+                    let d011 = density[(cell_x * 5 + (cell_z + 1)) * 17 + cell_y + 1];
+                    let d100 = density[((cell_x + 1) * 5 + cell_z) * 17 + cell_y];
+                    let d101 = density[((cell_x + 1) * 5 + cell_z) * 17 + cell_y + 1];
+                    let d110 = density[((cell_x + 1) * 5 + (cell_z + 1)) * 17 + cell_y];
+                    let d111 = density[((cell_x + 1) * 5 + (cell_z + 1)) * 17 + cell_y + 1];
+
+                    // Y interpolation step (8 blocks per cell_y)
+                    let y_step_00 = (d001 - d000) / 8.0;
+                    let y_step_10 = (d101 - d100) / 8.0;
+                    let y_step_01 = (d011 - d010) / 8.0;
+                    let y_step_11 = (d111 - d110) / 8.0;
+
+                    let mut d_y0_x0z0 = d000;
+                    let mut d_y0_x1z0 = d100;
+                    let mut d_y0_x0z1 = d010;
+                    let mut d_y0_x1z1 = d110;
+
+                    for sub_y in 0..8_usize {
+                        let y = cell_y * 8 + sub_y;
+                        if y >= CHUNK_HEIGHT {
+                            break;
+                        }
+
+                        // X interpolation step (4 blocks per cell_x)
+                        let x_step_z0 = (d_y0_x1z0 - d_y0_x0z0) / 4.0;
+                        let x_step_z1 = (d_y0_x1z1 - d_y0_x0z1) / 4.0;
+
+                        let mut d_xz0 = d_y0_x0z0;
+                        let mut d_xz1 = d_y0_x0z1;
+
+                        for sub_x in 0..4_usize {
+                            let local_x = cell_x * 4 + sub_x;
+
+                            // Z interpolation step (4 blocks per cell_z)
+                            let z_step = (d_xz1 - d_xz0) / 4.0;
+                            let mut d = d_xz0;
+
+                            for sub_z in 0..4_usize {
+                                let local_z = cell_z * 4 + sub_z;
+
+                                let block = if d > 0.0 {
+                                    STONE_ID
+                                } else if y < 64 {
+                                    // Check temperature for ICE at sea level surface
+                                    let temp_idx = local_z * 16 + local_x;
+                                    let temp = temperatures
+                                        .get(temp_idx)
+                                        .copied()
+                                        .unwrap_or(0.5);
+                                    if y == 63 && temp < 0.5 {
+                                        ICE_ID
+                                    } else {
+                                        WATER_ID
+                                    }
+                                } else {
+                                    AIR_ID
+                                };
+                                chunk.set_block(
+                                    local_x as u8,
+                                    y as u8,
+                                    local_z as u8,
+                                    block,
+                                );
+
+                                d += z_step;
+                            }
+                            d_xz0 += x_step_z0;
+                            d_xz1 += x_step_z1;
+                        }
+
+                        d_y0_x0z0 += y_step_00;
+                        d_y0_x1z0 += y_step_10;
+                        d_y0_x0z1 += y_step_01;
+                        d_y0_x1z1 += y_step_11;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Port of buildSurfaces (Java lines 127-191).
+    /// Top-down surface building pass: bedrock, sand/gravel/grass/dirt layers.
+    fn build_surfaces(
+        &self,
+        chunk: &mut ChunkData,
+        biomes: &[BiomeKind],
+        rng: &mut JavaRandom,
+    ) {
+        let cx = chunk.pos.x;
+        let cz = chunk.pos.z;
+
+        let mut sand_buf = vec![0.0_f64; 256];
+        let mut gravel_buf = vec![0.0_f64; 256];
+        let mut depth_buf = vec![0.0_f64; 256];
+
+        self.perlin_noise_2.get_region_3d(
+            &mut sand_buf,
+            (cx * 16) as f64,
+            (cz * 16) as f64,
+            0.0,
+            16,
+            16,
+            1,
+            0.03125,
+            0.03125,
+            1.0,
+        );
+        // Note: X/Z swap for gravel, matching Alpha
+        self.perlin_noise_2.get_region_3d(
+            &mut gravel_buf,
+            (cz * 16) as f64,
+            109.0134,
+            (cx * 16) as f64,
+            16,
+            1,
+            16,
+            0.03125,
+            1.0,
+            0.03125,
+        );
+        self.perlin_noise_3.get_region_3d(
+            &mut depth_buf,
+            (cx * 16) as f64,
+            (cz * 16) as f64,
+            0.0,
+            16,
+            16,
+            1,
+            0.0625,
+            0.0625,
+            0.0625,
+        );
+
+        for local_x in 0..16_usize {
+            for local_z in 0..16_usize {
+                let biome = biomes[local_z * 16 + local_x];
+                let (mut surface_block, mut subsurface_block) =
+                    biome.surface_subsurface_blocks();
+
+                let noise_idx = local_x * 16 + local_z;
+                let is_sand = sand_buf[noise_idx] + rng.next_double() * 0.2 > 0.0;
+                let is_gravel = gravel_buf[noise_idx] + rng.next_double() * 0.2 > 3.0;
+                let stone_depth =
+                    (depth_buf[noise_idx] / 3.0 + 3.0 + rng.next_double() * 0.25) as i32;
+
+                let mut counter: i32 = -1;
+
+                for y in (0..128_i32).rev() {
+                    // Bedrock
+                    if y <= rng.next_int(5) {
+                        chunk.set_block(local_x as u8, y as u8, local_z as u8, BEDROCK_ID);
+                        continue;
+                    }
+
+                    let block = chunk.block(local_x as u8, y as u8, local_z as u8);
+
+                    if block == AIR_ID {
+                        counter = -1;
+                        continue;
+                    }
+
+                    if block != STONE_ID {
+                        continue;
+                    }
+
+                    if counter == -1 {
+                        if stone_depth <= 0 {
+                            surface_block = AIR_ID;
+                            subsurface_block = STONE_ID;
+                        } else if y >= 60 && y <= 65 {
+                            // Near sea level: apply sand/gravel overrides
+                            let (sb, ssb) = biome.surface_subsurface_blocks();
+                            surface_block = sb;
+                            subsurface_block = ssb;
+                            if is_gravel {
+                                surface_block = AIR_ID;
+                                subsurface_block = GRAVEL_ID;
+                            }
+                            if is_sand {
+                                surface_block = SAND_ID;
+                                subsurface_block = SAND_ID;
+                            }
+                        }
+
+                        if y < 64 && surface_block == AIR_ID {
+                            surface_block = WATER_ID;
+                        }
+
+                        counter = stone_depth;
+                        chunk.set_block(
+                            local_x as u8,
+                            y as u8,
+                            local_z as u8,
+                            surface_block,
+                        );
+                    } else if counter > 0 {
+                        counter -= 1;
+                        chunk.set_block(
+                            local_x as u8,
+                            y as u8,
+                            local_z as u8,
+                            subsurface_block,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn populate_underground_features(&self, chunk: &mut ChunkData) {
@@ -1589,7 +2010,7 @@ fn trees_per_chunk(biome: BiomeKind) -> i32 {
         BiomeKind::SeasonalForest | BiomeKind::Swampland => 4,
         BiomeKind::Shrubland | BiomeKind::Savanna => 1,
         BiomeKind::Plains => 0,
-        BiomeKind::Desert | BiomeKind::IceDesert | BiomeKind::Tundra => -1,
+        BiomeKind::Desert | BiomeKind::Tundra => -1,
     }
 }
 
@@ -2004,10 +2425,6 @@ fn pine_canopy_radius(layer_from_bottom: i32, total_layers: i32) -> i32 {
         3 => 1,
         _ => 2, // bottom layers are wide
     }
-}
-
-fn normalize_noise(value: f64) -> f64 {
-    ((value + 1.0) * 0.5).clamp(0.0, 1.0)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -2430,7 +2847,7 @@ mod tests {
     fn biome_mapping_matches_alpha_thresholds() {
         assert_eq!(BiomeKind::from_climate(0.05, 0.5), BiomeKind::Tundra);
         assert_eq!(BiomeKind::from_climate(0.96, 0.05), BiomeKind::Desert);
-        assert_eq!(BiomeKind::from_climate(0.99, 0.05), BiomeKind::IceDesert);
+        assert_eq!(BiomeKind::from_climate(0.99, 0.05), BiomeKind::Desert);
         assert_eq!(BiomeKind::from_climate(0.65, 0.95), BiomeKind::Swampland);
         assert_eq!(BiomeKind::from_climate(0.85, 0.6), BiomeKind::Forest);
     }

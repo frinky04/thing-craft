@@ -28,7 +28,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - Chunk storage follows Alpha dimensions (`16x16x128`) and Alpha index layout:
   - `(x << 11) | (z << 7) | y`
 - Block and sky light channels use nibble storage (`4-bit` packed values).
-- A deterministic Overworld generator uses biome climate sampling + terrain noise to create startup chunks.
+- A deterministic Overworld generator uses Alpha-exact 3D density noise (7 `PerlinNoise` generators, 5x17x5 trilinear interpolation, climate-modulated shaping) plus a top-down surface builder (`buildSurfaces` port) to create startup chunks. Biome classification uses `PerlinSimplexNoise` with bulk region queries.
 - A CPU chunk mesher generates indexed triangle geometry with face-culling and atlas UVs (including face-aware texture selection from the block registry).
 - Vertex color modulation is used as the tint path; grass top tint is generated per column from biome temperature/downfall and sampled through Alpha `misc/grasscolor.png` (with a fallback map when unavailable).
 - The chunk mesher now samples neighbor-facing raw light (`max(sky, block)`), maps it through Alpha's brightness curve, and applies Alpha face scales (`top=1.0`, `bottom=0.5`, `north/south=0.8`, `west/east=0.6`) before writing vertex color modulation.

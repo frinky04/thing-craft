@@ -11,6 +11,10 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Alpha-derived block registry skeleton added (with explicit Alpha-excluded block IDs).
 - [x] Chunk core storage model added (`16x16x128`, nibble light channels, Alpha index layout).
 - [x] Deterministic biome climate sampler and overworld startup chunk generator scaffold added.
+- [x] Alpha-exact noise primitives added (`noise.rs`): `JavaRandom` (full Java LCG with `next_double`), `ImprovedNoise` (Perlin improved noise with bulk 2D/3D accumulation), `PerlinNoise` (octave stacking), `SimplexNoise` (2D simplex), and `PerlinSimplexNoise` (octave-stacked simplex). All seeded via sequential `JavaRandom` to match Alpha's exact noise generator construction order.
+- [x] 3D density terrain generation added: `OverworldChunkGenerator` now uses 7 `PerlinNoise` generators (minLimit/maxLimit 16-oct, perlin1 8-oct, perlin2/3 4-oct, scale 10-oct, depth 16-oct) with `generate_height_map` (5x17x5 density grid, climate-modulated scale/depth) and `build_terrain` (trilinear interpolation to 16x128x16 blocks).
+- [x] Top-down surface builder added: `build_surfaces` port of Alpha's `buildSurfaces` with sand/gravel noise, biome surface/subsurface blocks, irregular bedrock (y 0-4), and per-chunk `JavaRandom` reseeding.
+- [x] `BiomeSource` rewritten with `PerlinSimplexNoise`: temperature/downfall/biome noise with Alpha-exact scales, exponents, and post-processing transforms. Bulk `get_biomes` region sampling replaces per-block point queries for terrain generation.
 - [x] CPU chunk meshing scaffold added (face culling + atlas UV generation).
 - [x] `wgpu` scene pipeline now draws generated chunk geometry with camera uniforms.
 - [x] Alpha `terrain.png` texture atlas is loaded and sampled by the chunk render pipeline.
