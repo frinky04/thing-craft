@@ -195,12 +195,28 @@ impl ImprovedNoise {
     ) {
         if size_y == 1 {
             self.add_2d(
-                values, x_origin, z_origin, size_x, size_z, scale_x, scale_z, noise_scale,
+                values,
+                x_origin,
+                z_origin,
+                size_x,
+                size_z,
+                scale_x,
+                scale_z,
+                noise_scale,
             );
         } else {
             self.add_3d(
-                values, x_origin, y_origin, z_origin, size_x, size_y, size_z, scale_x, scale_y,
-                scale_z, noise_scale,
+                values,
+                x_origin,
+                y_origin,
+                z_origin,
+                size_x,
+                size_y,
+                size_z,
+                scale_x,
+                scale_y,
+                scale_z,
+                noise_scale,
             );
         }
     }

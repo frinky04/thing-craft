@@ -56,6 +56,12 @@ pub struct PhysicsBody {
     pub on_ground: bool,
     pub fall_distance: f64,
     pub step_height: f64,
+    pub in_water: bool,
+    pub in_lava: bool,
+    pub sneaking: bool,
+    pub render_eye_height_sneak_offset: f64,
+    pub prev_eye_height_sneak_offset: f64,
+    pub eye_height_sneak_offset: f64,
 }
 
 impl Default for PhysicsBody {
@@ -68,6 +74,12 @@ impl Default for PhysicsBody {
             on_ground: false,
             fall_distance: 0.0,
             step_height: 0.5,
+            in_water: false,
+            in_lava: false,
+            sneaking: false,
+            render_eye_height_sneak_offset: 0.0,
+            prev_eye_height_sneak_offset: 0.0,
+            eye_height_sneak_offset: 0.0,
         }
     }
 }
@@ -82,6 +94,7 @@ pub struct PlayerVitals {
     pub prev_damage_taken: i32,
     pub damaged_time: i32,
     pub damaged_timer: i32,
+    pub damaged_swing_dir: f32,
     pub breath: i32,
     pub breath_capacity: i32,
     pub on_fire_timer: i32,
@@ -100,6 +113,7 @@ impl Default for PlayerVitals {
             prev_damage_taken: 0,
             damaged_time: 0,
             damaged_timer: 0,
+            damaged_swing_dir: 0.0,
             breath: 300,
             breath_capacity: 300,
             on_fire_timer: 0,
@@ -130,6 +144,7 @@ impl PlayerVitals {
             self.health -= amount;
             self.damaged_time = 10;
             self.damaged_timer = 10;
+            self.damaged_swing_dir = 0.0;
         }
 
         self.health = self.health.max(0);
@@ -154,6 +169,7 @@ pub enum SimCommandEvent {
     LookDelta { yaw: f32, pitch: f32 },
     ToggleFly,
     Jump,
+    SneakIntent { active: bool },
 }
 
 #[derive(Resource, Debug, Default)]
@@ -187,6 +203,7 @@ pub struct PlayerIntentState {
     look_delta: Vec2,
     jump_requested: bool,
     toggle_fly_requested: bool,
+    sneaking: bool,
 }
 
 #[derive(Resource, Debug, Clone, Copy, Default)]
@@ -277,6 +294,28 @@ impl EcsRuntime {
         }
     }
 
+    pub fn clear_input_state(&mut self) {
+        let mut input = self.world.resource_mut::<RawInputState>();
+        input.pressed.clear();
+        input.just_pressed.clear();
+        input.mouse_delta = DVec2::ZERO;
+
+        let mut intent = self.world.resource_mut::<PlayerIntentState>();
+        intent.movement = Vec3::ZERO;
+        intent.look_delta = Vec2::ZERO;
+        intent.jump_requested = false;
+        intent.toggle_fly_requested = false;
+        intent.sneaking = false;
+    }
+
+    pub fn player_is_dead(&mut self) -> bool {
+        let mut query = self.world.query_filtered::<&PlayerVitals, With<Player>>();
+        query
+            .iter(&self.world)
+            .next()
+            .is_some_and(|vitals| vitals.health <= 0)
+    }
+
     pub fn add_mouse_delta(&mut self, dx: f64, dy: f64) {
         let mut input = self.world.resource_mut::<RawInputState>();
         input.mouse_delta += DVec2::new(dx, dy);
@@ -344,6 +383,9 @@ impl EcsRuntime {
         on_ground: bool,
         fall_distance: f64,
         damage_taken: i32,
+        in_water: bool,
+        in_lava: bool,
+        fluid_jump_assist: bool,
     ) {
         let mut query = self.world.query_filtered::<(
             &mut Transform64,
@@ -363,25 +405,49 @@ impl EcsRuntime {
             transform.position = position;
             // Alpha post-move velocity integration for next tick.
             let mut next_velocity = velocity;
-            next_velocity.y -= GRAVITY;
-            next_velocity.y *= AIR_DRAG_Y;
-            let h_friction = if on_ground {
-                GROUND_FRICTION
+            if in_water {
+                next_velocity.x *= 0.8;
+                next_velocity.y *= 0.8;
+                next_velocity.z *= 0.8;
+                next_velocity.y -= 0.02;
+                if fluid_jump_assist {
+                    next_velocity.y = 0.3;
+                }
+            } else if in_lava {
+                next_velocity.x *= 0.5;
+                next_velocity.y *= 0.5;
+                next_velocity.z *= 0.5;
+                next_velocity.y -= 0.02;
+                if fluid_jump_assist {
+                    next_velocity.y = 0.3;
+                }
             } else {
-                AIR_FRICTION_H
-            };
-            next_velocity.x *= h_friction;
-            next_velocity.z *= h_friction;
+                next_velocity.y -= GRAVITY;
+                next_velocity.y *= AIR_DRAG_Y;
+                let h_friction = if on_ground {
+                    GROUND_FRICTION
+                } else {
+                    AIR_FRICTION_H
+                };
+                next_velocity.x *= h_friction;
+                next_velocity.z *= h_friction;
+            }
             physics.velocity = next_velocity;
             physics.on_ground = on_ground;
             physics.fall_distance = fall_distance;
+            physics.in_water = in_water;
+            physics.in_lava = in_lava;
+            // Alpha order: use sneak offset for this tick's `y` write, then decay it.
+            physics.prev_eye_height_sneak_offset = physics.render_eye_height_sneak_offset;
+            physics.render_eye_height_sneak_offset = physics.eye_height_sneak_offset;
+            physics.eye_height_sneak_offset *= 0.4;
 
             // Alpha bob/tilt smoothing from horizontal/vertical motion.
             walk_bob.last_bob = walk_bob.bob;
             walk_bob.last_tilt = walk_bob.tilt;
-            let mut bob_target =
-                (next_velocity.x * next_velocity.x + next_velocity.z * next_velocity.z).sqrt()
-                    as f32;
+            let mut bob_target = (next_velocity.x * next_velocity.x
+                + next_velocity.z * next_velocity.z)
+                .sqrt() as f32;
             let mut tilt_target = (-next_velocity.y * 0.2).atan() as f32 * 15.0;
             if bob_target > 0.1 {
                 bob_target = 0.1;
@@ -438,6 +504,11 @@ fn capture_input_system(
     if raw_input.pressed.contains(&KeyCode::Space) {
         queue.0.push_back(SimCommandEvent::Jump);
     }
+    let sneaking = raw_input.pressed.contains(&KeyCode::ShiftLeft)
+        || raw_input.pressed.contains(&KeyCode::ShiftRight);
+    queue
+        .0
+        .push_back(SimCommandEvent::SneakIntent { active: sneaking });
 
     raw_input.just_pressed.clear();
 }
@@ -460,6 +531,9 @@ fn consume_commands_system(
             }
             SimCommandEvent::Jump => {
                 intent.jump_requested = true;
+            }
+            SimCommandEvent::SneakIntent { active } => {
+                intent.sneaking = active;
             }
         }
     }
@@ -498,16 +572,24 @@ fn apply_player_motion_system(
             vitals.invulnerable_timer -= 1;
         }
 
+        if vitals.health <= 0 {
+            intent.movement = Vec3::ZERO;
+            intent.look_delta = Vec2::ZERO;
+            intent.jump_requested = false;
+            intent.toggle_fly_requested = false;
+            intent.sneaking = false;
+        }
+
         // Handle fly toggle with position adjustment to prevent coordinate-space jump.
         // In fly mode, position = camera (eye). In physics mode, position = feet.
         if intent.toggle_fly_requested {
             camera.fly_mode = !camera.fly_mode;
             if camera.fly_mode {
                 // Switching to fly: position was at feet, move up to eye level.
-                transform.position.y += physics.eye_height;
+                transform.position.y += physics.eye_height - physics.render_eye_height_sneak_offset;
             } else {
                 // Switching to walk: position was at eye, move down to feet.
-                transform.position.y -= physics.eye_height;
+                transform.position.y -= physics.eye_height - physics.render_eye_height_sneak_offset;
                 physics.velocity = DVec3::ZERO;
                 physics.on_ground = false;
             }
@@ -532,6 +614,7 @@ fn apply_player_motion_system(
         let right = flat_forward.cross(DVec3::Y).normalize_or_zero();
 
         if camera.fly_mode {
+            physics.sneaking = false;
             // Fly mode: direct position control (original behavior).
             let mut desired_direction =
                 right * f64::from(intent.movement.x) + flat_forward * f64::from(intent.movement.z);
@@ -544,24 +627,39 @@ fn apply_player_motion_system(
             transform.position += desired_direction * camera.speed * fixed_dt.0;
             physics.velocity = DVec3::ZERO;
         } else {
+            physics.sneaking = intent.sneaking;
+            if physics.sneaking && physics.eye_height_sneak_offset < 0.2 {
+                physics.eye_height_sneak_offset = 0.2;
+            }
             // Physics mode: apply jump + input acceleration and integrate position.
             // Collision resolution and post-move drag/friction are handled after
             // this system in app.rs via `apply_resolved_physics`.
 
             // Jump: apply impulse if on_ground and jump requested.
-            if intent.jump_requested && physics.on_ground {
-                physics.velocity.y = JUMP_VELOCITY;
-                physics.on_ground = false;
+            if intent.jump_requested {
+                if physics.in_water || physics.in_lava {
+                    physics.velocity.y += 0.04;
+                } else if physics.on_ground {
+                    physics.velocity.y = JUMP_VELOCITY;
+                    physics.on_ground = false;
+                }
             }
 
             // Horizontal input acceleration (Alpha formulas).
-            let mut move_dir =
-                right * f64::from(intent.movement.x) + flat_forward * f64::from(intent.movement.z);
-            if move_dir.length_squared() > 0.0 {
+            let mut input_x = f64::from(intent.movement.x);
+            let mut input_z = f64::from(intent.movement.z);
+            if physics.sneaking {
+                input_x *= 0.3;
+                input_z *= 0.3;
+            }
+            let mut move_dir = right * input_x + flat_forward * input_z;
+            // Alpha updateVelocity only normalizes when input magnitude >= 1.0;
+            // this preserves sneak scaling (0.3x) instead of flattening it.
+            if move_dir.length_squared() >= 1.0 {
                 move_dir = move_dir.normalize();
             }
 
-            let acceleration = if physics.on_ground {
+            let acceleration = if physics.on_ground && !physics.in_water && !physics.in_lava {
                 GROUND_ACCELERATION
             } else {
                 AIR_ACCELERATION
@@ -573,7 +671,6 @@ fn apply_player_motion_system(
             // Apply current velocity to position first (Alpha Entity.move path).
             // Collision resolution happens in app.rs after this system.
             transform.position += physics.velocity;
-
         }
     }
 
@@ -597,7 +694,10 @@ fn interpolate_render_transform_system(
 
         // In physics mode, position is at feet. Camera goes at eye height.
         if !fly_camera.fly_mode {
-            pos.y += physics.eye_height;
+            let sneak_offset = physics.prev_eye_height_sneak_offset
+                + (physics.render_eye_height_sneak_offset - physics.prev_eye_height_sneak_offset)
+                    * blend;
+            pos.y += physics.eye_height - sneak_offset;
         }
 
         render_transform.position = pos.as_vec3();

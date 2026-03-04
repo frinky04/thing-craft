@@ -624,13 +624,15 @@ pub fn run() -> Result<()> {
                             snapshot.interpolated.yaw,
                             snapshot.interpolated.pitch,
                         );
+                        let hurt_cam = alpha_hurt_cam_matrix(&snapshot, render_alpha);
                         let view_bob = alpha_view_bob_matrix(&snapshot, render_alpha);
-                        let mut sky_view_bob = view_bob;
-                        sky_view_bob.w_axis = glam::Vec4::W;
+                        let mut sky_camera_fx = hurt_cam * view_bob;
+                        sky_camera_fx.w_axis = glam::Vec4::W;
                         let view =
                             Mat4::look_to_rh(snapshot.interpolated.position, direction, Vec3::Y);
+                        let fov_degrees = alpha_camera_fov_degrees(&snapshot, render_alpha);
                         let projection = Mat4::perspective_rh_gl(
-                            70_f32.to_radians(),
+                            fov_degrees.to_radians(),
                             renderer.viewport_aspect().max(0.001),
                             0.05,
                             render_distance_blocks,
@@ -638,8 +640,8 @@ pub fn run() -> Result<()> {
                         // Rotation-only view for sky/celestial (strips translation → infinite distance).
                         let sky_view = Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Y);
                         renderer.update_camera(
-                            (projection * view_bob * view).to_cols_array_2d(),
-                            (projection * sky_view_bob * sky_view).to_cols_array_2d(),
+                            (projection * hurt_cam * view_bob * view).to_cols_array_2d(),
+                            (projection * sky_camera_fx * sky_view).to_cols_array_2d(),
                             snapshot.interpolated.position.to_array(),
                             render_distance_blocks * 0.25,
                             render_distance_blocks,
@@ -666,6 +668,11 @@ pub fn run() -> Result<()> {
                             |x, y, z| chunk_streamer.block_at_world(x, y, z),
                         );
                         renderer.set_block_outline(outline_hit.map(|h| h.block));
+
+                        if snapshot.vitals.health <= 0 && mouse_captured {
+                            mouse_captured = false;
+                            set_mouse_capture(window, false);
+                        }
 
                         frame_camera = Some(snapshot);
                     } else {
@@ -831,9 +838,17 @@ pub fn run() -> Result<()> {
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let is_pressed = event.state == ElementState::Pressed;
-                        ecs_runtime.handle_key(code, is_pressed);
+                        let player_dead = ecs_runtime.player_is_dead();
+                        let allow_input_passthrough =
+                            !player_dead || matches!(code, KeyCode::Escape | KeyCode::KeyR);
+                        if allow_input_passthrough {
+                            ecs_runtime.handle_key(code, is_pressed);
+                        }
 
                         if is_pressed && !event.repeat {
+                            if player_dead && !matches!(code, KeyCode::KeyR | KeyCode::Escape) {
+                                return;
+                            }
                             if let Some(slot) = hotbar_slot_for_key(code) {
                                 selected_hotbar_slot = slot;
                                 hud_dirty = true;
@@ -894,6 +909,9 @@ pub fn run() -> Result<()> {
                     state: ElementState::Pressed,
                     ..
                 } => {
+                    if ecs_runtime.player_is_dead() {
+                        return;
+                    }
                     if !mouse_captured {
                         mouse_captured = true;
                         set_mouse_capture(window, true);
@@ -910,6 +928,9 @@ pub fn run() -> Result<()> {
                     state: ElementState::Pressed,
                     ..
                 } if mouse_captured => {
+                    if ecs_runtime.player_is_dead() {
+                        return;
+                    }
                     enqueue_block_interaction_request(
                         &mut ecs_runtime,
                         &mut block_interaction_requests,
@@ -924,6 +945,9 @@ pub fn run() -> Result<()> {
                 event: DeviceEvent::MouseMotion { delta },
                 ..
             } if mouse_captured => {
+                if ecs_runtime.player_is_dead() {
+                    return;
+                }
                 ecs_runtime.add_mouse_delta(delta.0, delta.1);
             },
             Event::AboutToWait => {
@@ -975,6 +999,41 @@ fn alpha_view_bob_matrix(snapshot: &crate::ecs::CameraSnapshot, render_alpha: f3
     tilt_rot * pitch * roll * translate
 }
 
+fn alpha_hurt_cam_matrix(snapshot: &crate::ecs::CameraSnapshot, render_alpha: f32) -> Mat4 {
+    let mut matrix = Mat4::IDENTITY;
+    if snapshot.vitals.health <= 0 {
+        let death = snapshot.vitals.death_ticks as f32 + render_alpha;
+        let rot_z = 40.0 - 8000.0 / (death + 200.0);
+        matrix = Mat4::from_rotation_z(rot_z.to_radians()) * matrix;
+    }
+
+    let damaged = snapshot.vitals.damaged_timer as f32 - render_alpha;
+    if damaged < 0.0 || snapshot.vitals.damaged_time <= 0 {
+        return matrix;
+    }
+
+    let phase = (damaged / snapshot.vitals.damaged_time as f32).powi(4) * std::f32::consts::PI;
+    let swing = phase.sin() * 14.0;
+    let yaw = snapshot.vitals.damaged_swing_dir;
+    let hurt = Mat4::from_rotation_y((-yaw).to_radians())
+        * Mat4::from_rotation_z((-swing).to_radians())
+        * Mat4::from_rotation_y(yaw.to_radians());
+    hurt * matrix
+}
+
+fn alpha_camera_fov_degrees(snapshot: &crate::ecs::CameraSnapshot, render_alpha: f32) -> f32 {
+    let mut fov = if snapshot.vitals.submerged_in_water {
+        60.0
+    } else {
+        70.0
+    };
+    if snapshot.vitals.health <= 0 {
+        let death = snapshot.vitals.death_ticks as f32 + render_alpha;
+        fov /= (1.0 - 500.0 / (death + 500.0)) * 2.0 + 1.0;
+    }
+    fov
+}
+
 fn direction_from_angles64(yaw: f64, pitch: f64) -> DVec3 {
     let x = yaw.sin() * pitch.cos();
     let y = pitch.sin();
@@ -1003,7 +1062,7 @@ fn enqueue_block_interaction_request(
     // In physics mode, position is at feet. Raycast from eye height.
     let mut origin = snapshot.authoritative.position;
     if !snapshot.fly_mode {
-        origin.y += snapshot.physics.eye_height;
+        origin.y += snapshot.physics.eye_height - snapshot.physics.render_eye_height_sneak_offset;
     }
 
     queue.push_back(BlockInteractionRequest {
@@ -1528,14 +1587,11 @@ fn tick_player_survival(
     registry: &BlockRegistry,
     sim_ticks: u64,
 ) {
-    let mut query = world.query_filtered::<
-        (
-            &mut crate::ecs::Transform64,
-            &mut crate::ecs::PhysicsBody,
-            &mut crate::ecs::PlayerVitals,
-        ),
-        bevy_ecs::query::With<crate::ecs::Player>,
-    >();
+    let mut query = world.query_filtered::<(
+        &mut crate::ecs::Transform64,
+        &mut crate::ecs::PhysicsBody,
+        &mut crate::ecs::PlayerVitals,
+    ), bevy_ecs::query::With<crate::ecs::Player>>();
     let Some((transform, physics, mut vitals)) = query.iter_mut(world).next() else {
         return;
     };
@@ -1577,7 +1633,8 @@ fn tick_player_survival(
 
     // Approximate Alpha eye-level submersion check.
     let eye_x = transform.position.x.floor() as i32;
-    let eye_y = (transform.position.y + physics.eye_height).floor() as i32;
+    let eye_y = (transform.position.y + physics.eye_height - physics.render_eye_height_sneak_offset)
+        .floor() as i32;
     let eye_z = transform.position.z.floor() as i32;
     let submerged_in_water = chunk_streamer
         .block_at_world(eye_x, eye_y, eye_z)
@@ -1614,15 +1671,15 @@ fn tick_player_survival(
 
 fn try_respawn_player(ecs_runtime: &mut EcsRuntime) -> bool {
     let world = ecs_runtime.world_mut();
-    let mut query = world.query_filtered::<
-        (
-            &mut crate::ecs::Transform64,
-            &mut crate::ecs::PhysicsBody,
-            &mut crate::ecs::PlayerVitals,
-        ),
-        bevy_ecs::query::With<crate::ecs::Player>,
-    >();
-    let Some((mut transform, mut physics, mut vitals)) = query.iter_mut(world).next() else {
+    let mut query = world.query_filtered::<(
+        &mut crate::ecs::Transform64,
+        &mut crate::ecs::PhysicsBody,
+        &mut crate::ecs::FlyCamera,
+        &mut crate::ecs::PlayerVitals,
+    ), bevy_ecs::query::With<crate::ecs::Player>>();
+    let Some((mut transform, mut physics, mut fly_camera, mut vitals)) =
+        query.iter_mut(world).next()
+    else {
         return false;
     };
     if !vitals.dead_ready {
@@ -1635,6 +1692,7 @@ fn try_respawn_player(ecs_runtime: &mut EcsRuntime) -> bool {
     vitals.prev_damage_taken = 0;
     vitals.damaged_time = 0;
     vitals.damaged_timer = 0;
+    vitals.damaged_swing_dir = 0.0;
     vitals.breath = vitals.breath_capacity;
     vitals.on_fire_timer = 0;
     vitals.death_ticks = 0;
@@ -1642,9 +1700,11 @@ fn try_respawn_player(ecs_runtime: &mut EcsRuntime) -> bool {
 
     transform.position = DVec3::new(0.0, 72.0, 0.0);
     transform.prev_position = transform.position;
+    fly_camera.fly_mode = false;
     physics.velocity = DVec3::ZERO;
     physics.on_ground = false;
     physics.fall_distance = 0.0;
+    ecs_runtime.clear_input_state();
     true
 }
 
@@ -1669,6 +1729,21 @@ fn resolve_player_physics(
 
     let half_w = physics.width / 2.0;
     let height = physics.height;
+    let in_water = player_body_touches_material(
+        transform.prev_position,
+        physics.width,
+        physics.height,
+        chunk_streamer,
+        |block_id| registry.is_water(block_id),
+    );
+    let in_lava = !in_water
+        && player_body_touches_material(
+            transform.prev_position,
+            physics.width,
+            physics.height,
+            chunk_streamer,
+            |block_id| registry.is_lava(block_id),
+        );
 
     // The position that apply_player_motion_system already wrote includes velocity.
     // We need to resolve collisions against the world.
@@ -1676,6 +1751,16 @@ fn resolve_player_physics(
     // Reconstruct pre-move position from prev_position (which was saved before velocity applied).
     let start_pos = transform.prev_position;
     let mut delta = target_pos - start_pos;
+    if physics.on_ground && physics.sneaking {
+        delta = clamp_sneak_edge_delta(
+            start_pos,
+            delta,
+            physics.width,
+            physics.height,
+            chunk_streamer,
+            registry,
+        );
+    }
 
     let mut pos = start_pos;
     let original_delta = delta;
@@ -1738,7 +1823,7 @@ fn resolve_player_physics(
     let h_blocked =
         (original_delta.x - delta.x).abs() > 1e-10 || (original_delta.z - delta.z).abs() > 1e-10;
     let was_on_ground = physics.on_ground;
-    if h_blocked && was_on_ground {
+    if h_blocked && was_on_ground && physics.eye_height_sneak_offset < 0.05 {
         let step = physics.step_height;
         // Try movement at +step_height offset.
         let step_pos = DVec3::new(start_pos.x, start_pos.y + step, start_pos.z);
@@ -1793,6 +1878,21 @@ fn resolve_player_physics(
 
     // Update on_ground: blocked downward means on ground.
     let on_ground = original_delta.y < -1e-10 && (original_delta.y - delta.y).abs() > 1e-10;
+    let in_water_at_end = player_body_touches_material(
+        pos,
+        physics.width,
+        physics.height,
+        chunk_streamer,
+        |block_id| registry.is_water(block_id),
+    );
+    let in_lava_at_end = player_body_touches_material(
+        pos,
+        physics.width,
+        physics.height,
+        chunk_streamer,
+        |block_id| registry.is_lava(block_id),
+    );
+    let in_fluid_at_end = in_water_at_end || in_lava_at_end;
 
     // Fall distance tracking.
     let mut fall_distance = physics.fall_distance;
@@ -1801,12 +1901,18 @@ fn resolve_player_physics(
     } else {
         fall_distance = 0.0;
     }
+    if in_fluid_at_end {
+        fall_distance = 0.0;
+    }
     let mut damage_taken = 0;
     if on_ground {
         if fall_distance > 3.0 {
             damage_taken = (fall_distance - 3.0).ceil() as i32;
         }
         fall_distance = 0.0;
+    }
+    if in_fluid_at_end {
+        damage_taken = 0;
     }
 
     // Velocity: zero out any component that was collision-clamped.
@@ -1821,7 +1927,42 @@ fn resolve_player_physics(
         velocity.z = 0.0;
     }
 
-    ecs_runtime.apply_resolved_physics(pos, velocity, on_ground, fall_distance, damage_taken);
+    let colliding_horizontally =
+        (original_delta.x - delta.x).abs() > 1e-10 || (original_delta.z - delta.z).abs() > 1e-10;
+    let fluid_jump_assist = if in_water || in_lava {
+        let drag = if in_water { 0.8 } else { 0.5 };
+        let mut test_velocity = velocity;
+        test_velocity.x *= drag;
+        test_velocity.y *= drag;
+        test_velocity.z *= drag;
+        test_velocity.y -= 0.02;
+        colliding_horizontally
+            && can_move_player(
+                pos,
+                physics.width,
+                physics.height,
+                DVec3::new(
+                    test_velocity.x,
+                    test_velocity.y + 0.6 - (pos.y - start_pos.y),
+                    test_velocity.z,
+                ),
+                chunk_streamer,
+                registry,
+            )
+    } else {
+        false
+    };
+
+    ecs_runtime.apply_resolved_physics(
+        pos,
+        velocity,
+        on_ground,
+        fall_distance,
+        damage_taken,
+        in_water,
+        in_lava,
+        fluid_jump_assist,
+    );
 }
 
 /// Collect AABBs of all solid blocks overlapping the given region into `out`.
@@ -1862,6 +2003,123 @@ pub(crate) fn collect_solid_block_aabbs(
             }
         }
     }
+}
+
+fn player_body_touches_material(
+    position: DVec3,
+    width: f64,
+    height: f64,
+    chunk_streamer: &ChunkStreamer,
+    is_material: impl Fn(u8) -> bool,
+) -> bool {
+    let half_w = width / 2.0;
+    let min_x = (position.x - half_w).floor() as i32;
+    let max_x = (position.x + half_w).floor() as i32;
+    let min_y = position.y.floor() as i32;
+    let max_y = (position.y + height).floor() as i32;
+    let min_z = (position.z - half_w).floor() as i32;
+    let max_z = (position.z + half_w).floor() as i32;
+
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+                continue;
+            }
+            for z in min_z..=max_z {
+                let Some(block_id) = chunk_streamer.block_at_world(x, y, z) else {
+                    continue;
+                };
+                if is_material(block_id) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn clamp_sneak_edge_delta(
+    position: DVec3,
+    mut delta: DVec3,
+    width: f64,
+    height: f64,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+) -> DVec3 {
+    let step = 0.05;
+    while delta.x.abs() > 1e-10
+        && can_move_player(
+            position,
+            width,
+            height,
+            DVec3::new(delta.x, -1.0, 0.0),
+            chunk_streamer,
+            registry,
+        )
+    {
+        if delta.x.abs() < step {
+            delta.x = 0.0;
+        } else if delta.x > 0.0 {
+            delta.x -= step;
+        } else {
+            delta.x += step;
+        }
+    }
+    while delta.z.abs() > 1e-10
+        && can_move_player(
+            position,
+            width,
+            height,
+            DVec3::new(0.0, -1.0, delta.z),
+            chunk_streamer,
+            registry,
+        )
+    {
+        if delta.z.abs() < step {
+            delta.z = 0.0;
+        } else if delta.z > 0.0 {
+            delta.z -= step;
+        } else {
+            delta.z += step;
+        }
+    }
+    delta
+}
+
+fn can_move_player(
+    position: DVec3,
+    width: f64,
+    height: f64,
+    offset: DVec3,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+) -> bool {
+    let half_w = width / 2.0;
+    let moved_pos = position + offset;
+    let mut scratch = Vec::with_capacity(32);
+    collect_solid_block_aabbs(
+        &mut scratch,
+        chunk_streamer,
+        registry,
+        DVec3::new(moved_pos.x - half_w, moved_pos.y, moved_pos.z - half_w),
+        DVec3::new(
+            moved_pos.x + half_w,
+            moved_pos.y + height,
+            moved_pos.z + half_w,
+        ),
+    );
+    for [bx0, by0, bz0, bx1, by1, bz1] in &scratch {
+        if moved_pos.x + half_w > *bx0
+            && moved_pos.x - half_w < *bx1
+            && moved_pos.y + height > *by0
+            && moved_pos.y < *by1
+            && moved_pos.z + half_w > *bz0
+            && moved_pos.z - half_w < *bz1
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Resolve movement along a single axis against block AABBs. Returns clamped delta.

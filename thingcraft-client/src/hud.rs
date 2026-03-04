@@ -314,7 +314,9 @@ fn push_hotbar_item_vertices(
     registry: &BlockRegistry,
     scale: f32,
 ) {
-    if registry.is_solid(block_id) && !registry.is_liquid(block_id) && !registry.is_billboard_plant(block_id)
+    if registry.is_solid(block_id)
+        && !registry.is_liquid(block_id)
+        && !registry.is_billboard_plant(block_id)
     {
         push_alpha_item3d_block(verts, x, y, block_id, registry, scale);
     } else {
@@ -361,12 +363,36 @@ fn push_alpha_item3d_block(
     let transformed = vertices.map(|v| alpha_item3d_transform(v, x, y));
     let face_defs = [
         // block.getSprite(face): 0=bottom, 1=top, 2=north, 3=south, 4=west, 5=east
-        ([0_usize, 1, 5, 4], [0.0, -1.0, 0.0], registry.sprite_index_for_face(block_id, [0, -1, 0])),
-        ([3, 2, 6, 7], [0.0, 1.0, 0.0], registry.sprite_index_for_face(block_id, [0, 1, 0])),
-        ([1, 0, 3, 2], [0.0, 0.0, -1.0], registry.sprite_index_for_face(block_id, [0, 0, -1])),
-        ([4, 5, 6, 7], [0.0, 0.0, 1.0], registry.sprite_index_for_face(block_id, [0, 0, 1])),
-        ([0, 4, 7, 3], [-1.0, 0.0, 0.0], registry.sprite_index_for_face(block_id, [-1, 0, 0])),
-        ([5, 1, 2, 6], [1.0, 0.0, 0.0], registry.sprite_index_for_face(block_id, [1, 0, 0])),
+        (
+            [0_usize, 1, 5, 4],
+            [0.0, -1.0, 0.0],
+            registry.sprite_index_for_face(block_id, [0, -1, 0]),
+        ),
+        (
+            [3, 2, 6, 7],
+            [0.0, 1.0, 0.0],
+            registry.sprite_index_for_face(block_id, [0, 1, 0]),
+        ),
+        (
+            [1, 0, 3, 2],
+            [0.0, 0.0, -1.0],
+            registry.sprite_index_for_face(block_id, [0, 0, -1]),
+        ),
+        (
+            [4, 5, 6, 7],
+            [0.0, 0.0, 1.0],
+            registry.sprite_index_for_face(block_id, [0, 0, 1]),
+        ),
+        (
+            [0, 4, 7, 3],
+            [-1.0, 0.0, 0.0],
+            registry.sprite_index_for_face(block_id, [-1, 0, 0]),
+        ),
+        (
+            [5, 1, 2, 6],
+            [1.0, 0.0, 0.0],
+            registry.sprite_index_for_face(block_id, [1, 0, 0]),
+        ),
     ];
 
     let mut faces: Vec<(f32, [[f32; 2]; 4], [[f32; 2]; 4], [f32; 4])> = Vec::with_capacity(3);
@@ -383,9 +409,11 @@ fn push_alpha_item3d_block(
             [transformed[idx[2]][0], transformed[idx[2]][1]],
             [transformed[idx[3]][0], transformed[idx[3]][1]],
         ];
-        let avg_z =
-            (transformed[idx[0]][2] + transformed[idx[1]][2] + transformed[idx[2]][2] + transformed[idx[3]][2])
-                * 0.25;
+        let avg_z = (transformed[idx[0]][2]
+            + transformed[idx[1]][2]
+            + transformed[idx[2]][2]
+            + transformed[idx[3]][2])
+            * 0.25;
         faces.push((
             avg_z,
             points,

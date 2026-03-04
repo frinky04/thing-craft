@@ -107,10 +107,7 @@ pub fn spawn_dropped_item(world: &mut World, block_id: u8, position: DVec3) {
     let bob = rng.gen_range(0.0..TAU) as f32;
 
     world.spawn((
-        DroppedItem {
-            block_id,
-            count: 1,
-        },
+        DroppedItem { block_id, count: 1 },
         Transform64::new(position),
         EntityPhysics {
             width: ITEM_WIDTH,
@@ -380,15 +377,10 @@ pub fn tick_entity_physics(
 // ---------------------------------------------------------------------------
 
 /// Check AABB overlap between player and dropped items. Returns true if any pickup happened.
-pub fn check_item_pickup(
-    world: &mut World,
-    hotbar: &mut crate::app::HotbarInventory,
-) -> bool {
+pub fn check_item_pickup(world: &mut World, hotbar: &mut crate::app::HotbarInventory) -> bool {
     // Read player position + physics.
-    let mut player_query =
-        world.query_filtered::<(&Transform64, &PhysicsBody), With<Player>>();
-    let Some((player_t, player_p)) = player_query.iter(world).next().map(|(t, p)| (*t, *p))
-    else {
+    let mut player_query = world.query_filtered::<(&Transform64, &PhysicsBody), With<Player>>();
+    let Some((player_t, player_p)) = player_query.iter(world).next().map(|(t, p)| (*t, *p)) else {
         return false;
     };
 
@@ -408,14 +400,17 @@ pub fn check_item_pickup(
     let mut to_despawn: Vec<Entity> = Vec::new();
     let mut any_pickup = false;
 
-    let mut item_query =
-        world.query::<(Entity, &DroppedItem, &Transform64, &PickupDelay, &EntityPhysics)>();
+    let mut item_query = world.query::<(
+        Entity,
+        &DroppedItem,
+        &Transform64,
+        &PickupDelay,
+        &EntityPhysics,
+    )>();
     let candidates: Vec<(Entity, u8, DVec3, f64, f64)> = item_query
         .iter(world)
         .filter(|(_, _, _, delay, _)| delay.ticks_remaining == 0)
-        .map(|(e, item, t, _, phys)| {
-            (e, item.block_id, t.position, phys.width, phys.height)
-        })
+        .map(|(e, item, t, _, phys)| (e, item.block_id, t.position, phys.width, phys.height))
         .collect();
 
     for (entity, block_id, item_pos, item_w, item_h) in candidates {
@@ -731,8 +726,8 @@ pub fn build_entity_shadow_mesh(
 
     let cam = Vec3::from(camera_pos);
 
-    let mut query = world
-        .query_filtered::<(&EntityRenderPos, &EntityAge, &BobOffset), With<EntityPhysics>>();
+    let mut query =
+        world.query_filtered::<(&EntityRenderPos, &EntityAge, &BobOffset), With<EntityPhysics>>();
 
     for (render_pos, age, bob) in query.iter(world) {
         // Replicate the bob offset used by the sprite mesh so shadow lines up.
@@ -894,10 +889,7 @@ mod tests {
         tick_entity_ages(&mut world);
 
         // Entity should be despawned.
-        let count = world
-            .query::<&DroppedItem>()
-            .iter(&world)
-            .count();
+        let count = world.query::<&DroppedItem>().iter(&world).count();
         assert_eq!(count, 0);
     }
 

@@ -1168,7 +1168,8 @@ impl OverworldChunkGenerator {
 
         // Phase 2: Surface building pass (top-down)
         let mut chunk_rng = JavaRandom::new(
-            (cx as i64).wrapping_mul(341873128712_i64)
+            (cx as i64)
+                .wrapping_mul(341873128712_i64)
                 .wrapping_add((cz as i64).wrapping_mul(132897987541_i64)),
         );
         self.build_surfaces(&mut chunk, &biomes, &mut chunk_rng);
@@ -1180,11 +1181,7 @@ impl OverworldChunkGenerator {
                 let temp = temperatures[col_idx];
                 let down = downfalls[col_idx];
                 chunk.set_grass_tint(local_x, local_z, self.grass_color_map.sample(temp, down));
-                chunk.set_foliage_tint(
-                    local_x,
-                    local_z,
-                    self.foliage_color_map.sample(temp, down),
-                );
+                chunk.set_foliage_tint(local_x, local_z, self.foliage_color_map.sample(temp, down));
             }
         }
 
@@ -1332,12 +1329,7 @@ impl OverworldChunkGenerator {
 
     /// Port of buildTerrain (Java lines 70-125).
     /// Trilinear interpolation from 5x17x5 density to 16x128x16 blocks.
-    fn build_terrain(
-        &self,
-        chunk: &mut ChunkData,
-        temperatures: &[f64],
-        downfalls: &[f64],
-    ) {
+    fn build_terrain(&self, chunk: &mut ChunkData, temperatures: &[f64], downfalls: &[f64]) {
         let cx = chunk.pos.x;
         let cz = chunk.pos.z;
 
@@ -1397,10 +1389,7 @@ impl OverworldChunkGenerator {
                                 } else if y < 64 {
                                     // Check temperature for ICE at sea level surface
                                     let temp_idx = local_z * 16 + local_x;
-                                    let temp = temperatures
-                                        .get(temp_idx)
-                                        .copied()
-                                        .unwrap_or(0.5);
+                                    let temp = temperatures.get(temp_idx).copied().unwrap_or(0.5);
                                     if y == 63 && temp < 0.5 {
                                         ICE_ID
                                     } else {
@@ -1409,12 +1398,7 @@ impl OverworldChunkGenerator {
                                 } else {
                                     AIR_ID
                                 };
-                                chunk.set_block(
-                                    local_x as u8,
-                                    y as u8,
-                                    local_z as u8,
-                                    block,
-                                );
+                                chunk.set_block(local_x as u8, y as u8, local_z as u8, block);
 
                                 d += z_step;
                             }
@@ -1434,12 +1418,7 @@ impl OverworldChunkGenerator {
 
     /// Port of buildSurfaces (Java lines 127-191).
     /// Top-down surface building pass: bedrock, sand/gravel/grass/dirt layers.
-    fn build_surfaces(
-        &self,
-        chunk: &mut ChunkData,
-        biomes: &[BiomeKind],
-        rng: &mut JavaRandom,
-    ) {
+    fn build_surfaces(&self, chunk: &mut ChunkData, biomes: &[BiomeKind], rng: &mut JavaRandom) {
         let cx = chunk.pos.x;
         let cz = chunk.pos.z;
 
@@ -1488,8 +1467,7 @@ impl OverworldChunkGenerator {
         for local_x in 0..16_usize {
             for local_z in 0..16_usize {
                 let biome = biomes[local_z * 16 + local_x];
-                let (mut surface_block, mut subsurface_block) =
-                    biome.surface_subsurface_blocks();
+                let (mut surface_block, mut subsurface_block) = biome.surface_subsurface_blocks();
 
                 let noise_idx = local_x * 16 + local_z;
                 let is_sand = sand_buf[noise_idx] + rng.next_double() * 0.2 > 0.0;
@@ -1541,20 +1519,10 @@ impl OverworldChunkGenerator {
                         }
 
                         counter = stone_depth;
-                        chunk.set_block(
-                            local_x as u8,
-                            y as u8,
-                            local_z as u8,
-                            surface_block,
-                        );
+                        chunk.set_block(local_x as u8, y as u8, local_z as u8, surface_block);
                     } else if counter > 0 {
                         counter -= 1;
-                        chunk.set_block(
-                            local_x as u8,
-                            y as u8,
-                            local_z as u8,
-                            subsurface_block,
-                        );
+                        chunk.set_block(local_x as u8, y as u8, local_z as u8, subsurface_block);
                     }
                 }
             }
@@ -3988,10 +3956,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            found_spring,
-            "no underground springs found in 5x5 region"
-        );
+        assert!(found_spring, "no underground springs found in 5x5 region");
     }
 
     #[test]

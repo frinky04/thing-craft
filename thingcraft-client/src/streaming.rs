@@ -2363,7 +2363,9 @@ impl ChunkStreamer {
         }
         // MC: when liquid spreads into a non-air block (flowers, torches, etc.),
         // water calls dropItems() and lava calls fizz().
-        let displaced = self.block_at_world(cell.x, cell.y, cell.z).unwrap_or(AIR_ID);
+        let displaced = self
+            .block_at_world(cell.x, cell.y, cell.z)
+            .unwrap_or(AIR_ID);
         if displaced != AIR_ID && kind == LiquidKind::Water {
             if let Some(drop_block_id) = self.registry.dropped_item_block_id(displaced) {
                 self.pending_fluid_item_drops.push((
@@ -4258,7 +4260,9 @@ mod tests {
 
         let drops = streamer.drain_fluid_item_drops();
         assert!(
-            drops.iter().any(|(block_id, _)| *block_id == TEST_FLOWER_ID),
+            drops
+                .iter()
+                .any(|(block_id, _)| *block_id == TEST_FLOWER_ID),
             "expected flower drop when water displaced decoration"
         );
     }
