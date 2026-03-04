@@ -455,6 +455,10 @@ pub fn run() -> Result<()> {
                     let frame_delta = now.saturating_duration_since(last_frame_start);
                     last_frame_start = now;
 
+                    // Inventory screen should not preserve prior movement/look intents.
+                    if inventory_open {
+                        ecs_runtime.clear_input_state();
+                    }
                     ecs_runtime.run_input();
 
                     let tick_timer_start = Instant::now();
@@ -990,6 +994,7 @@ pub fn run() -> Result<()> {
                             if inventory_open {
                                 mouse_captured = false;
                                 set_mouse_capture(window, false);
+                                ecs_runtime.clear_input_state();
                             } else {
                                 inventory_commands.push_back(InventoryCommand::CloseInventory);
                             }
