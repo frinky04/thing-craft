@@ -580,10 +580,12 @@ pub fn run() -> Result<()> {
                     let time_of_day = alpha_time_of_day(sim_ticks.wrapping_add(time_offset_ticks), render_alpha);
                     let ambient_darkness = alpha_ambient_darkness(time_of_day);
                     let cloud_color = alpha_cloud_color(time_of_day);
+                    let sunrise_color = alpha_sunrise_color(time_of_day);
                     let cloud_scroll = (sim_ticks as f32 + render_alpha) * 0.03;
                     let star_brightness = alpha_star_brightness(time_of_day);
                     let render_sky = alpha_view_distance < 2;
                     renderer.set_cloud_state(cloud_color, cloud_scroll);
+                    renderer.set_sunrise_state(sunrise_color);
                     renderer.set_star_brightness(star_brightness);
                     renderer.set_time_of_day(time_of_day);
                     if let Some(snapshot) = ecs_runtime.camera_snapshot() {
@@ -1482,6 +1484,19 @@ fn alpha_cloud_color(time_of_day: f32) -> [f32; 3] {
     ]
 }
 
+fn alpha_sunrise_color(time_of_day: f32) -> Option<[f32; 4]> {
+    let window = 0.4_f32;
+    let g = (time_of_day * std::f32::consts::TAU).cos();
+    if g < -window || g > window {
+        return None;
+    }
+
+    let i = (g / window) * 0.5 + 0.5;
+    let mut j = 1.0 - (1.0 - (i * std::f32::consts::PI).sin()) * 0.99;
+    j *= j;
+    Some([i * 0.3 + 0.7, i * i * 0.7 + 0.2, 0.2, j])
+}
+
 fn alpha_star_brightness(time_of_day: f32) -> f32 {
     let mut factor = 1.0 - ((time_of_day * std::f32::consts::TAU).cos() * 2.0 + 0.75);
     factor = factor.clamp(0.0, 1.0);
@@ -2188,9 +2203,10 @@ mod tests {
     use super::{
         affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
         alpha_brightness_from_light_level, alpha_fog_brightness_target, alpha_star_brightness,
-        alpha_time_of_day, has_target_directive, hotbar_slot_for_key, parse_env_bool,
-        parse_env_u32, raycast_first_solid_block, resolve_axis, AdaptiveFluidBudget, BlockRayHit,
-        HotbarInventory, AIR_BLOCK_ID, HOTBAR_BLOCK_IDS, HOTBAR_STACK_LIMIT,
+        alpha_sunrise_color, alpha_time_of_day, has_target_directive, hotbar_slot_for_key,
+        parse_env_bool, parse_env_u32, raycast_first_solid_block, resolve_axis,
+        AdaptiveFluidBudget, BlockRayHit, HotbarInventory, AIR_BLOCK_ID, HOTBAR_BLOCK_IDS,
+        HOTBAR_STACK_LIMIT,
     };
     use crate::streaming::{ChunkStreamer, ResidencyConfig};
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
@@ -2410,6 +2426,14 @@ mod tests {
         let midnight = alpha_star_brightness(alpha_time_of_day(18_000, 0.0));
         assert!(noon < 0.01);
         assert!(midnight > 0.45);
+    }
+
+    #[test]
+    fn sunrise_color_only_exists_near_horizon_transition() {
+        let noon = alpha_sunrise_color(alpha_time_of_day(6_000, 0.0));
+        let dawn = alpha_sunrise_color(alpha_time_of_day(0, 0.0));
+        assert!(noon.is_none());
+        assert!(dawn.is_some());
     }
 
     #[test]

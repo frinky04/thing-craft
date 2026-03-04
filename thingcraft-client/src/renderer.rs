@@ -37,6 +37,7 @@ pub struct Renderer<'w> {
     debug_line_pipeline: wgpu::RenderPipeline,
     block_outline_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    sunrise_pipeline: wgpu::RenderPipeline,
     stars_pipeline: wgpu::RenderPipeline,
     cloud_depth_pipeline: wgpu::RenderPipeline,
     cloud_pipeline: wgpu::RenderPipeline,
@@ -45,6 +46,9 @@ pub struct Renderer<'w> {
     sky_uniform_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
     sky_dome: SkyDome,
+    sunrise_uniform_buffer: wgpu::Buffer,
+    sunrise_bind_group: wgpu::BindGroup,
+    sunrise_mesh: Option<SunriseMeshGpu>,
     stars_uniform_buffer: wgpu::Buffer,
     stars_bind_group: wgpu::BindGroup,
     starfield: Starfield,
@@ -79,6 +83,7 @@ pub struct Renderer<'w> {
     render_sky: bool,
     cloud_color: [f32; 3],
     cloud_scroll: f32,
+    sunrise_color: Option<[f32; 4]>,
     star_brightness: f32,
     ambient_darkness: f32,
     leaf_cutout_enabled: f32,
@@ -237,6 +242,39 @@ struct SkyDome {
     dark_index_count: u32,
 }
 
+struct SunriseMeshGpu {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct SunriseUniform {
+    sky_view_proj: [[f32; 4]; 4],
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct SunriseVertex {
+    position: [f32; 3],
+    color: [f32; 4],
+}
+
+impl SunriseVertex {
+    const ATTRS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+
+    #[must_use]
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
 struct Starfield {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -247,7 +285,7 @@ struct Starfield {
 #[repr(C)]
 struct StarsUniform {
     sky_view_proj: [[f32; 4]; 4],
-    brightness: [f32; 4],
+    params: [f32; 4], // x = brightness, y = time_angle
 }
 
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -724,9 +762,39 @@ impl<'w> Renderer<'w> {
         });
 
         let sky_dome = create_sky_dome(&device);
+        let sunrise_uniform = SunriseUniform {
+            sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        };
+        let sunrise_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("thingcraft-sunrise-uniform-buffer"),
+            contents: bytemuck::bytes_of(&sunrise_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let sunrise_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-sunrise-bind-group-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let sunrise_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thingcraft-sunrise-bind-group"),
+            layout: &sunrise_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sunrise_uniform_buffer.as_entire_binding(),
+            }],
+        });
         let stars_uniform = StarsUniform {
             sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-            brightness: [0.0, 0.0, 0.0, 0.0],
+            params: [0.0, 0.0, 0.0, 0.0],
         };
         let stars_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("thingcraft-stars-uniform-buffer"),
@@ -1090,6 +1158,59 @@ impl<'w> Renderer<'w> {
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+
+        let sunrise_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-sunrise-shader"),
+            source: wgpu::ShaderSource::Wgsl(SUNRISE_SHADER.into()),
+        });
+        let sunrise_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("thingcraft-sunrise-pipeline-layout"),
+                bind_group_layouts: &[&sunrise_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let sunrise_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-sunrise-pipeline"),
+            layout: Some(&sunrise_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sunrise_shader,
+                entry_point: "vs_main",
+                buffers: &[SunriseVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sunrise_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -1744,6 +1865,7 @@ impl<'w> Renderer<'w> {
             debug_line_pipeline,
             block_outline_pipeline,
             sky_pipeline,
+            sunrise_pipeline,
             stars_pipeline,
             cloud_depth_pipeline,
             cloud_pipeline,
@@ -1752,6 +1874,9 @@ impl<'w> Renderer<'w> {
             sky_uniform_buffer,
             sky_bind_group,
             sky_dome,
+            sunrise_uniform_buffer,
+            sunrise_bind_group,
+            sunrise_mesh: None,
             stars_uniform_buffer,
             stars_bind_group,
             starfield,
@@ -1785,6 +1910,7 @@ impl<'w> Renderer<'w> {
             render_sky: false,
             cloud_color: [1.0, 1.0, 1.0],
             cloud_scroll: 0.0,
+            sunrise_color: None,
             star_brightness: 0.0,
             ambient_darkness: 0.0,
             leaf_cutout_enabled: 1.0,
@@ -1854,6 +1980,14 @@ impl<'w> Renderer<'w> {
 
     pub fn set_time_of_day(&mut self, time_of_day: f32) {
         self.time_of_day = time_of_day;
+        if self.sunrise_color.is_some() {
+            self.rebuild_sunrise_mesh();
+        }
+    }
+
+    pub fn set_sunrise_state(&mut self, sunrise: Option<[f32; 4]>) {
+        self.sunrise_color = sunrise;
+        self.rebuild_sunrise_mesh();
     }
 
     pub fn set_cloud_state(&mut self, cloud_color: [f32; 3], cloud_scroll: f32) {
@@ -2126,10 +2260,26 @@ impl<'w> Renderer<'w> {
             .write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
+    fn update_sunrise_uniform(&mut self) {
+        let uniform = SunriseUniform {
+            sky_view_proj: self.cached_sky_view_proj,
+        };
+        self.queue.write_buffer(
+            &self.sunrise_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
+    }
+
     fn update_stars_uniform(&mut self) {
         let uniform = StarsUniform {
             sky_view_proj: self.cached_sky_view_proj,
-            brightness: [self.star_brightness.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
+            params: [
+                self.star_brightness.clamp(0.0, 1.0),
+                self.time_of_day * std::f32::consts::TAU,
+                0.0,
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.stars_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -2170,6 +2320,34 @@ impl<'w> Renderer<'w> {
             0,
             bytemuck::bytes_of(&uniform),
         );
+    }
+
+    fn rebuild_sunrise_mesh(&mut self) {
+        let Some([r, g, b, a]) = self.sunrise_color else {
+            self.sunrise_mesh = None;
+            return;
+        };
+
+        let (vertices, indices) = build_alpha_sunrise_fan(self.time_of_day, [r, g, b, a]);
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("thingcraft-sunrise-vertex-buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("thingcraft-sunrise-index-buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.sunrise_mesh = Some(SunriseMeshGpu {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+        });
     }
 
     pub fn advance_dynamic_liquid_textures(&mut self, ticks: u32) {
@@ -2217,6 +2395,7 @@ impl<'w> Renderer<'w> {
 
         self.refresh_chunk_border_mesh_if_dirty();
         self.update_sky_uniform();
+        self.update_sunrise_uniform();
         self.update_stars_uniform();
         self.update_celestial_uniform();
 
@@ -2288,6 +2467,19 @@ impl<'w> Renderer<'w> {
                     0,
                     0..1,
                 );
+            }
+
+            if self.render_sky {
+                if let Some(sunrise) = &self.sunrise_mesh {
+                    render_pass.set_pipeline(&self.sunrise_pipeline);
+                    render_pass.set_bind_group(0, &self.sunrise_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, sunrise.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        sunrise.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.draw_indexed(0..sunrise.index_count, 0, 0..1);
+                }
             }
 
             // Celestial bodies (sun + moon) — after sky dome, before terrain.
@@ -2905,6 +3097,46 @@ fn build_alpha_starfield_mesh() -> (Vec<StarVertex>, Vec<u32>) {
     }
 
     (vertices, indices)
+}
+
+fn build_alpha_sunrise_fan(time_of_day: f32, color: [f32; 4]) -> (Vec<SunriseVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(18);
+    let mut indices = Vec::with_capacity(16 * 3);
+
+    let mut push_vertex = |position: [f32; 3], alpha: f32| {
+        vertices.push(SunriseVertex {
+            position,
+            color: [color[0], color[1], color[2], alpha],
+        });
+    };
+
+    push_vertex(
+        rotate_sunrise_vertex([0.0, 100.0, 0.0], time_of_day),
+        color[3],
+    );
+    for q in 0..=16 {
+        let angle = q as f32 * std::f32::consts::TAU / 16.0;
+        let u = angle.sin();
+        let v = angle.cos();
+        let ring = [u * 120.0, v * 120.0, -v * 40.0 * color[3]];
+        push_vertex(rotate_sunrise_vertex(ring, time_of_day), 0.0);
+    }
+
+    for i in 1..=16_u32 {
+        indices.extend_from_slice(&[0, i, i + 1]);
+    }
+
+    (vertices, indices)
+}
+
+fn rotate_sunrise_vertex(position: [f32; 3], time_of_day: f32) -> [f32; 3] {
+    // WorldRenderer.renderSky: Rx(90deg), then Rz(180deg) for evening half.
+    let rotated_x = [position[0], -position[2], position[1]];
+    if time_of_day > 0.5 {
+        [-rotated_x[0], -rotated_x[1], rotated_x[2]]
+    } else {
+        rotated_x
+    }
 }
 
 struct JavaRandom {
@@ -4092,10 +4324,42 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const SUNRISE_SHADER: &str = r#"
+struct Sunrise {
+    sky_view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> sunrise: Sunrise;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.clip_pos = sunrise.sky_view_proj * vec4<f32>(input.position, 1.0);
+    out.color = input.color;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    return input.color;
+}
+"#;
+
 const STARS_SHADER: &str = r#"
 struct Stars {
     sky_view_proj: mat4x4<f32>,
-    brightness: vec4<f32>,
+    params: vec4<f32>, // x = brightness, y = time_angle
 };
 
 @group(0) @binding(0)
@@ -4112,13 +4376,21 @@ struct VertexOut {
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
-    out.clip_pos = stars.sky_view_proj * vec4<f32>(input.position, 1.0);
+    let angle = stars.params.y;
+    let ca = cos(angle);
+    let sa = sin(angle);
+    let rotated = vec3<f32>(
+        input.position.x,
+        input.position.y * ca - input.position.z * sa,
+        input.position.y * sa + input.position.z * ca,
+    );
+    out.clip_pos = stars.sky_view_proj * vec4<f32>(rotated, 1.0);
     return out;
 }
 
 @fragment
 fn fs_main(_input: VertexOut) -> @location(0) vec4<f32> {
-    let b = clamp(stars.brightness.x, 0.0, 1.0);
+    let b = clamp(stars.params.x, 0.0, 1.0);
     return vec4<f32>(b, b, b, b);
 }
 "#;
@@ -4338,8 +4610,8 @@ mod tests {
     use glam::{Mat4, Vec3};
 
     use super::{
-        build_alpha_starfield_mesh, build_chunk_border_vertices, build_chunk_status_vertices,
-        build_fancy_cloud_mesh, chunk_aabb, FrustumPlanes,
+        build_alpha_starfield_mesh, build_alpha_sunrise_fan, build_chunk_border_vertices,
+        build_chunk_status_vertices, build_fancy_cloud_mesh, chunk_aabb, FrustumPlanes,
     };
     use crate::streaming::{ChunkDebugState, ChunkResidencyState};
     use crate::world::ChunkPos;
@@ -4407,5 +4679,14 @@ mod tests {
         assert!(vertices
             .iter()
             .any(|v| (v.face_kind - 2.0).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn sunrise_fan_has_center_alpha_and_outer_fade() {
+        let (vertices, indices) = build_alpha_sunrise_fan(0.0, [1.0, 0.6, 0.2, 0.8]);
+        assert_eq!(vertices.len(), 18);
+        assert_eq!(indices.len(), 48);
+        assert!((vertices[0].color[3] - 0.8).abs() < 0.0001);
+        assert!(vertices.iter().skip(1).all(|v| v.color[3] <= 0.0001));
     }
 }
