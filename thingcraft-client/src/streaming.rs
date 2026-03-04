@@ -345,6 +345,7 @@ pub struct ChunkStreamer {
     relight_dropped_stale_total: u64,
     fluid_scheduler: FluidScheduler,
     sim_tick: u64,
+    pending_fluid_item_drops: Vec<(u8, [f64; 3])>,
     render_updates: Vec<RenderMeshUpdate>,
 }
 
@@ -637,6 +638,7 @@ impl ChunkStreamer {
             relight_dropped_stale_total: 0,
             fluid_scheduler: FluidScheduler::default(),
             sim_tick: 0,
+            pending_fluid_item_drops: Vec::new(),
             render_updates: Vec::new(),
         }
     }
@@ -660,6 +662,10 @@ impl ChunkStreamer {
 
     pub fn drain_render_updates(&mut self) -> Vec<RenderMeshUpdate> {
         mem::take(&mut self.render_updates)
+    }
+
+    pub fn drain_fluid_item_drops(&mut self) -> Vec<(u8, [f64; 3])> {
+        mem::take(&mut self.pending_fluid_item_drops)
     }
 
     pub fn mark_chunk_geometry_dirty(&mut self, pos: ChunkPos) {
@@ -862,6 +868,11 @@ impl ChunkStreamer {
 
         let chunk = slot.chunk.as_ref()?;
         Some(chunk.block_metadata(local_x, world_y as u8, local_z))
+    }
+
+    #[must_use]
+    pub fn dropped_item_block_id(&self, block_id: u8) -> Option<u8> {
+        self.registry.dropped_item_block_id(block_id)
     }
 
     #[must_use]
@@ -2352,7 +2363,19 @@ impl ChunkStreamer {
         }
         // MC: when liquid spreads into a non-air block (flowers, torches, etc.),
         // water calls dropItems() and lava calls fizz().
-        // TODO: drop displaced block as item entity once entity system exists.
+        let displaced = self.block_at_world(cell.x, cell.y, cell.z).unwrap_or(AIR_ID);
+        if displaced != AIR_ID && kind == LiquidKind::Water {
+            if let Some(drop_block_id) = self.registry.dropped_item_block_id(displaced) {
+                self.pending_fluid_item_drops.push((
+                    drop_block_id,
+                    [
+                        cell.x as f64 + 0.5,
+                        cell.y as f64 + 0.5,
+                        cell.z as f64 + 0.5,
+                    ],
+                ));
+            }
+        }
         self.set_block_with_metadata_at_world_for_fluid(
             cell.x,
             cell.y,
@@ -2481,7 +2504,7 @@ impl ChunkStreamer {
         if block_id == AIR_ID {
             return false;
         }
-        self.registry.is_solid(block_id)
+        self.registry.blocks_movement(block_id)
     }
 
     fn can_spread_to(&self, x: i32, y: i32, z: i32, kind: LiquidKind) -> bool {
@@ -2845,6 +2868,8 @@ mod tests {
     use super::*;
 
     const TEST_STONE_ID: u8 = 1;
+    const TEST_FLOWER_ID: u8 = 37;
+    const TEST_LEAVES_ID: u8 = 18;
 
     fn insert_ready_air_chunk(streamer: &mut ChunkStreamer, pos: ChunkPos) {
         let mut chunk = ChunkData::new(pos, AIR_ID);
@@ -4195,5 +4220,81 @@ mod tests {
             streamer.block_at_world(16, 70, 8),
             Some(FLOWING_WATER_ID | WATER_ID)
         ));
+    }
+
+    #[test]
+    fn water_spread_drops_displaced_flower() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        // Force lateral spread and place a breakable decoration target.
+        assert!(streamer.set_block_with_metadata_at_world(8, 69, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(9, 69, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(7, 70, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 7, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 9, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 8, WATER_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(9, 70, 8, TEST_FLOWER_ID, 0));
+
+        streamer.enqueue_liquid_tick_with_neighbors(8, 70, 8, 0, FluidPriority::Urgent);
+        run_fluid_ticks(&mut streamer, 1, 16, 64);
+
+        assert!(matches!(
+            streamer.block_at_world(9, 70, 8),
+            Some(FLOWING_WATER_ID | WATER_ID)
+        ));
+
+        let drops = streamer.drain_fluid_item_drops();
+        assert!(
+            drops.iter().any(|(block_id, _)| *block_id == TEST_FLOWER_ID),
+            "expected flower drop when water displaced decoration"
+        );
+    }
+
+    #[test]
+    fn leaves_block_water_spread() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(
+            42,
+            registry,
+            ResidencyConfig {
+                view_radius: 0,
+                max_generation_dispatch: 0,
+                max_lighting_dispatch: 0,
+                max_meshing_dispatch: 0,
+                ..ResidencyConfig::default()
+            },
+        );
+        let center = ChunkPos { x: 0, z: 0 };
+        insert_ready_air_chunk(&mut streamer, center);
+
+        assert!(streamer.set_block_with_metadata_at_world(8, 69, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(9, 69, 8, TEST_STONE_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 8, WATER_ID, 0));
+        assert!(streamer.set_block_with_metadata_at_world(9, 70, 8, TEST_LEAVES_ID, 0));
+
+        streamer.enqueue_liquid_tick_with_neighbors(8, 70, 8, 0, FluidPriority::Urgent);
+        run_fluid_ticks(&mut streamer, 1, 16, 64);
+
+        assert_eq!(streamer.block_at_world(9, 70, 8), Some(TEST_LEAVES_ID));
+        assert!(
+            streamer
+                .drain_fluid_item_drops()
+                .iter()
+                .all(|(block_id, _)| *block_id != TEST_LEAVES_ID),
+            "leaves should not be displaced by water"
+        );
     }
 }

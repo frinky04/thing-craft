@@ -206,7 +206,7 @@ pub fn tick_entity_physics(
             && center_by < CHUNK_HEIGHT as i32
             && chunk_streamer
                 .block_at_world(center_bx, center_by, center_bz)
-                .is_some_and(|id| registry.is_solid(id))
+                .is_some_and(|id| registry.is_collidable(id))
         {
             // Find nearest open face among 6 cardinal neighbors.
             let directions: [(i32, i32, i32, usize); 6] = [
@@ -233,7 +233,7 @@ pub fn tick_entity_physics(
                 } else {
                     chunk_streamer
                         .block_at_world(nx, ny, nz)
-                        .is_some_and(|id| registry.is_solid(id))
+                        .is_some_and(|id| registry.is_collidable(id))
                 };
                 if !neighbor_solid {
                     // Distance from entity center to the face in that direction.
@@ -754,7 +754,7 @@ pub fn build_entity_shadow_mesh(
             let bz = ez.floor() as i32;
             if chunk_streamer
                 .block_at_world(bx, by, bz)
-                .is_some_and(|id| registry.is_solid(id))
+                .is_some_and(|id| registry.is_collidable(id))
             {
                 ground_block_y = Some(by);
                 break;

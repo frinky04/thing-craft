@@ -76,6 +76,8 @@ pub enum MaterialKind {
     Dirt,
     Grass,
     Wood,
+    Leaves,
+    Cactus,
     Plant,
     Glass,
     Liquid,
@@ -290,7 +292,7 @@ impl BlockRegistry {
             18,
             "oak_leaves",
             52,
-            MaterialKind::Plant,
+            MaterialKind::Leaves,
             false,
             1,
             0,
@@ -576,7 +578,7 @@ impl BlockRegistry {
             CACTUS_ID,
             "cactus",
             70,
-            MaterialKind::Plant,
+            MaterialKind::Cactus,
             true,
             15,
             0,
@@ -727,6 +729,34 @@ impl BlockRegistry {
     #[must_use]
     pub fn is_solid(&self, block_id: u8) -> bool {
         self.get(block_id).is_some_and(|block| block.solid)
+    }
+
+    #[must_use]
+    pub fn blocks_movement(&self, block_id: u8) -> bool {
+        let Some(block) = self.get(block_id) else {
+            return false;
+        };
+        !matches!(
+            block.material,
+            MaterialKind::Air
+                | MaterialKind::Liquid
+                | MaterialKind::Plant
+                | MaterialKind::Fire
+                | MaterialKind::Portal
+        )
+    }
+
+    #[must_use]
+    pub fn is_collidable(&self, block_id: u8) -> bool {
+        self.blocks_movement(block_id)
+    }
+
+    #[must_use]
+    pub fn dropped_item_block_id(&self, block_id: u8) -> Option<u8> {
+        if block_id == AIR_ID || self.is_liquid(block_id) {
+            return None;
+        }
+        Some(block_id)
     }
 
     #[must_use]
@@ -3962,5 +3992,23 @@ mod tests {
             found_spring,
             "no underground springs found in 5x5 region"
         );
+    }
+
+    #[test]
+    fn liquid_blocks_do_not_drop_items() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert_eq!(registry.dropped_item_block_id(WATER_ID), None);
+        assert_eq!(registry.dropped_item_block_id(FLOWING_WATER_ID), None);
+        assert_eq!(registry.dropped_item_block_id(LAVA_ID), None);
+        assert_eq!(registry.dropped_item_block_id(FLOWING_LAVA_ID), None);
+        assert_eq!(registry.dropped_item_block_id(STONE_ID), Some(STONE_ID));
+    }
+
+    #[test]
+    fn leaves_block_movement_but_are_not_full_solid_occluders() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert!(registry.blocks_movement(OAK_LEAVES_ID));
+        assert!(registry.is_collidable(OAK_LEAVES_ID));
+        assert!(!registry.is_solid(OAK_LEAVES_ID));
     }
 }

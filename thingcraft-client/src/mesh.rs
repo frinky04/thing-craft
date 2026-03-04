@@ -716,7 +716,9 @@ where
                     let sprite = registry.sprite_index_of(block_id);
                     let tint = [255_u8, 255, 255];
                     append_billboard_cross(
-                        &mut split.transparent,
+                        // Alpha-cutout plants should write depth before water.
+                        // Keep them in the opaque/cutout pass (shader alpha discard).
+                        &mut split.opaque,
                         base_pos,
                         sprite,
                         tint,
@@ -1705,5 +1707,29 @@ mod tests {
         let mesh = build_chunk_mesh(&chunk, &registry);
         assert!(!mesh.vertices.is_empty());
         assert!(mesh.vertices.iter().all(|vertex| vertex.light_data[3] == 1));
+    }
+
+    #[test]
+    fn billboard_plants_render_in_cutout_opaque_pass() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        // Sugar cane block ID.
+        chunk.set_block(4, 10, 4, 83);
+
+        let split = build_chunk_section_split_mesh_with_neighbor_slices(
+            &chunk,
+            &registry,
+            &CardinalNeighborSlicesOwned::default(),
+            0,
+        );
+
+        assert!(
+            !split.opaque.vertices.is_empty(),
+            "billboard plant should be emitted in opaque/cutout mesh"
+        );
+        assert!(
+            split.transparent.vertices.is_empty(),
+            "billboard plant should not be emitted in transparent mesh"
+        );
     }
 }

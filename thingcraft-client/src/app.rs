@@ -526,6 +526,14 @@ pub fn run() -> Result<()> {
                             }
                         }
 
+                        for (block_id, [x, y, z]) in chunk_streamer.drain_fluid_item_drops() {
+                            crate::entity::spawn_dropped_item(
+                                ecs_runtime.world_mut(),
+                                block_id,
+                                DVec3::new(x, y, z),
+                            );
+                        }
+
                         // Alpha GameRenderer.tick(): smooth fog brightness toward sampled player
                         // brightness, biased by view-distance setting.
                         let tick_time_of_day = alpha_time_of_day(sim_ticks.wrapping_add(time_offset_ticks), 0.0);
@@ -980,13 +988,13 @@ fn process_single_block_interaction_request(
                 hit.block[2],
                 AIR_BLOCK_ID,
             ) {
-                if broken_block_id != AIR_BLOCK_ID {
+                if let Some(drop_block_id) = chunk_streamer.dropped_item_block_id(broken_block_id) {
                     let spawn_pos = DVec3::new(
                         hit.block[0] as f64 + 0.5,
                         hit.block[1] as f64 + 0.5,
                         hit.block[2] as f64 + 0.5,
                     );
-                    item_spawns.push((broken_block_id, spawn_pos));
+                    item_spawns.push((drop_block_id, spawn_pos));
                 }
                 edit_latency_tracker.record_block_edit(hit.block[0], hit.block[2]);
             }
@@ -1637,7 +1645,7 @@ pub(crate) fn collect_solid_block_aabbs(
             }
             for bz in bz_min..=bz_max {
                 if let Some(block_id) = chunk_streamer.block_at_world(bx, by, bz) {
-                    if registry.get(block_id).is_some_and(|b| b.solid) {
+                    if registry.is_collidable(block_id) {
                         out.push([
                             bx as f64,
                             by as f64,
