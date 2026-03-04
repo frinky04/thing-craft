@@ -6,7 +6,7 @@ use glam::{DVec3, Vec3};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-use crate::ecs::{PhysicsBody, Player, RenderAlpha, Transform64};
+use crate::ecs::{PhysicsBody, Player, PlayerVitals, RenderAlpha, Transform64};
 use crate::inventory::PlayerInventoryState;
 use crate::mesh::{ChunkMesh, MeshVertex};
 use crate::streaming::ChunkStreamer;
@@ -27,9 +27,21 @@ const ITEM_HEIGHT: f64 = 0.25;
 const ITEM_SPAWN_VY: f64 = 0.2;
 const ITEM_SPAWN_VH_RANGE: f64 = 0.1;
 const ITEM_PICKUP_DELAY_TICKS: u32 = 10;
+const ITEM_PLAYER_DROP_PICKUP_DELAY_TICKS: u32 = 40;
 const ITEM_MAX_AGE_TICKS: u32 = 6000; // 5 minutes at 20 TPS
 const ITEM_EJECTION_VEL_MIN: f64 = 0.1;
 const ITEM_EJECTION_VEL_MAX: f64 = 0.3;
+const ITEM_PLAYER_DROP_THROW_SPEED: f64 = 0.3;
+const ITEM_PLAYER_DROP_SPREAD_SPEED: f64 = 0.02;
+const ITEM_PLAYER_DROP_Y_BIAS: f64 = 0.1;
+/// Player pickup query range from Alpha `PlayerEntity`: shape.grown(1.0, 0.0, 1.0).
+const ITEM_PICKUP_RANGE_XZ: f64 = 1.0;
+/// Alpha `EntityPickupParticle` lifetime in ticks.
+const ITEM_PICKUP_FX_LIFETIME_TICKS: u8 = 3;
+/// Alpha client uses offsetY = -0.5f when spawning item pickup particle.
+/// In this codebase player `Transform64.position.y` is feet-space, so we apply
+/// this relative to eye height to match first-person visual behavior.
+const ITEM_PICKUP_FX_OFFSET_Y: f32 = -0.5;
 
 /// Monotonic counter for seeding per-entity RNG (avoids needing `std_rng` feature).
 static ENTITY_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -96,6 +108,18 @@ pub struct EntityRenderPos {
     pub position: Vec3,
 }
 
+/// Short-lived visual pickup effect that lerps item render to the player.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct EntityPickupFx {
+    pub block_id: u8,
+    pub start_pos: DVec3,
+    pub start_age_ticks: u32,
+    pub bob_offset: f32,
+    pub age_ticks: u8,
+    pub lifetime_ticks: u8,
+    pub offset_y: f32,
+}
+
 // ---------------------------------------------------------------------------
 // Spawn
 // ---------------------------------------------------------------------------
@@ -106,14 +130,64 @@ pub fn spawn_dropped_item(world: &mut World, block_id: u8, position: DVec3) {
     let vx = rng.gen_range(-ITEM_SPAWN_VH_RANGE..ITEM_SPAWN_VH_RANGE);
     let vz = rng.gen_range(-ITEM_SPAWN_VH_RANGE..ITEM_SPAWN_VH_RANGE);
     let bob = rng.gen_range(0.0..TAU) as f32;
+    spawn_dropped_item_with(
+        world,
+        block_id,
+        position,
+        DVec3::new(vx, ITEM_SPAWN_VY, vz),
+        ITEM_PICKUP_DELAY_TICKS,
+        bob,
+    );
+}
 
+/// Spawn a player-dropped item (Alpha `PlayerEntity.dropItem` path):
+/// 40-tick pickup delay and a forward throw impulse from yaw/pitch.
+pub fn spawn_player_dropped_item(
+    world: &mut World,
+    block_id: u8,
+    position: DVec3,
+    yaw_radians: f64,
+    pitch_radians: f64,
+) {
+    let mut rng = entity_rng();
+    // ThingCraft forward convention matches `direction_from_angles` in app.rs:
+    // x = sin(yaw) * cos(pitch), z = cos(yaw) * cos(pitch).
+    let mut vx = yaw_radians.sin() * pitch_radians.cos() * ITEM_PLAYER_DROP_THROW_SPEED;
+    let mut vz = yaw_radians.cos() * pitch_radians.cos() * ITEM_PLAYER_DROP_THROW_SPEED;
+    let mut vy = pitch_radians.sin() * ITEM_PLAYER_DROP_THROW_SPEED + ITEM_PLAYER_DROP_Y_BIAS;
+
+    let h = rng.gen_range(0.0..TAU);
+    let jitter = ITEM_PLAYER_DROP_SPREAD_SPEED * rng.gen_range(0.0..1.0);
+    vx += h.cos() * jitter;
+    vy += rng.gen_range(-0.1..0.1);
+    vz += h.sin() * jitter;
+    let bob = rng.gen_range(0.0..TAU) as f32;
+
+    spawn_dropped_item_with(
+        world,
+        block_id,
+        position,
+        DVec3::new(vx, vy, vz),
+        ITEM_PLAYER_DROP_PICKUP_DELAY_TICKS,
+        bob,
+    );
+}
+
+fn spawn_dropped_item_with(
+    world: &mut World,
+    block_id: u8,
+    position: DVec3,
+    velocity: DVec3,
+    pickup_delay_ticks: u32,
+    bob_offset: f32,
+) {
     world.spawn((
         DroppedItem { block_id, count: 1 },
         Transform64::new(position),
         EntityPhysics {
             width: ITEM_WIDTH,
             height: ITEM_HEIGHT,
-            velocity: DVec3::new(vx, ITEM_SPAWN_VY, vz),
+            velocity,
             on_ground: false,
             gravity: ITEM_GRAVITY,
             air_drag_y: ITEM_AIR_DRAG_Y,
@@ -126,9 +200,9 @@ pub fn spawn_dropped_item(world: &mut World, block_id: u8, position: DVec3) {
             max_age_ticks: ITEM_MAX_AGE_TICKS,
         },
         PickupDelay {
-            ticks_remaining: ITEM_PICKUP_DELAY_TICKS,
+            ticks_remaining: pickup_delay_ticks,
         },
-        BobOffset(bob),
+        BobOffset(bob_offset),
         EntityRenderPos::default(),
     ));
 }
@@ -153,6 +227,18 @@ pub fn tick_entity_ages(world: &mut World) {
     }
 
     for entity in to_despawn {
+        world.despawn(entity);
+    }
+
+    let mut to_despawn_fx: Vec<Entity> = Vec::new();
+    let mut fx_query = world.query::<(Entity, &mut EntityPickupFx)>();
+    for (entity, mut fx) in fx_query.iter_mut(world) {
+        fx.age_ticks = fx.age_ticks.saturating_add(1);
+        if fx.age_ticks >= fx.lifetime_ticks {
+            to_despawn_fx.push(entity);
+        }
+    }
+    for entity in to_despawn_fx {
         world.despawn(entity);
     }
 }
@@ -380,10 +466,16 @@ pub fn tick_entity_physics(
 /// Check AABB overlap between player and dropped items. Returns true if any pickup happened.
 pub fn check_item_pickup(world: &mut World, inventory: &mut PlayerInventoryState) -> bool {
     // Read player position + physics.
-    let mut player_query = world.query_filtered::<(&Transform64, &PhysicsBody), With<Player>>();
-    let Some((player_t, player_p)) = player_query.iter(world).next().map(|(t, p)| (*t, *p)) else {
+    let mut player_query =
+        world.query_filtered::<(&Transform64, &PhysicsBody, Option<&PlayerVitals>), With<Player>>();
+    let Some((player_t, player_p, player_vitals)) =
+        player_query.iter(world).next().map(|(t, p, v)| (*t, *p, v.copied()))
+    else {
         return false;
     };
+    if player_vitals.is_some_and(|v| v.health <= 0) {
+        return false;
+    }
 
     let p_half_w = player_p.width / 2.0;
     let p_min = DVec3::new(
@@ -397,8 +489,19 @@ pub fn check_item_pickup(world: &mut World, inventory: &mut PlayerInventoryState
         player_t.position.z + p_half_w,
     );
 
+    let expanded_min = DVec3::new(
+        p_min.x - ITEM_PICKUP_RANGE_XZ,
+        p_min.y,
+        p_min.z - ITEM_PICKUP_RANGE_XZ,
+    );
+    let expanded_max = DVec3::new(
+        p_max.x + ITEM_PICKUP_RANGE_XZ,
+        p_max.y,
+        p_max.z + ITEM_PICKUP_RANGE_XZ,
+    );
     // Collect pickup candidates.
     let mut to_despawn: Vec<Entity> = Vec::new();
+    let mut to_spawn_fx: Vec<EntityPickupFx> = Vec::new();
     let mut any_pickup = false;
 
     let mut item_query = world.query::<(
@@ -408,13 +511,25 @@ pub fn check_item_pickup(world: &mut World, inventory: &mut PlayerInventoryState
         &PickupDelay,
         &EntityPhysics,
     )>();
-    let candidates: Vec<(Entity, u8, DVec3, f64, f64)> = item_query
+    let candidates: Vec<(Entity, u8, DVec3, f64, f64, u32, f32)> = item_query
         .iter(world)
         .filter(|(_, _, _, delay, _)| delay.ticks_remaining == 0)
-        .map(|(e, item, t, _, phys)| (e, item.block_id, t.position, phys.width, phys.height))
+        .filter_map(|(e, item, t, _, phys)| {
+            let age = world.get::<EntityAge>(e)?;
+            let bob = world.get::<BobOffset>(e)?;
+            Some((
+                e,
+                item.block_id,
+                t.position,
+                phys.width,
+                phys.height,
+                age.age_ticks,
+                bob.0,
+            ))
+        })
         .collect();
 
-    for (entity, block_id, item_pos, item_w, item_h) in candidates {
+    for (entity, block_id, item_pos, item_w, item_h, age_ticks, bob_offset) in candidates {
         let i_half_w = item_w / 2.0;
         let i_min = DVec3::new(item_pos.x - i_half_w, item_pos.y, item_pos.z - i_half_w);
         let i_max = DVec3::new(
@@ -423,22 +538,35 @@ pub fn check_item_pickup(world: &mut World, inventory: &mut PlayerInventoryState
             item_pos.z + i_half_w,
         );
 
-        // AABB overlap test + pickup attempt.
-        if p_min.x < i_max.x
-            && p_max.x > i_min.x
-            && p_min.y < i_max.y
-            && p_max.y > i_min.y
-            && p_min.z < i_max.z
-            && p_max.z > i_min.z
-            && inventory.try_add_block_pickup(block_id)
-        {
+        let inside_pickup_range = expanded_min.x < i_max.x
+            && expanded_max.x > i_min.x
+            && expanded_min.y < i_max.y
+            && expanded_max.y > i_min.y
+            && expanded_min.z < i_max.z
+            && expanded_max.z > i_min.z;
+        if !inside_pickup_range {
+            continue;
+        }
+        if inventory.try_add_block_pickup(block_id) {
             to_despawn.push(entity);
+            to_spawn_fx.push(EntityPickupFx {
+                block_id,
+                start_pos: item_pos,
+                start_age_ticks: age_ticks,
+                bob_offset,
+                age_ticks: 0,
+                lifetime_ticks: ITEM_PICKUP_FX_LIFETIME_TICKS,
+                offset_y: player_p.eye_height as f32 + ITEM_PICKUP_FX_OFFSET_Y,
+            });
             any_pickup = true;
         }
     }
 
     for entity in to_despawn {
         world.despawn(entity);
+    }
+    for fx in to_spawn_fx {
+        world.spawn(fx);
     }
     any_pickup
 }
@@ -570,6 +698,11 @@ pub fn build_entity_sprite_mesh(
 ) -> ChunkMesh {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let player_interp_pos = world
+        .query_filtered::<&Transform64, With<Player>>()
+        .iter(world)
+        .next()
+        .map(|t| t.prev_position.lerp(t.position, f64::from(render_alpha)));
 
     let mut query = world
         .query_filtered::<(&DroppedItem, &EntityRenderPos, &EntityAge, &BobOffset), With<EntityPhysics>>();
@@ -692,7 +825,175 @@ pub fn build_entity_sprite_mesh(
         }
     }
 
+    // Alpha-style pickup particle path: entity -> player over 3 ticks with squared progression.
+    if let Some(player_pos) = player_interp_pos {
+        let mut fx_query = world.query::<&EntityPickupFx>();
+        for fx in fx_query.iter(world) {
+            let progress = ((f32::from(fx.age_ticks) + render_alpha) / f32::from(fx.lifetime_ticks))
+                .clamp(0.0, 1.0);
+            let progress_sq = progress * progress;
+            let target = DVec3::new(
+                player_pos.x,
+                player_pos.y + f64::from(fx.offset_y),
+                player_pos.z,
+            );
+            let pos = fx.start_pos.lerp(target, f64::from(progress_sq));
+            let render_pos = EntityRenderPos {
+                position: pos.as_vec3(),
+            };
+            let age = EntityAge {
+                age_ticks: fx.start_age_ticks,
+                max_age_ticks: ITEM_MAX_AGE_TICKS,
+            };
+            let bob = BobOffset(fx.bob_offset);
+            append_item_mesh(
+                &mut vertices,
+                &mut indices,
+                fx.block_id,
+                &render_pos,
+                &age,
+                &bob,
+                camera_yaw,
+                registry,
+                chunk_streamer,
+                ambient_darkness,
+                render_alpha,
+            );
+        }
+    }
+
     ChunkMesh { vertices, indices }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_item_mesh(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    block_id: u8,
+    render_pos: &EntityRenderPos,
+    age: &EntityAge,
+    bob: &BobOffset,
+    camera_yaw: f32,
+    registry: &BlockRegistry,
+    chunk_streamer: &ChunkStreamer,
+    ambient_darkness: u8,
+    render_alpha: f32,
+) {
+    // Bob offset: sin((age + partial) / 10.0 + bobOffset) * 0.1 + 0.1
+    let age_f = age.age_ticks as f32 + render_alpha;
+    let bob_y = (age_f / 10.0 + bob.0).sin() * 0.1 + 0.1;
+
+    let cx = render_pos.position.x;
+    let cy = render_pos.position.y + bob_y;
+    let cz = render_pos.position.z;
+
+    // Sample world light at entity position (Alpha Entity.getBrightness samples
+    // at 66% of entity height; for small items this is ~entity position).
+    let world_x = cx.floor() as i32;
+    let world_y = (render_pos.position.y as f64 + ITEM_HEIGHT * 0.66).floor() as i32;
+    let world_z = cz.floor() as i32;
+    let effective_light = chunk_streamer
+        .effective_light_at_world(world_x, world_y, world_z, ambient_darkness)
+        .unwrap_or(15_u8.saturating_sub(ambient_darkness.min(15)));
+    // Split into sky/block for the shader: put effective in both channels so
+    // max(block, sky - darkness) = effective regardless of darkness uniform.
+    let light_sky = effective_light;
+    let light_block = effective_light;
+
+    let tint = [255_u8, 255, 255, 255];
+
+    if registry.is_solid(block_id) {
+        // 3D mini-block: Alpha rotates by (age + partial) / 20 * 57.2958 degrees.
+        let spin_rad = (age_f / 20.0 + bob.0) * (std::f32::consts::PI / 180.0) * 57.295_78;
+        let cos_r = spin_rad.cos();
+        let sin_r = spin_rad.sin();
+
+        for face in &CUBE_FACES {
+            let sprite = registry.sprite_index_for_face(block_id, face.face_offset);
+            let u0 = (sprite % 16) as f32 * ATLAS_TILE_UV;
+            let v0 = (sprite / 16) as f32 * ATLAS_TILE_UV;
+            let u1 = u0 + ATLAS_TILE_UV;
+            let v1 = v0 + ATLAS_TILE_UV;
+
+            let face_shade = (face.shade * 255.0) as u8;
+            let light = [light_sky, light_block, face_shade, 0];
+
+            let base = vertices.len() as u32;
+            let uvs = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
+
+            for (i, vert) in face.verts.iter().enumerate() {
+                // Scale then shift so bottom face sits at Y=0 (Alpha does
+                // glTranslate(-0.5,-0.5,-0.5) then glScale(0.25) so the
+                // cube occupies 0..0.25 in Y, not -0.125..+0.125).
+                let sx = vert[0] * BLOCK_ITEM_SCALE;
+                let sy = (vert[1] + 0.5) * BLOCK_ITEM_SCALE;
+                let sz = vert[2] * BLOCK_ITEM_SCALE;
+                let rx = sx * cos_r + sz * sin_r;
+                let rz = -sx * sin_r + sz * cos_r;
+
+                vertices.push(MeshVertex {
+                    position: [cx + rx, cy + sy, cz + rz],
+                    uv: uvs[i],
+                    tint_rgba: tint,
+                    light_data: light,
+                });
+            }
+
+            indices.push(base);
+            indices.push(base + 1);
+            indices.push(base + 2);
+            indices.push(base);
+            indices.push(base + 2);
+            indices.push(base + 3);
+        }
+    } else {
+        // Billboard sprite for non-solid items (torches, flowers, etc.).
+        let right_x = -camera_yaw.cos() * SPRITE_HALF_SIZE;
+        let right_z = camera_yaw.sin() * SPRITE_HALF_SIZE;
+
+        let sprite_index = registry.sprite_index_of(block_id);
+        let u0 = (sprite_index % 16) as f32 * ATLAS_TILE_UV;
+        let v0 = (sprite_index / 16) as f32 * ATLAS_TILE_UV;
+        let u1 = u0 + ATLAS_TILE_UV;
+        let v1 = v0 + ATLAS_TILE_UV;
+
+        let light = [light_sky, light_block, 255, 0];
+        let base_index = vertices.len() as u32;
+        let bot_y = cy;
+        let top_y = cy + SPRITE_HALF_SIZE * 2.0;
+
+        vertices.push(MeshVertex {
+            position: [cx - right_x, bot_y, cz - right_z],
+            uv: [u0, v1],
+            tint_rgba: tint,
+            light_data: light,
+        });
+        vertices.push(MeshVertex {
+            position: [cx + right_x, bot_y, cz + right_z],
+            uv: [u1, v1],
+            tint_rgba: tint,
+            light_data: light,
+        });
+        vertices.push(MeshVertex {
+            position: [cx + right_x, top_y, cz + right_z],
+            uv: [u1, v0],
+            tint_rgba: tint,
+            light_data: light,
+        });
+        vertices.push(MeshVertex {
+            position: [cx - right_x, top_y, cz - right_z],
+            uv: [u0, v0],
+            tint_rgba: tint,
+            light_data: light,
+        });
+
+        indices.push(base_index);
+        indices.push(base_index + 1);
+        indices.push(base_index + 2);
+        indices.push(base_index);
+        indices.push(base_index + 2);
+        indices.push(base_index + 3);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +1145,11 @@ pub fn build_entity_shadow_mesh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecs::Player;
+
+    fn spawn_test_player(world: &mut World, position: DVec3) {
+        world.spawn((Player, Transform64::new(position), PhysicsBody::default()));
+    }
 
     #[test]
     fn spawn_creates_entity_with_all_components() {
@@ -908,6 +1214,68 @@ mod tests {
     }
 
     #[test]
+    fn player_drop_uses_longer_pickup_delay() {
+        let mut world = World::new();
+        world.insert_resource(RenderAlpha(0.0));
+        spawn_player_dropped_item(&mut world, 1, DVec3::ZERO, 0.0, 0.0);
+
+        let mut query = world.query::<&PickupDelay>();
+        let delay = query.iter(&world).next().unwrap();
+        assert_eq!(delay.ticks_remaining, ITEM_PLAYER_DROP_PICKUP_DELAY_TICKS);
+    }
+
+    #[test]
+    fn player_drop_throw_uses_forward_look_direction_convention() {
+        let mut world = World::new();
+        world.insert_resource(RenderAlpha(0.0));
+        // yaw = +90deg should throw toward +X in ThingCraft camera convention.
+        spawn_player_dropped_item(
+            &mut world,
+            1,
+            DVec3::ZERO,
+            std::f64::consts::FRAC_PI_2,
+            0.0,
+        );
+
+        let mut query = world.query::<&EntityPhysics>();
+        let physics = query.iter(&world).next().unwrap();
+        assert!(physics.velocity.x > 0.0);
+    }
+
+    #[test]
+    fn player_drop_throw_respects_pitch_sign() {
+        let mut up_world = World::new();
+        up_world.insert_resource(RenderAlpha(0.0));
+        spawn_player_dropped_item(
+            &mut up_world,
+            1,
+            DVec3::ZERO,
+            0.0,
+            std::f64::consts::FRAC_PI_4,
+        );
+        let vy_up = up_world.query::<&EntityPhysics>().iter(&up_world).next().unwrap().velocity.y;
+
+        let mut down_world = World::new();
+        down_world.insert_resource(RenderAlpha(0.0));
+        spawn_player_dropped_item(
+            &mut down_world,
+            1,
+            DVec3::ZERO,
+            0.0,
+            -std::f64::consts::FRAC_PI_4,
+        );
+        let vy_down = down_world
+            .query::<&EntityPhysics>()
+            .iter(&down_world)
+            .next()
+            .unwrap()
+            .velocity
+            .y;
+
+        assert!(vy_up > vy_down, "looking up should produce higher drop arc than looking down");
+    }
+
+    #[test]
     fn solid_block_mesh_produces_cube_geometry() {
         let mut world = World::new();
         world.insert_resource(RenderAlpha(0.0));
@@ -953,5 +1321,44 @@ mod tests {
         // Billboard: 4 verts, 6 indices
         assert_eq!(mesh.vertices.len(), 4);
         assert_eq!(mesh.indices.len(), 6);
+    }
+
+    #[test]
+    fn pickup_collects_in_alpha_expanded_range_and_spawns_fx() {
+        let mut world = World::new();
+        world.insert_resource(RenderAlpha(0.0));
+        spawn_test_player(&mut world, DVec3::new(0.0, 64.0, 0.0));
+        // Just outside player AABB, but inside Alpha expanded pickup range.
+        spawn_dropped_item(&mut world, 3, DVec3::new(1.20, 64.2, 0.0));
+        for mut delay in world.query::<&mut PickupDelay>().iter_mut(&mut world) {
+            delay.ticks_remaining = 0;
+        }
+
+        let mut inventory = PlayerInventoryState::alpha_defaults();
+        // Ensure stack is mergeable so pickup succeeds.
+        let _ = inventory.apply(crate::inventory::InventoryCommand::SelectHotbar { index: 0 });
+        let picked = check_item_pickup(&mut world, &mut inventory);
+        assert!(picked);
+        assert_eq!(world.query::<&DroppedItem>().iter(&world).count(), 0);
+        assert_eq!(world.query::<&EntityPickupFx>().iter(&world).count(), 1);
+    }
+
+    #[test]
+    fn pickup_fx_expires_after_lifetime() {
+        let mut world = World::new();
+        world.insert_resource(RenderAlpha(0.0));
+        spawn_test_player(&mut world, DVec3::new(0.0, 64.0, 0.0));
+        spawn_dropped_item(&mut world, 3, DVec3::new(1.20, 64.2, 0.0));
+        for mut delay in world.query::<&mut PickupDelay>().iter_mut(&mut world) {
+            delay.ticks_remaining = 0;
+        }
+        let mut inventory = PlayerInventoryState::alpha_defaults();
+        assert!(check_item_pickup(&mut world, &mut inventory));
+        assert_eq!(world.query::<&EntityPickupFx>().iter(&world).count(), 1);
+
+        for _ in 0..ITEM_PICKUP_FX_LIFETIME_TICKS {
+            tick_entity_ages(&mut world);
+        }
+        assert_eq!(world.query::<&EntityPickupFx>().iter(&world).count(), 0);
     }
 }

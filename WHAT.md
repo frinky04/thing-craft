@@ -33,3 +33,31 @@ Since we are using bevy_ecs, a great way to "build smart" for future networking 
 Check and update both completion docs:
 - `BOOSTRAP_COMPLETION.md` for implementation/bootstrap milestones.
 - `GAMEPLAY_COMPLETION.md` for Alpha 1.2.6 gameplay parity.
+
+# Coordinate + Angle Conventions (Read Before Porting Alpha Math)
+
+- **World axes:** `+Y` is up. Horizontal plane is `X/Z`.
+- **Player transform origin:** `Transform64.position` is **feet-space** while physics is active.
+- **Camera origin:** `camera_y = feet_y + eye_height - sneak_offset`.
+- **Yaw/Pitch units:** radians.
+- **Yaw positive direction:** positive yaw rotates view toward `+X`.
+- **Pitch positive direction:** positive pitch looks up (`+Y` component increases).
+
+Forward/look direction used across gameplay code:
+
+```rust
+x = sin(yaw) * cos(pitch);
+y = sin(pitch);
+z = cos(yaw) * cos(pitch);
+```
+
+This is the canonical direction mapping and should be reused for:
+- raycasts
+- first-person interaction traces
+- throw/projectile/drop impulses
+
+Porting checklist for Alpha formulas:
+- **Do not copy signs blindly** from decompiled code. First map Alpha's local convention to ThingCraft's canonical direction mapping above.
+- If target code uses player position in feet-space, convert eye-space constants (`offsetY`, eye-relative effects) explicitly.
+- When matching visual effects (pickup, hand/item transforms), verify whether Alpha behavior is physics-driven vs render-only before adding gameplay forces.
+- Add a narrow regression test for each imported formula (at minimum: yaw sign and pitch sign expectations).

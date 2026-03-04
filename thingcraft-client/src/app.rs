@@ -46,24 +46,64 @@ const FLUID_URGENT_SLICE_MIN: usize = 16;
 const FLUID_URGENT_SLICE_DIVISOR: usize = 8;
 const DAY_TICKS: u64 = 24_000;
 const WORLD_SEED: u64 = 0xA126_0001;
-
-#[derive(Debug, Clone, Copy)]
-enum BlockInteractionKind {
-    Break,
-    Place,
-}
+const ALPHA_MINING_COOLDOWN_TICKS: u8 = 5;
 
 #[derive(Debug, Clone, Copy)]
 struct BlockInteractionRequest {
     origin: DVec3,
     direction: DVec3,
-    kind: BlockInteractionKind,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct BlockRayHit {
     block: [i32; 3],
     normal: [i32; 3],
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct MiningTarget {
+    x: i32,
+    y: i32,
+    z: i32,
+    face: [i32; 3],
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct MiningState {
+    target: Option<MiningTarget>,
+    progress: f32,
+    last_progress: f32,
+    ticks: f32,
+    cooldown_ticks: u8,
+}
+
+impl MiningState {
+    fn stop(&mut self) {
+        self.target = None;
+        self.progress = 0.0;
+        self.last_progress = 0.0;
+        self.ticks = 0.0;
+        self.cooldown_ticks = 0;
+    }
+
+    fn retarget(&mut self, target: MiningTarget) {
+        self.target = Some(target);
+        self.progress = 0.0;
+        self.last_progress = 0.0;
+        self.ticks = 0.0;
+    }
+
+    fn on_block_broken(&mut self) {
+        self.progress = 0.0;
+        self.last_progress = 0.0;
+        self.ticks = 0.0;
+        self.cooldown_ticks = ALPHA_MINING_COOLDOWN_TICKS;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MiningToolKind {
+    None,
 }
 
 #[derive(Debug, Default)]
@@ -387,6 +427,9 @@ pub fn run() -> Result<()> {
     let mut last_frame_start = Instant::now();
     let mut loop_stats = LoopStats::default();
     let mut mouse_captured = false;
+    let mut left_mouse_held = false;
+    let mut mining_start_requested = false;
+    let mut mining_state = MiningState::default();
     let mut inventory_open = false;
     let mut mouse_screen_pos = [0.0_f32, 0.0_f32];
     let mut block_interaction_requests = VecDeque::new();
@@ -505,17 +548,30 @@ pub fn run() -> Result<()> {
                                 hud_dirty = true;
                             }
                             if !result.dropped_to_world.is_empty() {
-                                let drop_pos = ecs_runtime
+                                let (drop_pos, drop_yaw, drop_pitch) = ecs_runtime
                                     .camera_snapshot()
-                                    .map(|snapshot| snapshot.authoritative.position + DVec3::new(0.0, 1.2, 0.0))
-                                    .unwrap_or(DVec3::ZERO);
+                                    .map(|snapshot| {
+                                        (
+                                            snapshot.authoritative.position
+                                                + DVec3::new(
+                                                    0.0,
+                                                    snapshot.physics.eye_height - 0.3,
+                                                    0.0,
+                                                ),
+                                            snapshot.authoritative.yaw,
+                                            snapshot.authoritative.pitch,
+                                        )
+                                    })
+                                    .unwrap_or((DVec3::ZERO, 0.0, 0.0));
                                 for dropped in result.dropped_to_world {
                                     let ItemKey::Block(block_id) = dropped.item;
                                     for _ in 0..dropped.count {
-                                        crate::entity::spawn_dropped_item(
+                                        crate::entity::spawn_player_dropped_item(
                                             ecs_runtime.world_mut(),
                                             block_id,
                                             drop_pos,
+                                            drop_yaw,
+                                            drop_pitch,
                                         );
                                     }
                                 }
@@ -530,20 +586,48 @@ pub fn run() -> Result<()> {
                             hud_dirty = true;
                         }
 
-                        // Block interactions (break/place).
-                        let item_spawns = process_block_interaction_requests(
+                        if !mouse_captured || inventory_open || ecs_runtime.player_is_dead() {
+                            left_mouse_held = false;
+                            mining_start_requested = false;
+                            mining_state.stop();
+                        }
+
+                        if mining_start_requested {
+                            if try_start_block_mining(
+                                &mut ecs_runtime,
+                                &mut chunk_streamer,
+                                &bootstrap_world.registry,
+                                &inventory_state,
+                                &mut mining_state,
+                                &mut edit_latency_tracker,
+                            ) {
+                                hud_dirty = true;
+                            }
+                            mining_start_requested = false;
+                        }
+
+                        if left_mouse_held {
+                            if tick_block_mining(
+                                &mut ecs_runtime,
+                                &mut chunk_streamer,
+                                &bootstrap_world.registry,
+                                &inventory_state,
+                                &mut mining_state,
+                                &mut edit_latency_tracker,
+                            ) {
+                                hud_dirty = true;
+                            }
+                        } else {
+                            mining_state.stop();
+                        }
+
+                        // Block interactions (place-only in this queue path).
+                        process_block_interaction_requests(
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
                             &mut edit_latency_tracker,
                             &mut inventory_state,
                         );
-                        for (block_id, spawn_pos) in item_spawns {
-                            crate::entity::spawn_dropped_item(
-                                ecs_runtime.world_mut(),
-                                block_id,
-                                spawn_pos,
-                            );
-                        }
 
                         if inventory_state.snapshot() != pre_inv {
                             hud_dirty = true;
@@ -983,12 +1067,16 @@ pub fn run() -> Result<()> {
                             if inventory_open {
                                 inventory_commands.push_back(InventoryCommand::CloseInventory);
                                 inventory_open = false;
+                                left_mouse_held = false;
+                                mining_state.stop();
                                 if !ecs_runtime.player_is_dead() {
                                     mouse_captured = true;
                                     set_mouse_capture(window, true);
                                 }
                             } else {
                                 mouse_captured = false;
+                                left_mouse_held = false;
+                                mining_state.stop();
                                 set_mouse_capture(window, false);
                             }
                             hud_dirty = true;
@@ -998,6 +1086,8 @@ pub fn run() -> Result<()> {
                             inventory_open = !inventory_open;
                             if inventory_open {
                                 mouse_captured = false;
+                                left_mouse_held = false;
+                                mining_state.stop();
                                 set_mouse_capture(window, false);
                                 ecs_runtime.clear_input_state();
                                 let size = window.inner_size();
@@ -1057,13 +1147,19 @@ pub fn run() -> Result<()> {
                         set_mouse_capture(window, true);
                     } else {
                         first_person_hand.trigger_swing();
-                        enqueue_block_interaction_request(
-                            &mut ecs_runtime,
-                            &mut block_interaction_requests,
-                            BlockInteractionKind::Break,
-                        );
+                        left_mouse_held = true;
+                        mining_start_requested = true;
                     }
                 },
+                WindowEvent::MouseInput {
+                    button: MouseButton::Left,
+                    state: ElementState::Released,
+                    ..
+                } => {
+                    left_mouse_held = false;
+                    mining_start_requested = false;
+                    mining_state.stop();
+                }
                 WindowEvent::MouseInput {
                     button: MouseButton::Right,
                     state: ElementState::Pressed,
@@ -1097,7 +1193,6 @@ pub fn run() -> Result<()> {
                     enqueue_block_interaction_request(
                         &mut ecs_runtime,
                         &mut block_interaction_requests,
-                        BlockInteractionKind::Place,
                     );
                 },
                 WindowEvent::MouseWheel { delta, .. } => {
@@ -1223,22 +1318,16 @@ fn direction_from_angles64(yaw: f64, pitch: f64) -> DVec3 {
     DVec3::new(x, y, z).normalize_or_zero()
 }
 
-fn enqueue_block_interaction_request(
-    ecs_runtime: &mut EcsRuntime,
-    queue: &mut VecDeque<BlockInteractionRequest>,
-    kind: BlockInteractionKind,
-) {
-    let Some(snapshot) = ecs_runtime.camera_snapshot() else {
-        return;
-    };
+fn current_block_interaction_ray(ecs_runtime: &mut EcsRuntime) -> Option<(DVec3, DVec3)> {
+    let snapshot = ecs_runtime.camera_snapshot()?;
     if snapshot.vitals.health <= 0 {
-        return;
+        return None;
     }
 
     let direction =
         direction_from_angles64(snapshot.authoritative.yaw, snapshot.authoritative.pitch);
     if direction.length_squared() == 0.0 {
-        return;
+        return None;
     }
 
     // In physics mode, position is at feet. Raycast from eye height.
@@ -1247,32 +1336,289 @@ fn enqueue_block_interaction_request(
         origin.y += snapshot.physics.eye_height - snapshot.physics.render_eye_height_sneak_offset;
     }
 
+    Some((origin, direction))
+}
+
+fn raycast_current_mining_target(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+) -> Option<MiningTarget> {
+    let (origin, direction) = current_block_interaction_ray(ecs_runtime)?;
+    let hit = raycast_first_solid_block(origin, direction, BLOCK_INTERACTION_REACH_BLOCKS, |x, y, z| {
+        chunk_streamer.block_at_world(x, y, z)
+    })?;
+    let block_id = chunk_streamer
+        .block_at_world(hit.block[0], hit.block[1], hit.block[2])
+        .unwrap_or(AIR_BLOCK_ID);
+    if block_id == AIR_BLOCK_ID {
+        return None;
+    }
+    if registry
+        .get(block_id)
+        .is_some_and(|def| def.material == MaterialKind::Liquid)
+    {
+        return None;
+    }
+    Some(MiningTarget {
+        x: hit.block[0],
+        y: hit.block[1],
+        z: hit.block[2],
+        face: hit.normal,
+    })
+}
+
+fn alpha_break_block_and_collect_drop(
+    chunk_streamer: &mut ChunkStreamer,
+    block_x: i32,
+    block_y: i32,
+    block_z: i32,
+    edit_latency_tracker: &mut EditLatencyTracker,
+) -> Option<(u8, DVec3)> {
+    let broken_block_id = chunk_streamer
+        .block_at_world(block_x, block_y, block_z)
+        .unwrap_or(AIR_BLOCK_ID);
+    if broken_block_id == AIR_BLOCK_ID {
+        return None;
+    }
+    if !chunk_streamer.set_block_at_world(block_x, block_y, block_z, AIR_BLOCK_ID) {
+        return None;
+    }
+    edit_latency_tracker.record_block_edit(block_x, block_z);
+    let drop_block_id = chunk_streamer.dropped_item_block_id(broken_block_id)?;
+    let spawn_pos = DVec3::new(
+        block_x as f64 + 0.5,
+        block_y as f64 + 0.5,
+        block_z as f64 + 0.5,
+    );
+    Some((drop_block_id, spawn_pos))
+}
+
+fn resolve_mining_tool_stub(_inventory: &PlayerInventoryState) -> MiningToolKind {
+    // TODO(alpha-tools): map selected stack to actual Alpha tool classes once tools are implemented.
+    MiningToolKind::None
+}
+
+fn alpha_block_mining_time(block_id: u8) -> f32 {
+    match block_id {
+        7 | 90 => -1.0, // bedrock, portal
+        8 | 9 | 11 => 100.0, // water/lava source-like blocks
+        6 | 10 | 37 | 38 | 39 | 40 | 46 | 50 | 51 | 55 | 59 | 75 | 76 | 83 => 0.0,
+        1 => 1.5,
+        2 => 0.6,
+        3 => 0.5,
+        4 => 2.0,
+        5 => 2.0,
+        12 => 0.5,
+        13 => 0.6,
+        14 | 15 | 16 | 56 | 73 | 74 => 3.0,
+        17 => 2.0,
+        18 => 0.2,
+        19 => 0.6,
+        20 => 0.3,
+        35 => 0.8,
+        41 => 3.0,
+        42 | 57 => 5.0,
+        43 | 44 | 45 | 48 | 53 | 67 | 84 => 2.0,
+        47 => 1.5,
+        49 => 10.0,
+        52 => 5.0,
+        54 | 58 => 2.5,
+        60 => 0.6,
+        61 | 62 => 3.5,
+        63 | 68 => 1.0,
+        64 => 3.0,
+        65 => 0.4,
+        66 => 0.7,
+        69 | 70 | 72 | 77 => 0.5,
+        71 => 5.0,
+        78 => 0.1,
+        79 => 0.5,
+        80 => 0.2,
+        81 => 0.4,
+        82 => 0.6,
+        85 => 2.0,
+        86 | 91 => 1.0,
+        87 => 0.4,
+        88 => 0.5,
+        89 => 0.3,
+        _ => 1.0,
+    }
+}
+
+fn alpha_tool_mining_speed_stub(_tool: MiningToolKind, _block_id: u8) -> Option<f32> {
+    // TODO(alpha-tools): return tool class/tier mining speed multiplier.
+    None
+}
+
+fn alpha_can_harvest_block_stub(_tool: MiningToolKind, _block_id: u8) -> Option<bool> {
+    // TODO(alpha-tools): return harvest gate for pickaxe tier/material-sensitive blocks.
+    None
+}
+
+fn alpha_block_mining_progress_per_tick(
+    block_id: u8,
+    inventory: &PlayerInventoryState,
+    player_on_ground: bool,
+    player_in_water: bool,
+) -> f32 {
+    let mining_time = alpha_block_mining_time(block_id);
+    if mining_time < 0.0 {
+        return 0.0;
+    }
+    if mining_time == 0.0 {
+        return f32::INFINITY;
+    }
+
+    let tool = resolve_mining_tool_stub(inventory);
+    let can_harvest = alpha_can_harvest_block_stub(tool, block_id).unwrap_or(true);
+    if !can_harvest {
+        return 1.0 / mining_time / 100.0;
+    }
+
+    let mut player_speed = alpha_tool_mining_speed_stub(tool, block_id).unwrap_or(1.0);
+    if player_in_water {
+        player_speed /= 5.0;
+    }
+    if !player_on_ground {
+        player_speed /= 5.0;
+    }
+    player_speed / mining_time / 30.0
+}
+
+fn try_start_block_mining(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
+    inventory: &PlayerInventoryState,
+    mining_state: &mut MiningState,
+    edit_latency_tracker: &mut EditLatencyTracker,
+) -> bool {
+    let Some(target) = raycast_current_mining_target(ecs_runtime, chunk_streamer, registry) else {
+        return false;
+    };
+    if mining_state.progress != 0.0 {
+        return false;
+    }
+
+    let Some(snapshot) = ecs_runtime.camera_snapshot() else {
+        return false;
+    };
+    let block_id = chunk_streamer
+        .block_at_world(target.x, target.y, target.z)
+        .unwrap_or(AIR_BLOCK_ID);
+    let speed = alpha_block_mining_progress_per_tick(
+        block_id,
+        inventory,
+        snapshot.physics.on_ground,
+        snapshot.physics.in_water,
+    );
+    if speed >= 1.0 {
+        if let Some((drop_block_id, spawn_pos)) = alpha_break_block_and_collect_drop(
+            chunk_streamer,
+            target.x,
+            target.y,
+            target.z,
+            edit_latency_tracker,
+        ) {
+            crate::entity::spawn_dropped_item(ecs_runtime.world_mut(), drop_block_id, spawn_pos);
+            mining_state.on_block_broken();
+            return true;
+        }
+    }
+    false
+}
+
+fn tick_block_mining(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
+    inventory: &PlayerInventoryState,
+    mining_state: &mut MiningState,
+    edit_latency_tracker: &mut EditLatencyTracker,
+) -> bool {
+    mining_state.last_progress = mining_state.progress;
+    if mining_state.cooldown_ticks > 0 {
+        mining_state.cooldown_ticks = mining_state.cooldown_ticks.saturating_sub(1);
+        return false;
+    }
+
+    let Some(target) = raycast_current_mining_target(ecs_runtime, chunk_streamer, registry) else {
+        mining_state.stop();
+        return false;
+    };
+
+    let is_same_target = mining_state.target.is_some_and(|old| old == target);
+    if !is_same_target {
+        mining_state.retarget(target);
+        return false;
+    }
+
+    let Some(snapshot) = ecs_runtime.camera_snapshot() else {
+        return false;
+    };
+    let block_id = chunk_streamer
+        .block_at_world(target.x, target.y, target.z)
+        .unwrap_or(AIR_BLOCK_ID);
+    if block_id == AIR_BLOCK_ID {
+        mining_state.stop();
+        return false;
+    }
+
+    mining_state.progress += alpha_block_mining_progress_per_tick(
+        block_id,
+        inventory,
+        snapshot.physics.on_ground,
+        snapshot.physics.in_water,
+    );
+    mining_state.ticks += 1.0;
+    if mining_state.progress < 1.0 {
+        return false;
+    }
+
+    if let Some((drop_block_id, spawn_pos)) = alpha_break_block_and_collect_drop(
+        chunk_streamer,
+        target.x,
+        target.y,
+        target.z,
+        edit_latency_tracker,
+    ) {
+        crate::entity::spawn_dropped_item(ecs_runtime.world_mut(), drop_block_id, spawn_pos);
+        mining_state.on_block_broken();
+        return true;
+    }
+
+    false
+}
+
+fn enqueue_block_interaction_request(
+    ecs_runtime: &mut EcsRuntime,
+    queue: &mut VecDeque<BlockInteractionRequest>,
+) {
+    let Some((origin, direction)) = current_block_interaction_ray(ecs_runtime) else {
+        return;
+    };
+
     queue.push_back(BlockInteractionRequest {
         origin,
         direction,
-        kind,
     });
 }
 
-/// Process all queued block interaction requests. Returns a list of (block_id, position)
-/// pairs for items that should be spawned as dropped item entities.
 fn process_block_interaction_requests(
     chunk_streamer: &mut ChunkStreamer,
     queue: &mut VecDeque<BlockInteractionRequest>,
     edit_latency_tracker: &mut EditLatencyTracker,
     inventory: &mut PlayerInventoryState,
-) -> Vec<(u8, DVec3)> {
-    let mut item_spawns = Vec::new();
+) {
     while let Some(request) = queue.pop_front() {
         process_single_block_interaction_request(
             chunk_streamer,
             request,
             edit_latency_tracker,
             inventory,
-            &mut item_spawns,
         );
     }
-    item_spawns
 }
 
 fn process_single_block_interaction_request(
@@ -1280,7 +1626,6 @@ fn process_single_block_interaction_request(
     request: BlockInteractionRequest,
     edit_latency_tracker: &mut EditLatencyTracker,
     inventory: &mut PlayerInventoryState,
-    item_spawns: &mut Vec<(u8, DVec3)>,
 ) {
     let Some(hit) = raycast_first_solid_block(
         request.origin,
@@ -1291,53 +1636,28 @@ fn process_single_block_interaction_request(
         return;
     };
 
-    match request.kind {
-        BlockInteractionKind::Break => {
-            let broken_block_id = chunk_streamer
-                .block_at_world(hit.block[0], hit.block[1], hit.block[2])
-                .unwrap_or(AIR_BLOCK_ID);
-            if chunk_streamer.set_block_at_world(
-                hit.block[0],
-                hit.block[1],
-                hit.block[2],
-                AIR_BLOCK_ID,
-            ) {
-                if let Some(drop_block_id) = chunk_streamer.dropped_item_block_id(broken_block_id) {
-                    let spawn_pos = DVec3::new(
-                        hit.block[0] as f64 + 0.5,
-                        hit.block[1] as f64 + 0.5,
-                        hit.block[2] as f64 + 0.5,
-                    );
-                    item_spawns.push((drop_block_id, spawn_pos));
-                }
-                edit_latency_tracker.record_block_edit(hit.block[0], hit.block[2]);
-            }
-        }
-        BlockInteractionKind::Place => {
-            if hit.normal == [0, 0, 0] {
-                return;
-            }
-            let Some(block_id) = inventory.selected_block_id() else {
-                return;
-            };
-            let [x, y, z] = hit.block;
-            let Some(place_x) = x.checked_add(hit.normal[0]) else {
-                return;
-            };
-            let Some(place_y) = y.checked_add(hit.normal[1]) else {
-                return;
-            };
-            let Some(place_z) = z.checked_add(hit.normal[2]) else {
-                return;
-            };
+    if hit.normal == [0, 0, 0] {
+        return;
+    }
+    let Some(block_id) = inventory.selected_block_id() else {
+        return;
+    };
+    let [x, y, z] = hit.block;
+    let Some(place_x) = x.checked_add(hit.normal[0]) else {
+        return;
+    };
+    let Some(place_y) = y.checked_add(hit.normal[1]) else {
+        return;
+    };
+    let Some(place_z) = z.checked_add(hit.normal[2]) else {
+        return;
+    };
 
-            if chunk_streamer.block_at_world(place_x, place_y, place_z) == Some(AIR_BLOCK_ID)
-                && chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id)
-            {
-                let _ = inventory.apply(InventoryCommand::ConsumeSelected { amount: 1 });
-                edit_latency_tracker.record_block_edit(place_x, place_z);
-            }
-        }
+    if chunk_streamer.block_at_world(place_x, place_y, place_z) == Some(AIR_BLOCK_ID)
+        && chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id)
+    {
+        let _ = inventory.apply(InventoryCommand::ConsumeSelected { amount: 1 });
+        edit_latency_tracker.record_block_edit(place_x, place_z);
     }
 }
 
@@ -2617,11 +2937,13 @@ mod tests {
 
     use super::{
         affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
-        alpha_brightness_from_light_level, alpha_fog_brightness_target, alpha_star_brightness,
-        alpha_sunrise_color, alpha_time_of_day, has_target_directive, hotbar_slot_for_key,
-        parse_env_bool, parse_env_u32, raycast_first_solid_block, resolve_axis,
+        alpha_block_mining_progress_per_tick, alpha_brightness_from_light_level,
+        alpha_fog_brightness_target, alpha_star_brightness, alpha_sunrise_color,
+        alpha_time_of_day, has_target_directive, hotbar_slot_for_key, parse_env_bool,
+        parse_env_u32, raycast_first_solid_block, resolve_axis,
         AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID,
     };
+    use crate::inventory::PlayerInventoryState;
     use crate::streaming::{ChunkStreamer, ResidencyConfig};
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
 
@@ -2680,6 +3002,29 @@ mod tests {
         assert_eq!(hotbar_slot_for_key(KeyCode::Digit5), Some(4));
         assert_eq!(hotbar_slot_for_key(KeyCode::Digit9), Some(8));
         assert_eq!(hotbar_slot_for_key(KeyCode::KeyB), None);
+    }
+
+    #[test]
+    fn alpha_mining_progress_matches_hand_stone_rate() {
+        let inv = PlayerInventoryState::alpha_defaults();
+        let per_tick = alpha_block_mining_progress_per_tick(
+            1, // stone
+            &inv,
+            true,
+            false,
+        );
+        // 1.0 / 1.5 / 30.0
+        assert!((per_tick - (1.0 / 45.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn alpha_mining_progress_applies_water_and_airborne_penalties() {
+        let inv = PlayerInventoryState::alpha_defaults();
+        let grounded = alpha_block_mining_progress_per_tick(3, &inv, true, false);
+        let in_water = alpha_block_mining_progress_per_tick(3, &inv, true, true);
+        let airborne = alpha_block_mining_progress_per_tick(3, &inv, false, false);
+        assert!((in_water - grounded / 5.0).abs() < 1e-6);
+        assert!((airborne - grounded / 5.0).abs() < 1e-6);
     }
 
     #[test]
