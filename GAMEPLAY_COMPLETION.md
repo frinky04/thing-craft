@@ -19,7 +19,7 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [x] Light Spread: Sunlight and block light both spread with 1-level attenuation per step, including cross-chunk boundary seeding/propagation.
 - [x] Day/Night Cycle: Fixed-tick world time uses Alpha time-of-day and ambient-darkness curves; rendered skylight and fog transition through the cycle while preserving emitted block light.
 - [x] Distance Fog: Linear distance fog blending is active, and clear-fog color now uses Alpha-style player-brightness modulation (`fogBrightness` smoothing/interpolation with view-distance bias).
-- [~] Sky/Cloud Atmosphere: Alpha fog clear-color mixing, far/normal sky-color pass, and non-fancy moving cloud layer are implemented; sun/moon/stars/sunrise disc rendering is still pending.
+- [~] Sky/Cloud Atmosphere: Alpha fog clear-color mixing, far/normal sky-color pass, sun/moon + deterministic starfield rendering, and fancy 3D block cloud volume rendering are implemented; sunrise disc rendering is still pending.
 - [x] Alpha Test: Terrain shader now discards low-alpha texels (Alpha-style cutout behavior).
 - [x] Leaf Graphics Modes: Runtime now supports fancy cutout leaves and fast opaque leaves (via `THINGCRAFT_FANCY_GRAPHICS`), matching Alpha's visual mode split.
 

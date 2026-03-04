@@ -17,10 +17,14 @@ use crate::world::{ChunkPos, CHUNK_SECTION_COUNT, SECTION_HEIGHT};
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const DEFAULT_FOG_COLOR: [f32; 3] = [0.04, 0.07, 0.12];
 const BUFFER_POOL_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
-const CLOUD_LAYER_HEIGHT: f32 = 120.33;
-const CLOUD_UV_SCALE: f32 = 1.0 / 2048.0;
-const CLOUD_TILE_SIZE: f32 = 32.0;
-const CLOUD_GRID_RADIUS_TILES: i32 = 8;
+const CLOUD_LAYER_HEIGHT: f32 = 108.33;
+const CLOUD_TILE_SIZE: f32 = 8.0;
+const CLOUD_RENDER_RADIUS: i32 = 3;
+const CLOUD_THICKNESS: f32 = 4.0;
+const CLOUD_EDGE_EPSILON: f32 = 1.0 / 1024.0;
+const CLOUD_WORLD_SCALE: f32 = 12.0;
+const CLOUD_TEXEL_UV: f32 = 1.0 / 256.0;
+const CLOUD_ALPHA: f32 = 0.8;
 
 pub struct Renderer<'w> {
     surface: wgpu::Surface<'w>,
@@ -33,12 +37,17 @@ pub struct Renderer<'w> {
     debug_line_pipeline: wgpu::RenderPipeline,
     block_outline_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    stars_pipeline: wgpu::RenderPipeline,
+    cloud_depth_pipeline: wgpu::RenderPipeline,
     cloud_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     sky_uniform_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
     sky_dome: SkyDome,
+    stars_uniform_buffer: wgpu::Buffer,
+    stars_bind_group: wgpu::BindGroup,
+    starfield: Starfield,
     celestial_pipeline: wgpu::RenderPipeline,
     celestial_bodies: CelestialBodies,
     terrain_atlas: TerrainAtlas,
@@ -70,6 +79,7 @@ pub struct Renderer<'w> {
     render_sky: bool,
     cloud_color: [f32; 3],
     cloud_scroll: f32,
+    star_brightness: f32,
     ambient_darkness: f32,
     leaf_cutout_enabled: f32,
     camera_pos: [f32; 3],
@@ -227,6 +237,39 @@ struct SkyDome {
     dark_index_count: u32,
 }
 
+struct Starfield {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct StarsUniform {
+    sky_view_proj: [[f32; 4]; 4],
+    brightness: f32,
+    _pad: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct StarVertex {
+    position: [f32; 3],
+}
+
+impl StarVertex {
+    const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+
+    #[must_use]
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
 /// Celestial bodies (sun + moon): textured quads rotated by time of day.
 struct CelestialBodies {
     uniform_bind_group: wgpu::BindGroup,
@@ -278,10 +321,10 @@ impl CelestialVertex {
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct CloudUniform {
-    origin: [f32; 3],
+    camera_origin: [f32; 3],
     alpha: f32,
-    uv_offset: [f32; 2],
-    _pad0: [f32; 2],
+    uv_base: [f32; 2],
+    uv_frac: [f32; 2],
     color: [f32; 3],
     _pad1: f32,
 }
@@ -289,11 +332,19 @@ struct CloudUniform {
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct CloudVertex {
-    local_pos: [f32; 2],
+    local_pos: [f32; 3],
+    uv: [f32; 2],
+    shade: f32,
+    face_kind: f32,
 }
 
 impl CloudVertex {
-    const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x2];
+    const ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x2,
+        2 => Float32,
+        3 => Float32
+    ];
 
     #[must_use]
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -674,6 +725,39 @@ impl<'w> Renderer<'w> {
         });
 
         let sky_dome = create_sky_dome(&device);
+        let stars_uniform = StarsUniform {
+            sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            brightness: 0.0,
+            _pad: [0.0; 3],
+        };
+        let stars_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("thingcraft-stars-uniform-buffer"),
+            contents: bytemuck::bytes_of(&stars_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let stars_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-stars-bind-group-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let stars_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thingcraft-stars-bind-group"),
+            layout: &stars_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: stars_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let starfield = create_starfield(&device);
 
         // Celestial body texture bind group layout (shared with cloud-style layout).
         let celestial_tex_bind_group_layout =
@@ -1015,6 +1099,70 @@ impl<'w> Renderer<'w> {
             multiview: None,
         });
 
+        let stars_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-stars-shader"),
+            source: wgpu::ShaderSource::Wgsl(STARS_SHADER.into()),
+        });
+        let stars_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("thingcraft-stars-pipeline-layout"),
+                bind_group_layouts: &[&stars_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let stars_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-stars-pipeline"),
+            layout: Some(&stars_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &stars_shader,
+                entry_point: "vs_main",
+                buffers: &[StarVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &stars_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+
         let cloud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("thingcraft-cloud-shader"),
             source: wgpu::ShaderSource::Wgsl(CLOUD_SHADER.into()),
@@ -1066,6 +1214,48 @@ impl<'w> Renderer<'w> {
                     format: config.format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+        let cloud_depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-cloud-depth-pipeline"),
+            layout: Some(&cloud_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &cloud_shader,
+                entry_point: "vs_main",
+                buffers: &[CloudVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cloud_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
@@ -1556,12 +1746,17 @@ impl<'w> Renderer<'w> {
             debug_line_pipeline,
             block_outline_pipeline,
             sky_pipeline,
+            stars_pipeline,
+            cloud_depth_pipeline,
             cloud_pipeline,
             camera_buffer,
             camera_bind_group,
             sky_uniform_buffer,
             sky_bind_group,
             sky_dome,
+            stars_uniform_buffer,
+            stars_bind_group,
+            starfield,
             celestial_pipeline,
             celestial_bodies,
             terrain_atlas,
@@ -1592,6 +1787,7 @@ impl<'w> Renderer<'w> {
             render_sky: false,
             cloud_color: [1.0, 1.0, 1.0],
             cloud_scroll: 0.0,
+            star_brightness: 0.0,
             ambient_darkness: 0.0,
             leaf_cutout_enabled: 1.0,
             camera_pos: [0.0; 3],
@@ -1665,6 +1861,10 @@ impl<'w> Renderer<'w> {
     pub fn set_cloud_state(&mut self, cloud_color: [f32; 3], cloud_scroll: f32) {
         self.cloud_color = cloud_color;
         self.cloud_scroll = cloud_scroll;
+    }
+
+    pub fn set_star_brightness(&mut self, brightness: f32) {
+        self.star_brightness = brightness.clamp(0.0, 1.0);
     }
 
     pub fn set_scene_mesh(&mut self, mesh: &ChunkMesh) {
@@ -1928,6 +2128,16 @@ impl<'w> Renderer<'w> {
             .write_buffer(&self.sky_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
+    fn update_stars_uniform(&mut self) {
+        let uniform = StarsUniform {
+            sky_view_proj: self.cached_sky_view_proj,
+            brightness: self.star_brightness.clamp(0.0, 1.0),
+            _pad: [0.0; 3],
+        };
+        self.queue
+            .write_buffer(&self.stars_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
     fn update_celestial_uniform(&mut self) {
         let uniform = CelestialUniform {
             view_proj: self.cached_sky_view_proj,
@@ -1943,11 +2153,18 @@ impl<'w> Renderer<'w> {
     }
 
     fn update_cloud_uniform(&mut self) {
+        let cloud_x = (self.camera_pos[0] + self.cloud_scroll) / CLOUD_WORLD_SCALE;
+        let cloud_z = self.camera_pos[2] / CLOUD_WORLD_SCALE + 0.33;
+        let cloud_x_floor = cloud_x.floor();
+        let cloud_z_floor = cloud_z.floor();
         let uniform = CloudUniform {
-            origin: [self.camera_pos[0], CLOUD_LAYER_HEIGHT, self.camera_pos[2]],
-            alpha: 0.8,
-            uv_offset: [self.cloud_scroll * CLOUD_UV_SCALE, 0.0],
-            _pad0: [0.0; 2],
+            camera_origin: [self.camera_pos[0], CLOUD_LAYER_HEIGHT, self.camera_pos[2]],
+            alpha: CLOUD_ALPHA,
+            uv_base: [
+                cloud_x_floor * CLOUD_TEXEL_UV,
+                cloud_z_floor * CLOUD_TEXEL_UV,
+            ],
+            uv_frac: [cloud_x - cloud_x_floor, cloud_z - cloud_z_floor],
             color: self.cloud_color,
             _pad1: 0.0,
         };
@@ -2003,6 +2220,7 @@ impl<'w> Renderer<'w> {
 
         self.refresh_chunk_border_mesh_if_dirty();
         self.update_sky_uniform();
+        self.update_stars_uniform();
         self.update_celestial_uniform();
 
         let output = self
@@ -2101,6 +2319,17 @@ impl<'w> Renderer<'w> {
                     0,
                     0..1,
                 );
+
+                if self.star_brightness > 0.0 {
+                    render_pass.set_pipeline(&self.stars_pipeline);
+                    render_pass.set_bind_group(0, &self.stars_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, self.starfield.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        self.starfield.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.draw_indexed(0..self.starfield.index_count, 0, 0..1);
+                }
             }
 
             if let Some(scene_mesh) = &self.scene_mesh {
@@ -2209,7 +2438,8 @@ impl<'w> Renderer<'w> {
                 render_pass.draw(0..outline.vertex_count, 0..1);
             }
 
-            render_pass.set_pipeline(&self.cloud_pipeline);
+            // Alpha fancy-cloud parity: write cloud depth first (no color), then blend color.
+            render_pass.set_pipeline(&self.cloud_depth_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_bind_group(1, &self.cloud_layer.bind_group, &[]);
             render_pass.set_bind_group(2, &self.cloud_layer.uniform_bind_group, &[]);
@@ -2218,6 +2448,8 @@ impl<'w> Renderer<'w> {
                 self.cloud_layer.index_buffer.slice(..),
                 wgpu::IndexFormat::Uint32,
             );
+            render_pass.draw_indexed(0..self.cloud_layer.index_count, 0, 0..1);
+            render_pass.set_pipeline(&self.cloud_pipeline);
             render_pass.draw_indexed(0..self.cloud_layer.index_count, 0, 0..1);
 
             if self.chunk_border_debug_enabled {
@@ -2605,6 +2837,114 @@ fn create_sky_dome(device: &wgpu::Device) -> SkyDome {
     }
 }
 
+fn create_starfield(device: &wgpu::Device) -> Starfield {
+    let (vertices, indices) = build_alpha_starfield_mesh();
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-stars-vertex-buffer"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("thingcraft-stars-index-buffer"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    Starfield {
+        vertex_buffer,
+        index_buffer,
+        index_count: indices.len() as u32,
+    }
+}
+
+fn build_alpha_starfield_mesh() -> (Vec<StarVertex>, Vec<u32>) {
+    let mut rng = JavaRandom::new(10_842);
+    let mut vertices = Vec::with_capacity(1_500 * 4);
+    let mut indices = Vec::with_capacity(1_500 * 6);
+
+    for _ in 0..1_500 {
+        let mut dx = rng.next_f32() as f64 * 2.0 - 1.0;
+        let mut dy = rng.next_f32() as f64 * 2.0 - 1.0;
+        let mut dz = rng.next_f32() as f64 * 2.0 - 1.0;
+        let size = 0.25 + rng.next_f32() as f64 * 0.25;
+        let mut length_sq = dx * dx + dy * dy + dz * dz;
+        if length_sq >= 1.0 || length_sq <= 0.01 {
+            continue;
+        }
+        length_sq = 1.0 / length_sq.sqrt();
+        dx *= length_sq;
+        dy *= length_sq;
+        dz *= length_sq;
+
+        let px = dx * 100.0;
+        let py = dy * 100.0;
+        let pz = dz * 100.0;
+        let yaw = dx.atan2(dz);
+        let sin_yaw = yaw.sin();
+        let cos_yaw = yaw.cos();
+        let pitch = (dx * dx + dz * dz).sqrt().atan2(dy);
+        let sin_pitch = pitch.sin();
+        let cos_pitch = pitch.cos();
+        let roll = rng.next_f64() * std::f64::consts::PI * 2.0;
+        let sin_roll = roll.sin();
+        let cos_roll = roll.cos();
+
+        let base = vertices.len() as u32;
+        for corner in 0..4 {
+            let x = ((corner & 2) as f64 - 1.0) * size;
+            let y = (((corner + 1) & 2) as f64 - 1.0) * size;
+            let z = 0.0_f64;
+            let aa = x * cos_roll - y * sin_roll;
+            let ac = y * cos_roll + x * sin_roll;
+            let ad = aa * sin_pitch + z * cos_pitch;
+            let ae = z * sin_pitch - aa * cos_pitch;
+            let af = ae * sin_yaw - ac * cos_yaw;
+            let ag = ad;
+            let ah = ac * sin_yaw + ae * cos_yaw;
+            vertices.push(StarVertex {
+                position: [(px + af) as f32, (py + ag) as f32, (pz + ah) as f32],
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    (vertices, indices)
+}
+
+struct JavaRandom {
+    seed: u64,
+}
+
+impl JavaRandom {
+    const MULTIPLIER: u64 = 0x5DEECE66D;
+    const ADDEND: u64 = 0xB;
+    const MASK: u64 = (1_u64 << 48) - 1;
+
+    fn new(seed: i64) -> Self {
+        Self {
+            seed: ((seed as u64) ^ Self::MULTIPLIER) & Self::MASK,
+        }
+    }
+
+    fn next_bits(&mut self, bits: u32) -> u32 {
+        self.seed = (self
+            .seed
+            .wrapping_mul(Self::MULTIPLIER)
+            .wrapping_add(Self::ADDEND))
+            & Self::MASK;
+        (self.seed >> (48 - bits)) as u32
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        self.next_bits(24) as f32 / (1_u32 << 24) as f32
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        let high = self.next_bits(26) as u64;
+        let low = self.next_bits(27) as u64;
+        ((high << 27) | low) as f64 / (1_u64 << 53) as f64
+    }
+}
+
 /// Build the 12-edge wireframe for a block outline, inflated by 0.002 to prevent z-fighting.
 /// Color: black at 40% opacity, matching MC Alpha's `renderBlockOutline`.
 fn build_block_outline_vertices(block: [i32; 3]) -> Vec<OutlineVertex> {
@@ -2950,8 +3290,8 @@ fn create_cloud_layer(
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
         address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
         mipmap_filter: wgpu::FilterMode::Nearest,
         ..Default::default()
     });
@@ -2971,10 +3311,10 @@ fn create_cloud_layer(
     });
 
     let cloud_uniform = CloudUniform {
-        origin: [0.0, CLOUD_LAYER_HEIGHT, 0.0],
-        alpha: 0.8,
-        uv_offset: [0.0, 0.0],
-        _pad0: [0.0; 2],
+        camera_origin: [0.0, CLOUD_LAYER_HEIGHT, 0.0],
+        alpha: CLOUD_ALPHA,
+        uv_base: [0.0, 0.0],
+        uv_frac: [0.0, 0.0],
         color: [1.0, 1.0, 1.0],
         _pad1: 0.0,
     };
@@ -2992,7 +3332,7 @@ fn create_cloud_layer(
         }],
     });
 
-    let (vertices, indices) = build_cloud_grid_mesh();
+    let (vertices, indices) = build_fancy_cloud_mesh();
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("thingcraft-cloud-vertex-buffer"),
         contents: bytemuck::cast_slice(&vertices),
@@ -3014,36 +3354,181 @@ fn create_cloud_layer(
     }
 }
 
-fn build_cloud_grid_mesh() -> (Vec<CloudVertex>, Vec<u32>) {
-    let extent = CLOUD_GRID_RADIUS_TILES as f32 * CLOUD_TILE_SIZE;
-    let tiles_per_axis = CLOUD_GRID_RADIUS_TILES * 2;
-    let mut vertices = Vec::with_capacity((tiles_per_axis * tiles_per_axis * 4) as usize);
-    let mut indices = Vec::with_capacity((tiles_per_axis * tiles_per_axis * 6) as usize);
+fn build_fancy_cloud_mesh() -> (Vec<CloudVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let tile = CLOUD_TILE_SIZE;
+    let y0 = 0.0_f32;
+    let y1 = CLOUD_THICKNESS;
+    let y_top = y1 - CLOUD_EDGE_EPSILON;
+    let max_tile = CLOUD_RENDER_RADIUS;
 
-    for z in 0..tiles_per_axis {
-        for x in 0..tiles_per_axis {
-            let x0 = -extent + x as f32 * CLOUD_TILE_SIZE;
-            let z0 = -extent + z as f32 * CLOUD_TILE_SIZE;
-            let x1 = x0 + CLOUD_TILE_SIZE;
-            let z1 = z0 + CLOUD_TILE_SIZE;
-            let base = vertices.len() as u32;
-            vertices.push(CloudVertex {
-                local_pos: [x0, z0],
-            });
-            vertices.push(CloudVertex {
-                local_pos: [x1, z0],
-            });
-            vertices.push(CloudVertex {
-                local_pos: [x1, z1],
-            });
-            vertices.push(CloudVertex {
-                local_pos: [x0, z1],
-            });
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    for tile_z in (-max_tile + 1)..=max_tile {
+        for tile_x in (-max_tile + 1)..=max_tile {
+            let ac = tile_x as f32 * tile;
+            let ad = tile_z as f32 * tile;
+            let x0 = ac;
+            let x1 = ac + tile;
+            let z0 = ad;
+            let z1 = ad + tile;
+
+            append_cloud_quad(
+                &mut vertices,
+                &mut indices,
+                [x0, y0, z1],
+                [x1, y0, z1],
+                [x1, y0, z0],
+                [x0, y0, z0],
+                [x0 * CLOUD_TEXEL_UV, z1 * CLOUD_TEXEL_UV],
+                [x1 * CLOUD_TEXEL_UV, z1 * CLOUD_TEXEL_UV],
+                [x1 * CLOUD_TEXEL_UV, z0 * CLOUD_TEXEL_UV],
+                [x0 * CLOUD_TEXEL_UV, z0 * CLOUD_TEXEL_UV],
+                0.7,
+                0.0,
+            );
+            append_cloud_quad(
+                &mut vertices,
+                &mut indices,
+                [x0, y_top, z1],
+                [x1, y_top, z1],
+                [x1, y_top, z0],
+                [x0, y_top, z0],
+                [x0 * CLOUD_TEXEL_UV, z1 * CLOUD_TEXEL_UV],
+                [x1 * CLOUD_TEXEL_UV, z1 * CLOUD_TEXEL_UV],
+                [x1 * CLOUD_TEXEL_UV, z0 * CLOUD_TEXEL_UV],
+                [x0 * CLOUD_TEXEL_UV, z0 * CLOUD_TEXEL_UV],
+                1.0,
+                1.0,
+            );
+
+            if tile_x > -1 {
+                for strip in 0..(tile as i32) {
+                    let x = ac + strip as f32;
+                    let uv_x = (ac + strip as f32 + 0.5) * CLOUD_TEXEL_UV;
+                    append_cloud_quad(
+                        &mut vertices,
+                        &mut indices,
+                        [x, y0, z1],
+                        [x, y1, z1],
+                        [x, y1, z0],
+                        [x, y0, z0],
+                        [uv_x, z1 * CLOUD_TEXEL_UV],
+                        [uv_x, z1 * CLOUD_TEXEL_UV],
+                        [uv_x, z0 * CLOUD_TEXEL_UV],
+                        [uv_x, z0 * CLOUD_TEXEL_UV],
+                        0.9,
+                        2.0,
+                    );
+                }
+            }
+            if tile_x <= 1 {
+                for strip in 0..(tile as i32) {
+                    let x = ac + strip as f32 + 1.0 - CLOUD_EDGE_EPSILON;
+                    let uv_x = (ac + strip as f32 + 0.5) * CLOUD_TEXEL_UV;
+                    append_cloud_quad(
+                        &mut vertices,
+                        &mut indices,
+                        [x, y0, z1],
+                        [x, y1, z1],
+                        [x, y1, z0],
+                        [x, y0, z0],
+                        [uv_x, z1 * CLOUD_TEXEL_UV],
+                        [uv_x, z1 * CLOUD_TEXEL_UV],
+                        [uv_x, z0 * CLOUD_TEXEL_UV],
+                        [uv_x, z0 * CLOUD_TEXEL_UV],
+                        0.9,
+                        2.0,
+                    );
+                }
+            }
+
+            if tile_z > -1 {
+                for strip in 0..(tile as i32) {
+                    let z = ad + strip as f32;
+                    let uv_z = (ad + strip as f32 + 0.5) * CLOUD_TEXEL_UV;
+                    append_cloud_quad(
+                        &mut vertices,
+                        &mut indices,
+                        [x0, y1, z],
+                        [x1, y1, z],
+                        [x1, y0, z],
+                        [x0, y0, z],
+                        [x0 * CLOUD_TEXEL_UV, uv_z],
+                        [x1 * CLOUD_TEXEL_UV, uv_z],
+                        [x1 * CLOUD_TEXEL_UV, uv_z],
+                        [x0 * CLOUD_TEXEL_UV, uv_z],
+                        0.8,
+                        2.0,
+                    );
+                }
+            }
+            if tile_z <= 1 {
+                for strip in 0..(tile as i32) {
+                    let z = ad + strip as f32 + 1.0 - CLOUD_EDGE_EPSILON;
+                    let uv_z = (ad + strip as f32 + 0.5) * CLOUD_TEXEL_UV;
+                    append_cloud_quad(
+                        &mut vertices,
+                        &mut indices,
+                        [x0, y1, z],
+                        [x1, y1, z],
+                        [x1, y0, z],
+                        [x0, y0, z],
+                        [x0 * CLOUD_TEXEL_UV, uv_z],
+                        [x1 * CLOUD_TEXEL_UV, uv_z],
+                        [x1 * CLOUD_TEXEL_UV, uv_z],
+                        [x0 * CLOUD_TEXEL_UV, uv_z],
+                        0.8,
+                        2.0,
+                    );
+                }
+            }
         }
     }
 
     (vertices, indices)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_cloud_quad(
+    vertices: &mut Vec<CloudVertex>,
+    indices: &mut Vec<u32>,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    uv0: [f32; 2],
+    uv1: [f32; 2],
+    uv2: [f32; 2],
+    uv3: [f32; 2],
+    shade: f32,
+    face_kind: f32,
+) {
+    let base = vertices.len() as u32;
+    vertices.push(CloudVertex {
+        local_pos: p0,
+        uv: uv0,
+        shade,
+        face_kind,
+    });
+    vertices.push(CloudVertex {
+        local_pos: p1,
+        uv: uv1,
+        shade,
+        face_kind,
+    });
+    vertices.push(CloudVertex {
+        local_pos: p2,
+        uv: uv2,
+        shade,
+        face_kind,
+    });
+    vertices.push(CloudVertex {
+        local_pos: p3,
+        uv: uv3,
+        shade,
+        face_kind,
+    });
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 fn create_terrain_atlas(
@@ -3610,6 +4095,38 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const STARS_SHADER: &str = r#"
+struct Stars {
+    sky_view_proj: mat4x4<f32>,
+    brightness: f32,
+    _pad: vec3<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> stars: Stars;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.clip_pos = stars.sky_view_proj * vec4<f32>(input.position, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_main(_input: VertexOut) -> @location(0) vec4<f32> {
+    let b = clamp(stars.brightness, 0.0, 1.0);
+    return vec4<f32>(b, b, b, b);
+}
+"#;
+
 const CLOUD_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -3623,10 +4140,10 @@ struct Camera {
 };
 
 struct Cloud {
-    origin: vec3<f32>,
+    camera_origin: vec3<f32>,
     alpha: f32,
-    uv_offset: vec2<f32>,
-    _pad0: vec2<f32>,
+    uv_base: vec2<f32>,
+    uv_frac: vec2<f32>,
     color: vec3<f32>,
     _pad1: f32,
 };
@@ -3644,30 +4161,51 @@ var cloud_sampler: sampler;
 var<uniform> cloud: Cloud;
 
 struct VertexIn {
-    @location(0) local_pos: vec2<f32>,
+    @location(0) local_pos: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) shade: f32,
+    @location(3) face_kind: f32,
 };
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) world_pos: vec3<f32>,
+    @location(2) shade: f32,
+    @location(3) face_kind: f32,
 };
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
-    let world_pos = vec3<f32>(input.local_pos.x + cloud.origin.x, cloud.origin.y, input.local_pos.y + cloud.origin.z);
+    let world_pos = vec3<f32>(
+        (input.local_pos.x - cloud.uv_frac.x) * 12.0 + cloud.camera_origin.x,
+        input.local_pos.y + cloud.camera_origin.y,
+        (input.local_pos.z - cloud.uv_frac.y) * 12.0 + cloud.camera_origin.z
+    );
     out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
-    out.uv = world_pos.xz * 0.00048828125 + cloud.uv_offset;
+    out.uv = input.uv + cloud.uv_base;
     out.world_pos = world_pos;
+    out.shade = input.shade;
+    out.face_kind = input.face_kind;
     return out;
 }
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    // Face visibility parity with Alpha fancy clouds.
+    if (input.face_kind < 0.5 && camera.camera_pos.y > 113.33) {
+        discard;
+    }
+    if (input.face_kind > 0.5 && input.face_kind < 1.5 && camera.camera_pos.y < 103.33) {
+        discard;
+    }
     let texel = textureSample(cloud_texture, cloud_sampler, input.uv);
+    if (texel.a <= 0.1) {
+        discard;
+    }
     let alpha = texel.a * cloud.alpha;
-    let base = texel.rgb * cloud.color;
+    let base = texel.rgb * cloud.color * input.shade;
     let distance_to_camera = distance(input.world_pos, camera.camera_pos);
     let fog_span = max(camera.fog_end - camera.fog_start, 0.0001);
     let fog_t = clamp((distance_to_camera - camera.fog_start) / fog_span, 0.0, 1.0);
@@ -3804,7 +4342,8 @@ mod tests {
     use glam::{Mat4, Vec3};
 
     use super::{
-        build_chunk_border_vertices, build_chunk_status_vertices, chunk_aabb, FrustumPlanes,
+        build_alpha_starfield_mesh, build_chunk_border_vertices, build_chunk_status_vertices,
+        build_fancy_cloud_mesh, chunk_aabb, FrustumPlanes,
     };
     use crate::streaming::{ChunkDebugState, ChunkResidencyState};
     use crate::world::ChunkPos;
@@ -3847,5 +4386,30 @@ mod tests {
             .into_iter(),
         );
         assert_eq!(vertices.len(), 6);
+    }
+
+    #[test]
+    fn alpha_starfield_mesh_contains_expected_geometry() {
+        let (vertices, indices) = build_alpha_starfield_mesh();
+        assert!(!vertices.is_empty());
+        assert!(!indices.is_empty());
+        assert_eq!(vertices.len() % 4, 0);
+        assert_eq!(indices.len() % 6, 0);
+    }
+
+    #[test]
+    fn fancy_cloud_mesh_contains_top_bottom_and_side_faces() {
+        let (vertices, indices) = build_fancy_cloud_mesh();
+        assert!(!vertices.is_empty());
+        assert!(!indices.is_empty());
+        assert!(vertices
+            .iter()
+            .any(|v| (v.face_kind - 0.0).abs() < f32::EPSILON));
+        assert!(vertices
+            .iter()
+            .any(|v| (v.face_kind - 1.0).abs() < f32::EPSILON));
+        assert!(vertices
+            .iter()
+            .any(|v| (v.face_kind - 2.0).abs() < f32::EPSILON));
     }
 }

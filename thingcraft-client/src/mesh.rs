@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::f32::consts::FRAC_PI_2;
+use std::sync::OnceLock;
 
 use crate::world::{
     BiomeTintKind, BlockRegistry, ChunkData, ChunkPos, CHUNK_DEPTH, CHUNK_EDGE_SLICE_VOLUME,
