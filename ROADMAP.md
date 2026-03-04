@@ -17,6 +17,7 @@
 - Atmosphere parity follow-up landed during M7: fog clear color now follows Alpha sky/fog biome blending rules, far/normal view distances now render a dedicated sky pass (Alpha-like blue daytime sky), and a non-fancy Alpha cloud layer (`environment/clouds.png`, Y=120.33, 0.03 scroll speed, day-tinted cloud color) is rendered with depth-aware blending + fog.
 - Fog parity follow-up landed during M7: clear-fog color is now multiplied by Alpha-style smoothed player-position fog brightness (`world.getBrightness` + view-distance bias + tick smoothing/interpolation), restoring underground/shadow fog darkening behavior.
 - Leaf rendering parity follow-up landed during M7: leaf vertices now carry a dedicated material marker and runtime `THINGCRAFT_FANCY_GRAPHICS` controls fancy cutout leaves (`true`) vs fast opaque leaves (`false`, with Alpha tile `+1` remap).
+- M7 Wave 5 landed: entity framework and dropped item entities. Breaking a block now spawns a physics-driven item entity (Alpha ItemEntity constants: gravity 0.04, bounce -0.5, ground friction 0.588, 10-tick pickup delay, 5-minute despawn) that the player collects by walking over it. Items render as Y-axis billboarded terrain atlas sprites with bobbing animation, drawn via the existing chunk shader pipeline in a single batched draw call.
 
 ## M0 - Repository Foundation
 

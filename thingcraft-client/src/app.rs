@@ -82,7 +82,7 @@ impl Default for HotbarSlot {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct HotbarInventory {
+pub(crate) struct HotbarInventory {
     slots: [HotbarSlot; HOTBAR_BLOCK_IDS.len()],
 }
 
@@ -152,7 +152,7 @@ impl HotbarInventory {
         true
     }
 
-    fn try_pickup_block(&mut self, block_id: u8) -> bool {
+    pub(crate) fn try_pickup_block(&mut self, block_id: u8) -> bool {
         if block_id == AIR_BLOCK_ID {
             return false;
         }
@@ -464,13 +464,39 @@ pub fn run() -> Result<()> {
                             &bootstrap_world.registry,
                             fly_mode,
                         );
+                        // Entity framework ticks.
+                        crate::entity::tick_entity_ages(ecs_runtime.world_mut());
+                        crate::entity::tick_entity_physics(
+                            ecs_runtime.world_mut(),
+                            &chunk_streamer,
+                            &bootstrap_world.registry,
+                        );
+
                         let pre_inv = hotbar_inventory.snapshot_counts();
-                        process_block_interaction_requests(
+
+                        // Item pickup (player walks over dropped items).
+                        if crate::entity::check_item_pickup(
+                            ecs_runtime.world_mut(),
+                            &mut hotbar_inventory,
+                        ) {
+                            hud_dirty = true;
+                        }
+
+                        // Block interactions (break/place).
+                        let item_spawns = process_block_interaction_requests(
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
                             &mut edit_latency_tracker,
                             &mut hotbar_inventory,
                         );
+                        for (block_id, spawn_pos) in item_spawns {
+                            crate::entity::spawn_dropped_item(
+                                ecs_runtime.world_mut(),
+                                block_id,
+                                spawn_pos,
+                            );
+                        }
+
                         if hotbar_inventory.snapshot_counts() != pre_inv {
                             hud_dirty = true;
                         }
@@ -530,6 +556,7 @@ pub fn run() -> Result<()> {
                         + (fog_brightness - last_fog_brightness) * render_alpha)
                         .clamp(0.0, 1.0);
                     ecs_runtime.run_render_prep(render_alpha);
+
                     let mut frame_camera: Option<crate::ecs::CameraSnapshot> = None;
                     let mut camera_chunk = ChunkPos { x: 0, z: 0 };
                     let time_of_day = alpha_time_of_day(sim_ticks.wrapping_add(time_offset_ticks), render_alpha);
@@ -540,6 +567,27 @@ pub fn run() -> Result<()> {
                     renderer.set_cloud_state(cloud_color, cloud_scroll);
                     renderer.set_time_of_day(time_of_day);
                     if let Some(snapshot) = ecs_runtime.camera_snapshot() {
+                        // Build entity sprite mesh for this frame.
+                        let entity_mesh = crate::entity::build_entity_sprite_mesh(
+                            ecs_runtime.world_mut(),
+                            snapshot.interpolated.yaw,
+                            &bootstrap_world.registry,
+                            &chunk_streamer,
+                            ambient_darkness,
+                            render_alpha,
+                        );
+                        renderer.update_entity_sprites(&entity_mesh);
+
+                        let shadow_mesh = crate::entity::build_entity_shadow_mesh(
+                            ecs_runtime.world_mut(),
+                            &chunk_streamer,
+                            &bootstrap_world.registry,
+                            ambient_darkness,
+                            snapshot.interpolated.position.to_array(),
+                            render_alpha,
+                        );
+                        renderer.update_entity_shadows(&shadow_mesh);
+
                         let biome_sample = biome_source.sample(
                             snapshot.authoritative.position.x.floor() as i32,
                             snapshot.authoritative.position.z.floor() as i32,
@@ -884,20 +932,25 @@ fn enqueue_block_interaction_request(
     });
 }
 
+/// Process all queued block interaction requests. Returns a list of (block_id, position)
+/// pairs for items that should be spawned as dropped item entities.
 fn process_block_interaction_requests(
     chunk_streamer: &mut ChunkStreamer,
     queue: &mut VecDeque<BlockInteractionRequest>,
     edit_latency_tracker: &mut EditLatencyTracker,
     hotbar_inventory: &mut HotbarInventory,
-) {
+) -> Vec<(u8, DVec3)> {
+    let mut item_spawns = Vec::new();
     while let Some(request) = queue.pop_front() {
         process_single_block_interaction_request(
             chunk_streamer,
             request,
             edit_latency_tracker,
             hotbar_inventory,
+            &mut item_spawns,
         );
     }
+    item_spawns
 }
 
 fn process_single_block_interaction_request(
@@ -905,6 +958,7 @@ fn process_single_block_interaction_request(
     request: BlockInteractionRequest,
     edit_latency_tracker: &mut EditLatencyTracker,
     hotbar_inventory: &mut HotbarInventory,
+    item_spawns: &mut Vec<(u8, DVec3)>,
 ) {
     let Some(hit) = raycast_first_solid_block(
         request.origin,
@@ -926,7 +980,14 @@ fn process_single_block_interaction_request(
                 hit.block[2],
                 AIR_BLOCK_ID,
             ) {
-                hotbar_inventory.try_pickup_block(broken_block_id);
+                if broken_block_id != AIR_BLOCK_ID {
+                    let spawn_pos = DVec3::new(
+                        hit.block[0] as f64 + 0.5,
+                        hit.block[1] as f64 + 0.5,
+                        hit.block[2] as f64 + 0.5,
+                    );
+                    item_spawns.push((broken_block_id, spawn_pos));
+                }
                 edit_latency_tracker.record_block_edit(hit.block[0], hit.block[2]);
             }
         }
@@ -1554,7 +1615,7 @@ fn resolve_player_physics(
 
 /// Collect AABBs of all solid blocks overlapping the given region into `out`.
 /// Clears `out` before filling — reuse across calls to avoid allocation.
-fn collect_solid_block_aabbs(
+pub(crate) fn collect_solid_block_aabbs(
     out: &mut Vec<[f64; 6]>,
     chunk_streamer: &ChunkStreamer,
     registry: &BlockRegistry,
@@ -1594,7 +1655,7 @@ fn collect_solid_block_aabbs(
 
 /// Resolve movement along a single axis against block AABBs. Returns clamped delta.
 /// `axis`: 0=X, 1=Y, 2=Z. The perpendicular axes are checked for overlap.
-fn resolve_axis(
+pub(crate) fn resolve_axis(
     pos: DVec3,
     half_w: f64,
     height: f64,

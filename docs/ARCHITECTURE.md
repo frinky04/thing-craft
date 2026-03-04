@@ -80,6 +80,17 @@ This allows future network packets to feed the same command path without forking
 - Terrain vertex payload now carries separate sky-light and block-light channels plus face-scale factors; fragment shading combines them per-frame (`max(block, sky-ambient_darkness)`) so daylight transitions do not require full chunk relighting.
 - Liquid simulation is queue-driven and budgeted per fixed tick. Runtime tracks scheduled liquid cells in loaded chunks, updates metadata depth/source-flowing states, and applies lava-water conversion to obsidian/cobblestone while reusing existing dirty-lighting/dirty-mesh propagation hooks.
 
+## Entity Framework
+
+- Non-player entities are full bevy_ecs entities with their own component set (`DroppedItem`, `EntityPhysics`, `EntityAge`, `PickupDelay`, `BobOffset`, `EntityRenderPos`).
+- Authoritative position reuses the existing `Transform64` component (f64 precision, prev_position for interpolation).
+- Entity physics is simplified vs. player: no step-up, no input-driven acceleration. Uses Alpha ItemEntity constants (gravity 0.04, bounce -0.5, ground friction 0.588, air drag 0.98).
+- Solid-block ejection pushes entities toward the nearest open face when embedded inside a solid block.
+- AABB collision resolution reuses `collect_solid_block_aabbs` / `resolve_axis` from the player physics path.
+- Entity lifecycle ticks (age/pickup delay/despawn) and physics run as free functions called from the main tick loop, not scheduled systems — same pattern as `resolve_player_physics`.
+- Item pickup is an AABB overlap test between player and dropped items, run after entity physics each tick.
+- Entity sprite rendering generates a single batched vertex/index buffer of Y-axis billboard quads per frame using the existing `MeshVertex` format, terrain atlas UVs, and the chunk shader pipeline. No new GPU pipeline or shader needed.
+
 ## Early Pitfalls to Avoid
 
 - Running chunk generation/meshing/lighting in render callbacks.

@@ -169,7 +169,10 @@ impl EcsRuntime {
         fixed_schedule.add_systems((consume_commands_system, apply_player_motion_system).chain());
 
         let mut render_schedule = Schedule::default();
-        render_schedule.add_systems(interpolate_render_transform_system);
+        render_schedule.add_systems((
+            interpolate_render_transform_system,
+            crate::entity::interpolate_entity_render_positions,
+        ));
 
         Self {
             world,
@@ -265,6 +268,11 @@ impl EcsRuntime {
             physics.on_ground = on_ground;
             physics.fall_distance = fall_distance;
         }
+    }
+
+    /// Mutable access to the ECS world for entity operations.
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
     }
 
     #[cfg(test)]

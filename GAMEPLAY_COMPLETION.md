@@ -3,12 +3,12 @@
 This document tracks Alpha 1.2.6 gameplay/content parity items.
 
 ## World and Generation
-- [ ] Dimensions: The Overworld and the Nether.
-- [ ] World Limits: X/Z are practically infinite, but the Y height limit is strictly 128 blocks. Water level is at Y=64.
-- [ ] Biomes: The "Halloween Update" biome system (2D noise map of Temperature and Humidity).
-- [ ] Biome Types: Rainforest, Swampland, Seasonal Forest, Forest, Savanna, Shrubland, Taiga, Desert, Plains, Tundra, Hell.
+- [~] Dimensions: Overworld generation/streaming is implemented; Nether dimension generation/streaming is still pending.
+- [~] World Limits: Y=128 chunk height and sea level behavior at Y=64 are implemented in generation/runtime; full parity validation for practical X/Z behavior across extended travel is still pending.
+- [~] Biomes: 2D temperature/downfall biome sampling and biome classification are implemented; final parity tuning/coverage (including dimension-specific behavior) is still pending.
+- [~] Biome Types: Overworld biome set is implemented (Rainforest, Swampland, Seasonal Forest, Forest, Savanna, Shrubland, Taiga, Desert, Plains, Tundra, plus Ice Desert variant); Hell/Nether biome parity is pending.
 - [x] Dynamic Colors: Grass and leaf colors shift dynamically based on biome temperature and humidity values.
-- [ ] Terrain: 3D Perlin noise generation.
+- [~] Terrain: Deterministic terrain generation is implemented (surface shape + biome-dependent top blocks + cave/ore/dungeon/tree population), but strict Alpha-style 3D Perlin density/parity is not fully complete.
 - [x] Caves: Standard cave tunnels only (no ravines).
 - [x] Underground Generation: Dirt, gravel, coal, iron, gold, diamond, and redstone veins.
 - [~] Structures: Dungeon rooms with mob spawner blocks placed (chest inventory and spawner entity config require M7 entity/inventory systems).
@@ -33,7 +33,9 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [ ] Food Mechanics: No Hunger bar (food heals health instantly).
 
 ## Entities and Mobs
+- [x] Entity Framework: bevy_ecs entity lifecycle with components for physics, age, pickup delay, and render interpolation. Simplified AABB collision (Alpha ItemEntity constants), solid-block ejection, and age-based despawn.
+- [x] Dropped Items: Breaking a block spawns a dropped item entity with Alpha-faithful physics (gravity 0.04, bounce, drag, 10-tick pickup delay, 5-minute despawn). Items render as billboarded terrain atlas sprites with bobbing animation.
 - [ ] Passive Mobs: Pigs, Sheep, Cows, Chickens.
 - [ ] Hostile Mobs: Zombies, Skeletons, Spiders, Creepers, Slimes.
 - [ ] Nether Mobs: Ghasts, Zombie Pigmen.
-- [ ] Mechanical Entities: Minecarts, Boats, Dropped items.
+- [~] Mechanical Entities: Minecarts and Boats pending; dropped items implemented.

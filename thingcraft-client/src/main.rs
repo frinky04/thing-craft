@@ -1,5 +1,6 @@
 mod app;
 mod ecs;
+mod entity;
 mod hud;
 mod lighting;
 mod mesh;

@@ -74,6 +74,10 @@ pub struct Renderer<'w> {
     camera_pos: [f32; 3],
     time_of_day: f32,
     mesh_buffer_pool: MeshBufferPool,
+    entity_sprite_mesh: Option<SceneMeshGpu>,
+    shadow_pipeline: wgpu::RenderPipeline,
+    shadow_bind_group: wgpu::BindGroup,
+    entity_shadow_mesh: Option<SceneMeshGpu>,
 }
 
 struct SceneMeshGpu {
@@ -1269,6 +1273,121 @@ impl<'w> Renderer<'w> {
             multiview: None,
         });
 
+        // Shadow pipeline: alpha-blended disc projected under dropped items.
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thingcraft-shadow-shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADOW_SHADER.into()),
+        });
+
+        let (shadow_bind_group, shadow_pipeline) = {
+            let (sw, sh, shadow_rgba) = load_png_rgba(Path::new(
+                "resources/minecraft-a1.2.6-client/misc/shadow.png",
+            ));
+            let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("thingcraft-shadow-texture"),
+                size: wgpu::Extent3d {
+                    width: sw,
+                    height: sh,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &shadow_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &shadow_rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * sw),
+                    rows_per_image: Some(sh),
+                },
+                wgpu::Extent3d {
+                    width: sw,
+                    height: sh,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("thingcraft-shadow-sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("thingcraft-shadow-bind-group"),
+                layout: &terrain_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&shadow_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                    },
+                ],
+            });
+
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("thingcraft-shadow-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shadow_shader,
+                    entry_point: "vs_main",
+                    buffers: &[MeshVertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shadow_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview: None,
+            });
+
+            (bind_group, pipeline)
+        };
+
         Ok(Self {
             surface,
             device,
@@ -1320,6 +1439,10 @@ impl<'w> Renderer<'w> {
             camera_pos: [0.0; 3],
             time_of_day: 0.0,
             mesh_buffer_pool: MeshBufferPool::default(),
+            entity_sprite_mesh: None,
+            shadow_pipeline,
+            shadow_bind_group,
+            entity_shadow_mesh: None,
         })
     }
 
@@ -1387,15 +1510,28 @@ impl<'w> Renderer<'w> {
     }
 
     pub fn set_scene_mesh(&mut self, mesh: &ChunkMesh) {
+        self.scene_mesh = self.upload_mesh(mesh, "thingcraft-scene");
+    }
+
+    /// Upload entity sprite geometry for this frame (billboarded item quads).
+    pub fn update_entity_sprites(&mut self, mesh: &ChunkMesh) {
+        self.entity_sprite_mesh = self.upload_mesh(mesh, "thingcraft-entity-sprite");
+    }
+
+    /// Upload entity shadow geometry for this frame (ground-projected discs).
+    pub fn update_entity_shadows(&mut self, mesh: &ChunkMesh) {
+        self.entity_shadow_mesh = self.upload_mesh(mesh, "thingcraft-entity-shadow");
+    }
+
+    fn upload_mesh(&self, mesh: &ChunkMesh, label_prefix: &str) -> Option<SceneMeshGpu> {
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-            self.scene_mesh = None;
-            return;
+            return None;
         }
 
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("thingcraft-scene-vertex-buffer"),
+                label: Some(&format!("{label_prefix}-vb")),
                 contents: bytemuck::cast_slice(&mesh.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
@@ -1403,18 +1539,18 @@ impl<'w> Renderer<'w> {
         let index_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("thingcraft-scene-index-buffer"),
+                label: Some(&format!("{label_prefix}-ib")),
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        self.scene_mesh = Some(SceneMeshGpu {
+        Some(SceneMeshGpu {
             vertex_buffer,
             index_buffer,
             index_count: mesh.indices.len() as u32,
             vertex_bytes: std::mem::size_of_val(mesh.vertices.as_slice()) as u64,
             index_bytes: std::mem::size_of_val(mesh.indices.as_slice()) as u64,
-        });
+        })
     }
 
     pub fn upsert_chunk_section_mesh(&mut self, pos: ChunkPos, section_y: u8, mesh: &ChunkMesh) {
@@ -1851,6 +1987,32 @@ impl<'w> Renderer<'w> {
                 self.visible_chunk_meshes = visible;
             } else {
                 self.visible_chunk_meshes = 0;
+            }
+
+            // Entity shadows: ground-projected discs drawn before sprites.
+            if let Some(shadow_mesh) = &self.entity_shadow_mesh {
+                render_pass.set_pipeline(&self.shadow_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.shadow_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, shadow_mesh.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    shadow_mesh.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..shadow_mesh.index_count, 0, 0..1);
+            }
+
+            // Entity sprites: drawn after opaque terrain, before transparent pass.
+            if let Some(entity_mesh) = &self.entity_sprite_mesh {
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.terrain_atlas.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, entity_mesh.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    entity_mesh.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..entity_mesh.index_count, 0, 0..1);
             }
 
             // Transparent pass: water and other translucent blocks (after opaque, before debug).
@@ -2991,6 +3153,49 @@ fn upload_dynamic_sprite(
         }
     }
 }
+
+const SHADOW_SHADER: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    fog_start: f32,
+    fog_color: vec3<f32>,
+    fog_end: f32,
+    ambient_darkness: f32,
+    leaf_cutout_enabled: f32,
+    _pad: vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(1) @binding(0) var shadow_tex: texture_2d<f32>;
+@group(1) @binding(1) var shadow_sampler: sampler;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) tint_rgba: vec4<f32>,
+    @location(3) light_data: vec4<u32>,
+};
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) alpha: f32,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
+    out.uv = input.uv;
+    out.alpha = input.tint_rgba.a;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(shadow_tex, shadow_sampler, input.uv);
+    return vec4<f32>(0.0, 0.0, 0.0, texel.a * input.alpha);
+}
+"#;
 
 const CHUNK_SHADER: &str = r#"
 struct Camera {
