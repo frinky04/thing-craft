@@ -20,7 +20,8 @@ use crate::streaming::{
 };
 use crate::time_step::FixedStepClock;
 use crate::world::{
-    BiomeSource, BlockRegistry, BootstrapWorld, ChunkPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH,
+    BiomeSource, BlockRegistry, BootstrapWorld, ChunkPos, MaterialKind, CHUNK_DEPTH, CHUNK_HEIGHT,
+    CHUNK_WIDTH,
 };
 
 const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
@@ -464,6 +465,12 @@ pub fn run() -> Result<()> {
                             &bootstrap_world.registry,
                             fly_mode,
                         );
+                        tick_player_survival(
+                            ecs_runtime.world_mut(),
+                            &chunk_streamer,
+                            &bootstrap_world.registry,
+                            sim_ticks,
+                        );
                         // Entity framework ticks.
                         crate::entity::tick_entity_ages(ecs_runtime.world_mut());
                         crate::entity::tick_entity_physics(
@@ -710,6 +717,14 @@ pub fn run() -> Result<()> {
                                 .map_or(20, |snapshot| snapshot.vitals.prev_health),
                             invulnerable_timer: frame_camera
                                 .map_or(0, |snapshot| snapshot.vitals.invulnerable_timer),
+                            breath: frame_camera.map_or(300, |snapshot| snapshot.vitals.breath),
+                            breath_capacity: frame_camera
+                                .map_or(300, |snapshot| snapshot.vitals.breath_capacity),
+                            submerged_in_water: frame_camera
+                                .is_some_and(|snapshot| snapshot.vitals.submerged_in_water),
+                            armor_points: 0,
+                            is_dead: frame_camera.is_some_and(|snapshot| snapshot.vitals.health <= 0),
+                            death_ticks: frame_camera.map_or(0, |snapshot| snapshot.vitals.death_ticks),
                             sim_ticks,
                         };
                         let hud_verts = hud::build_hud_vertices(
@@ -865,6 +880,13 @@ pub fn run() -> Result<()> {
                             mouse_captured = false;
                             set_mouse_capture(window, false);
                         }
+
+                        if code == KeyCode::KeyR && is_pressed && !event.repeat {
+                            if try_respawn_player(&mut ecs_runtime) {
+                                hud_dirty = true;
+                                info!("player respawned");
+                            }
+                        }
                     }
                 },
                 WindowEvent::MouseInput {
@@ -968,6 +990,9 @@ fn enqueue_block_interaction_request(
     let Some(snapshot) = ecs_runtime.camera_snapshot() else {
         return;
     };
+    if snapshot.vitals.health <= 0 {
+        return;
+    }
 
     let direction =
         direction_from_angles64(snapshot.authoritative.yaw, snapshot.authoritative.pitch);
@@ -1495,6 +1520,132 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
         4 => [t, p, v],
         _ => [v, p, q],
     }
+}
+
+fn tick_player_survival(
+    world: &mut bevy_ecs::world::World,
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    sim_ticks: u64,
+) {
+    let mut query = world.query_filtered::<
+        (
+            &mut crate::ecs::Transform64,
+            &mut crate::ecs::PhysicsBody,
+            &mut crate::ecs::PlayerVitals,
+        ),
+        bevy_ecs::query::With<crate::ecs::Player>,
+    >();
+    let Some((transform, physics, mut vitals)) = query.iter_mut(world).next() else {
+        return;
+    };
+
+    if vitals.health <= 0 {
+        vitals.death_ticks += 1;
+        if vitals.death_ticks > 20 {
+            vitals.dead_ready = true;
+        }
+        return;
+    }
+
+    let half_w = physics.width / 2.0;
+    let min_x = (transform.position.x - half_w).floor() as i32;
+    let max_x = (transform.position.x + half_w).floor() as i32;
+    let min_y = transform.position.y.floor() as i32;
+    let max_y = (transform.position.y + physics.height).floor() as i32;
+    let min_z = (transform.position.z - half_w).floor() as i32;
+    let max_z = (transform.position.z + half_w).floor() as i32;
+
+    let mut in_lava = false;
+    let mut in_fire = false;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+                continue;
+            }
+            for z in min_z..=max_z {
+                let Some(block_id) = chunk_streamer.block_at_world(x, y, z) else {
+                    continue;
+                };
+                in_lava |= registry.is_lava(block_id);
+                in_fire |= registry
+                    .get(block_id)
+                    .is_some_and(|b| b.material == MaterialKind::Fire);
+            }
+        }
+    }
+
+    // Approximate Alpha eye-level submersion check.
+    let eye_x = transform.position.x.floor() as i32;
+    let eye_y = (transform.position.y + physics.eye_height).floor() as i32;
+    let eye_z = transform.position.z.floor() as i32;
+    let submerged_in_water = chunk_streamer
+        .block_at_world(eye_x, eye_y, eye_z)
+        .is_some_and(|block_id| registry.is_water(block_id));
+    vitals.submerged_in_water = submerged_in_water;
+
+    if submerged_in_water {
+        vitals.breath -= 1;
+        if vitals.breath == -20 {
+            vitals.breath = 0;
+            let _ = vitals.apply_damage(2);
+        }
+        vitals.on_fire_timer = 0;
+    } else {
+        vitals.breath = vitals.breath_capacity;
+    }
+
+    if in_lava {
+        let _ = vitals.apply_damage(4);
+        vitals.on_fire_timer = 600;
+    }
+
+    if in_fire && !submerged_in_water {
+        vitals.on_fire_timer = vitals.on_fire_timer.max(300);
+    }
+
+    if vitals.on_fire_timer > 0 {
+        if sim_ticks.is_multiple_of(20) {
+            let _ = vitals.apply_damage(1);
+        }
+        vitals.on_fire_timer -= 1;
+    }
+}
+
+fn try_respawn_player(ecs_runtime: &mut EcsRuntime) -> bool {
+    let world = ecs_runtime.world_mut();
+    let mut query = world.query_filtered::<
+        (
+            &mut crate::ecs::Transform64,
+            &mut crate::ecs::PhysicsBody,
+            &mut crate::ecs::PlayerVitals,
+        ),
+        bevy_ecs::query::With<crate::ecs::Player>,
+    >();
+    let Some((mut transform, mut physics, mut vitals)) = query.iter_mut(world).next() else {
+        return false;
+    };
+    if !vitals.dead_ready {
+        return false;
+    }
+
+    vitals.health = 20;
+    vitals.prev_health = 20;
+    vitals.invulnerable_timer = 0;
+    vitals.prev_damage_taken = 0;
+    vitals.damaged_time = 0;
+    vitals.damaged_timer = 0;
+    vitals.breath = vitals.breath_capacity;
+    vitals.on_fire_timer = 0;
+    vitals.death_ticks = 0;
+    vitals.dead_ready = false;
+
+    transform.position = DVec3::new(0.0, 72.0, 0.0);
+    transform.prev_position = transform.position;
+    physics.velocity = DVec3::ZERO;
+    physics.on_ground = false;
+    physics.fall_distance = 0.0;
+    true
 }
 
 // ---------------------------------------------------------------------------

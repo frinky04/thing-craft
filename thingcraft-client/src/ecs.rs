@@ -82,6 +82,12 @@ pub struct PlayerVitals {
     pub prev_damage_taken: i32,
     pub damaged_time: i32,
     pub damaged_timer: i32,
+    pub breath: i32,
+    pub breath_capacity: i32,
+    pub on_fire_timer: i32,
+    pub death_ticks: i32,
+    pub dead_ready: bool,
+    pub submerged_in_water: bool,
 }
 
 impl Default for PlayerVitals {
@@ -94,6 +100,12 @@ impl Default for PlayerVitals {
             prev_damage_taken: 0,
             damaged_time: 0,
             damaged_timer: 0,
+            breath: 300,
+            breath_capacity: 300,
+            on_fire_timer: 0,
+            death_ticks: 0,
+            dead_ready: false,
+            submerged_in_water: false,
         }
     }
 }

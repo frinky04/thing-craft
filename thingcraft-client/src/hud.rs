@@ -50,6 +50,12 @@ pub struct HudState {
     pub health: i32,
     pub prev_health: i32,
     pub invulnerable_timer: i32,
+    pub breath: i32,
+    pub breath_capacity: i32,
+    pub submerged_in_water: bool,
+    pub armor_points: i32,
+    pub is_dead: bool,
+    pub death_ticks: i32,
     pub sim_ticks: u64,
 }
 
@@ -116,7 +122,8 @@ pub fn build_hud_vertices(
         WHITE,
     );
 
-    // Hotbar items (terrain atlas sprites).
+    // Hotbar items (Alpha-like item rendering path: 3D mini block for solid cubes,
+    // flat sprite for cutout/liquid/non-solid blocks).
     for slot in 0..HOTBAR_SLOT_COUNT {
         if state.slot_counts[slot] == 0 {
             continue;
@@ -125,25 +132,38 @@ pub fn build_hud_vertices(
         if !registry.is_defined_block(block_id) {
             continue;
         }
-        let sprite = registry.sprite_index_of(block_id);
-        let u = (sprite % 16) as f32 * 16.0;
-        let v = (sprite / 16) as f32 * 16.0;
         let item_x = center_x - 90.0 + slot as f32 * 20.0 + 2.0;
         let item_y = gui_h - 16.0 - 3.0;
-        push_textured_quad_gui(
-            &mut verts,
-            item_x,
-            item_y,
-            16.0,
-            16.0,
-            u,
-            v,
-            16.0,
-            16.0,
-            HUD_TEX_TERRAIN,
-            scale,
-            WHITE,
-        );
+        push_hotbar_item_vertices(&mut verts, item_x, item_y, block_id, registry, scale);
+    }
+
+    // Armor row (icons.png, shown only when armor points > 0).
+    if state.armor_points > 0 {
+        for s in 0..10 {
+            let x = center_x + 91.0 - s as f32 * 8.0 - 9.0;
+            let y = gui_h - 32.0;
+            let (u, v) = if s * 2 + 1 < state.armor_points as usize {
+                (34.0, 9.0)
+            } else if s * 2 + 1 == state.armor_points as usize {
+                (25.0, 9.0)
+            } else {
+                (16.0, 9.0)
+            };
+            push_textured_quad_gui(
+                &mut verts,
+                x,
+                y,
+                9.0,
+                9.0,
+                u,
+                v,
+                9.0,
+                9.0,
+                HUD_TEX_ICONS,
+                scale,
+                WHITE,
+            );
+        }
     }
 
     // Hearts (icons.png), including invulnerability blink and low-health jitter.
@@ -242,7 +262,119 @@ pub fn build_hud_vertices(
         }
     }
 
+    if state.submerged_in_water {
+        let full = (((state.breath - 2).max(0) as f32) * 10.0 / state.breath_capacity as f32).ceil()
+            as i32;
+        let partial = ((state.breath.max(0) as f32) * 10.0 / state.breath_capacity as f32).ceil()
+            as i32
+            - full;
+        let bubble_count = (full + partial).max(0) as usize;
+        for i in 0..bubble_count {
+            let x = center_x - 91.0 + i as f32 * 8.0;
+            let y = gui_h - 32.0 - 9.0;
+            let tex_x = if i < full as usize { 16.0 } else { 25.0 };
+            push_textured_quad_gui(
+                &mut verts,
+                x,
+                y,
+                9.0,
+                9.0,
+                tex_x,
+                18.0,
+                9.0,
+                9.0,
+                HUD_TEX_ICONS,
+                scale,
+                WHITE,
+            );
+        }
+    }
+
+    if state.is_dead {
+        let fade = ((state.death_ticks as f32) / 20.0).clamp(0.0, 1.0) * 0.6;
+        push_colored_quad_gui(
+            &mut verts,
+            0.0,
+            0.0,
+            gui_w,
+            gui_h,
+            scale,
+            [0.3, 0.0, 0.0, fade],
+        );
+    }
+
     verts
+}
+
+fn push_hotbar_item_vertices(
+    verts: &mut Vec<HudVertex>,
+    x: f32,
+    y: f32,
+    block_id: u8,
+    registry: &BlockRegistry,
+    scale: f32,
+) {
+    if registry.is_solid(block_id) && !registry.is_liquid(block_id) && !registry.is_billboard_plant(block_id)
+    {
+        let top = registry.sprite_index_for_face(block_id, [0, 1, 0]);
+        let side = registry.sprite_index_for_face(block_id, [0, 0, 1]);
+
+        let top_uv = sprite_uv(top);
+        let side_uv = sprite_uv(side);
+        // Top face (diamond-ish quad).
+        push_textured_quad_points_gui(
+            verts,
+            [[x + 4.0, y + 1.0], [x + 13.0, y + 1.0], [x + 11.0, y + 5.0], [x + 2.0, y + 5.0]],
+            top_uv,
+            HUD_TEX_TERRAIN,
+            scale,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        // Left/front side.
+        push_textured_quad_points_gui(
+            verts,
+            [[x + 2.0, y + 5.0], [x + 11.0, y + 5.0], [x + 11.0, y + 14.0], [x + 2.0, y + 14.0]],
+            side_uv,
+            HUD_TEX_TERRAIN,
+            scale,
+            [0.8, 0.8, 0.8, 1.0],
+        );
+        // Right side.
+        push_textured_quad_points_gui(
+            verts,
+            [[x + 11.0, y + 5.0], [x + 13.0, y + 1.0], [x + 13.0, y + 10.0], [x + 11.0, y + 14.0]],
+            side_uv,
+            HUD_TEX_TERRAIN,
+            scale,
+            [0.6, 0.6, 0.6, 1.0],
+        );
+    } else {
+        let sprite = registry.sprite_index_of(block_id);
+        let u = (sprite % 16) as f32 * 16.0;
+        let v = (sprite / 16) as f32 * 16.0;
+        push_textured_quad_gui(
+            verts,
+            x,
+            y,
+            16.0,
+            16.0,
+            u,
+            v,
+            16.0,
+            16.0,
+            HUD_TEX_TERRAIN,
+            scale,
+            WHITE,
+        );
+    }
+}
+
+fn sprite_uv(sprite: u16) -> [[f32; 2]; 4] {
+    let u = (sprite % 16) as f32 * 16.0 / TEX_SIZE_PX;
+    let v = (sprite / 16) as f32 * 16.0 / TEX_SIZE_PX;
+    let u1 = u + 16.0 / TEX_SIZE_PX;
+    let v1 = v + 16.0 / TEX_SIZE_PX;
+    [[u, v], [u1, v], [u1, v1], [u, v1]]
 }
 
 fn gui_scale(screen_w: f32, screen_h: f32) -> f32 {
@@ -317,6 +449,61 @@ fn push_textured_quad_gui(
     verts.push(vtx0);
 }
 
+fn push_colored_quad_gui(
+    verts: &mut Vec<HudVertex>,
+    gui_x: f32,
+    gui_y: f32,
+    gui_w: f32,
+    gui_h: f32,
+    scale: f32,
+    color: [f32; 4],
+) {
+    push_textured_quad_gui(
+        verts, gui_x, gui_y, gui_w, gui_h, 0.0, 0.0, 1.0, 1.0, -1.0, scale, color,
+    );
+}
+
+fn push_textured_quad_points_gui(
+    verts: &mut Vec<HudVertex>,
+    points: [[f32; 2]; 4],
+    uv: [[f32; 2]; 4],
+    texture_kind: f32,
+    scale: f32,
+    color: [f32; 4],
+) {
+    let p = points.map(|p| [(p[0] * scale).floor(), (p[1] * scale).floor()]);
+    let v0 = HudVertex {
+        position: p[0],
+        uv: uv[0],
+        color,
+        texture_kind,
+    };
+    let v1 = HudVertex {
+        position: p[1],
+        uv: uv[1],
+        color,
+        texture_kind,
+    };
+    let v2 = HudVertex {
+        position: p[2],
+        uv: uv[2],
+        color,
+        texture_kind,
+    };
+    let v3 = HudVertex {
+        position: p[3],
+        uv: uv[3],
+        color,
+        texture_kind,
+    };
+    verts.push(v0);
+    verts.push(v1);
+    verts.push(v2);
+    verts.push(v2);
+    verts.push(v3);
+    verts.push(v0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +525,12 @@ mod tests {
             health: 20,
             prev_health: 20,
             invulnerable_timer: 0,
+            breath: 300,
+            breath_capacity: 300,
+            submerged_in_water: false,
+            armor_points: 0,
+            is_dead: false,
+            death_ticks: 0,
             sim_ticks: 0,
         };
         let verts = build_hud_vertices(1280.0, 720.0, &state, &registry);

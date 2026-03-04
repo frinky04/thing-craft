@@ -3783,6 +3783,9 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    if (input.texture_kind < -0.5) {
+        return input.color;
+    }
     var texel = textureSample(hud_gui_tex, hud_sampler, input.uv);
     if (input.texture_kind > 0.5 && input.texture_kind < 1.5) {
         texel = textureSample(hud_icons_tex, hud_sampler, input.uv);
