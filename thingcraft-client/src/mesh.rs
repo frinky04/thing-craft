@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::f32::consts::FRAC_PI_2;
 
 use crate::world::{
@@ -447,9 +448,11 @@ const FACES: [FaceDef; 6] = [
 
 #[must_use]
 pub fn build_chunk_mesh(chunk: &ChunkData, registry: &BlockRegistry) -> ChunkMesh {
+    let fancy_graphics = resolve_fancy_graphics_for_meshing();
     let split = build_split_chunk_mesh_with_neighbor_lookup(
         chunk,
         registry,
+        fancy_graphics,
         0,
         CHUNK_HEIGHT as i32,
         |x, y, z| neighbor_block(chunk, x, y, z),
@@ -517,9 +520,11 @@ pub fn build_chunk_section_split_mesh_with_neighbor_slices(
     assert!(section < CHUNK_SECTION_COUNT, "section_y out of range");
     let y_start = section * SECTION_HEIGHT;
     let y_end = y_start + SECTION_HEIGHT;
+    let fancy_graphics = resolve_fancy_graphics_for_meshing();
     build_split_chunk_mesh_with_neighbor_lookup(
         chunk,
         registry,
+        fancy_graphics,
         y_start as i32,
         y_end as i32,
         |x, y, z| neighbor_block_with_slices(chunk, neighbor_slices, x, y, z),
@@ -534,6 +539,7 @@ pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> Chun
     if let [single] = chunks {
         return build_chunk_mesh(single, registry);
     }
+    let fancy_graphics = resolve_fancy_graphics_for_meshing();
 
     let index_by_pos: HashMap<ChunkPos, usize> = chunks
         .iter()
@@ -547,6 +553,7 @@ pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> Chun
             let split = build_split_chunk_mesh_with_neighbor_lookup(
                 chunk,
                 registry,
+                fancy_graphics,
                 0,
                 CHUNK_HEIGHT as i32,
                 |x, y, z| neighbor_block_from_region(chunks, &index_by_pos, chunk.pos, x, y, z),
@@ -566,6 +573,7 @@ pub fn build_region_mesh(chunks: &[ChunkData], registry: &BlockRegistry) -> Chun
 fn build_split_chunk_mesh_with_neighbor_lookup<FB, FM, FS, FBL>(
     chunk: &ChunkData,
     registry: &BlockRegistry,
+    fancy_graphics: bool,
     y_start: i32,
     y_end: i32,
     mut neighbor_block_lookup: FB,
@@ -740,7 +748,14 @@ where
                         let nz = local_z + face.offset[2];
                         let neighbor_id = neighbor_block_lookup(nx, ny, nz);
 
-                        if neighbor_id == block_id || registry.is_face_occluder(neighbor_id) {
+                        let same_block_cull = neighbor_id == block_id;
+                        let leaf_neighbor_pair =
+                            registry.is_leaves(block_id) && registry.is_leaves(neighbor_id);
+                        // Alpha fancy leaves keep interior leaf faces visible through cutout alpha.
+                        // Fast leaves cull shared faces and render as solid foliage cubes.
+                        let cull_shared_face =
+                            same_block_cull && (!leaf_neighbor_pair || !fancy_graphics);
+                        if cull_shared_face || registry.is_face_occluder(neighbor_id) {
                             continue;
                         }
 
@@ -785,6 +800,20 @@ where
     }
 
     split
+}
+
+fn resolve_fancy_graphics_for_meshing() -> bool {
+    static FANCY_GRAPHICS: OnceLock<bool> = OnceLock::new();
+    *FANCY_GRAPHICS.get_or_init(|| {
+        std::env::var("THINGCRAFT_FANCY_GRAPHICS")
+            .ok()
+            .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true)
+    })
 }
 
 #[must_use]
@@ -1522,6 +1551,43 @@ mod tests {
         let mesh = build_chunk_mesh(&chunk, &registry);
         assert_eq!(mesh.vertices.len(), 40);
         assert_eq!(mesh.indices.len(), 60);
+    }
+
+    #[test]
+    fn adjacent_leaves_keep_shared_faces_for_fancy_cutout() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        let leaves = 18_u8;
+        chunk.set_block(1, 1, 1, leaves);
+        chunk.set_block(2, 1, 1, leaves);
+
+        let mesh = build_chunk_mesh(&chunk, &registry);
+        assert_eq!(mesh.vertices.len(), 48);
+        assert_eq!(mesh.indices.len(), 72);
+    }
+
+    #[test]
+    fn adjacent_leaves_cull_shared_faces_in_fast_mode() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut chunk = ChunkData::new(ChunkPos { x: 0, z: 0 }, AIR_ID);
+        let leaves = 18_u8;
+        chunk.set_block(1, 1, 1, leaves);
+        chunk.set_block(2, 1, 1, leaves);
+
+        let split = build_split_chunk_mesh_with_neighbor_lookup(
+            &chunk,
+            &registry,
+            false,
+            0,
+            CHUNK_HEIGHT as i32,
+            |x, y, z| neighbor_block(&chunk, x, y, z),
+            |x, y, z| neighbor_metadata(&chunk, x, y, z),
+            |x, y, z| neighbor_sky_light(&chunk, x, y, z),
+            |x, y, z| neighbor_block_light(&chunk, x, y, z),
+        );
+
+        assert_eq!(split.opaque.vertices.len(), 40);
+        assert_eq!(split.opaque.indices.len(), 60);
     }
 
     #[test]
