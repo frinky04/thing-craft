@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use glam::{DVec3, Mat4, Vec3};
 use tracing::{debug, error, info, warn};
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -999,6 +999,15 @@ pub fn run() -> Result<()> {
                                 mouse_captured = false;
                                 set_mouse_capture(window, false);
                                 ecs_runtime.clear_input_state();
+                                let size = window.inner_size();
+                                let center = PhysicalPosition::new(
+                                    f64::from(size.width) * 0.5,
+                                    f64::from(size.height) * 0.5,
+                                );
+                                if let Err(err) = window.set_cursor_position(center) {
+                                    warn!(?err, "failed to center cursor on inventory open");
+                                }
+                                mouse_screen_pos = [center.x as f32, center.y as f32];
                             } else {
                                 inventory_commands.push_back(InventoryCommand::CloseInventory);
                                 if !ecs_runtime.player_is_dead() {
