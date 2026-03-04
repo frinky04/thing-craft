@@ -778,50 +778,51 @@ pub fn run() -> Result<()> {
                     // Build and upload HUD vertices only when state changes.
                     if hud_dirty {
                         let (sw, sh) = renderer.screen_size();
-                        let hud_verts = if inventory_open {
-                            hud::build_inventory_vertices(
+                        let slot_counts: [u8; crate::inventory::HOTBAR_SLOT_COUNT] =
+                            std::array::from_fn(|i| {
+                                inventory_state.hotbar_stack(i).map_or(0, |stack| stack.count)
+                            });
+                        let slot_block_ids: [u8; crate::inventory::HOTBAR_SLOT_COUNT] =
+                            std::array::from_fn(|i| {
+                                inventory_state.hotbar_stack(i).map_or(AIR_BLOCK_ID, |stack| {
+                                    match stack.item {
+                                        ItemKey::Block(block_id) => block_id,
+                                    }
+                                })
+                            });
+                        let hud_state = hud::HudState {
+                            selected_slot: usize::from(inventory_state.selected_hotbar),
+                            slot_counts,
+                            slot_block_ids,
+                            health: frame_camera.map_or(20, |snapshot| snapshot.vitals.health),
+                            prev_health: frame_camera
+                                .map_or(20, |snapshot| snapshot.vitals.prev_health),
+                            invulnerable_timer: frame_camera
+                                .map_or(0, |snapshot| snapshot.vitals.invulnerable_timer),
+                            breath: frame_camera.map_or(300, |snapshot| snapshot.vitals.breath),
+                            breath_capacity: frame_camera
+                                .map_or(300, |snapshot| snapshot.vitals.breath_capacity),
+                            submerged_in_water: frame_camera
+                                .is_some_and(|snapshot| snapshot.vitals.submerged_in_water),
+                            armor_points: 0,
+                            is_dead: frame_camera
+                                .is_some_and(|snapshot| snapshot.vitals.health <= 0),
+                            death_ticks: frame_camera
+                                .map_or(0, |snapshot| snapshot.vitals.death_ticks),
+                            sim_ticks,
+                        };
+                        let mut hud_verts =
+                            hud::build_hud_vertices(sw, sh, &hud_state, &bootstrap_world.registry);
+                        if inventory_open {
+                            let mut inventory_verts = hud::build_inventory_vertices(
                                 sw,
                                 sh,
                                 &inventory_state,
                                 mouse_screen_pos,
                                 &bootstrap_world.registry,
-                            )
-                        } else {
-                            let slot_counts: [u8; crate::inventory::HOTBAR_SLOT_COUNT] =
-                                std::array::from_fn(|i| {
-                                    inventory_state.hotbar_stack(i).map_or(0, |stack| stack.count)
-                                });
-                            let slot_block_ids: [u8; crate::inventory::HOTBAR_SLOT_COUNT] =
-                                std::array::from_fn(|i| {
-                                    inventory_state.hotbar_stack(i).map_or(AIR_BLOCK_ID, |stack| {
-                                        match stack.item {
-                                            ItemKey::Block(block_id) => block_id,
-                                        }
-                                    })
-                                });
-                            let hud_state = hud::HudState {
-                                selected_slot: usize::from(inventory_state.selected_hotbar),
-                                slot_counts,
-                                slot_block_ids,
-                                health: frame_camera.map_or(20, |snapshot| snapshot.vitals.health),
-                                prev_health: frame_camera
-                                    .map_or(20, |snapshot| snapshot.vitals.prev_health),
-                                invulnerable_timer: frame_camera
-                                    .map_or(0, |snapshot| snapshot.vitals.invulnerable_timer),
-                                breath: frame_camera.map_or(300, |snapshot| snapshot.vitals.breath),
-                                breath_capacity: frame_camera
-                                    .map_or(300, |snapshot| snapshot.vitals.breath_capacity),
-                                submerged_in_water: frame_camera
-                                    .is_some_and(|snapshot| snapshot.vitals.submerged_in_water),
-                                armor_points: 0,
-                                is_dead: frame_camera
-                                    .is_some_and(|snapshot| snapshot.vitals.health <= 0),
-                                death_ticks: frame_camera
-                                    .map_or(0, |snapshot| snapshot.vitals.death_ticks),
-                                sim_ticks,
-                            };
-                            hud::build_hud_vertices(sw, sh, &hud_state, &bootstrap_world.registry)
-                        };
+                            );
+                            hud_verts.append(&mut inventory_verts);
+                        }
                         renderer.update_hud(&hud_verts);
                         hud_dirty = false;
                     }

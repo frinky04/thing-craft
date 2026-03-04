@@ -1811,8 +1811,9 @@ impl<'w> Renderer<'w> {
                 depth_or_array_layers: 1,
             },
         );
-        let (font_w, font_h, font_rgba) =
-            load_png_rgba(Path::new("resources/minecraft-a1.2.6-client/font/default.png"));
+        let (font_w, font_h, font_rgba) = load_png_rgba(Path::new(
+            "resources/minecraft-a1.2.6-client/font/default.png",
+        ));
         let font_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("thingcraft-hud-font-texture"),
             size: wgpu::Extent3d {
