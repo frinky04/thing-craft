@@ -1,3 +1,7 @@
+use crate::inventory::{
+    inventory_layout, slot_gui_xy, ItemKey, PlayerInventoryState, PlayerSlot, ARMOR_SLOT_COUNT,
+    MAIN_SLOT_COUNT,
+};
 use crate::world::BlockRegistry;
 
 /// HUD overlay rendered in screen pixels. Shaders convert positions to NDC.
@@ -38,6 +42,7 @@ pub const HOTBAR_SLOT_COUNT: usize = 9;
 const HUD_TEX_GUI: f32 = 0.0;
 const HUD_TEX_ICONS: f32 = 1.0;
 const HUD_TEX_TERRAIN: f32 = 2.0;
+pub const HUD_TEX_INVENTORY: f32 = 3.0;
 
 const TEX_SIZE_PX: f32 = 256.0;
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -304,6 +309,148 @@ pub fn build_hud_vertices(
     }
 
     verts
+}
+
+#[must_use]
+pub fn build_inventory_vertices(
+    screen_w: f32,
+    screen_h: f32,
+    inventory: &PlayerInventoryState,
+    mouse_screen_pos: [f32; 2],
+    registry: &BlockRegistry,
+) -> Vec<HudVertex> {
+    let mut verts = Vec::with_capacity(1024);
+    let layout = inventory_layout(screen_w, screen_h);
+
+    // Dim world behind inventory.
+    push_colored_quad_gui(
+        &mut verts,
+        0.0,
+        0.0,
+        (screen_w / layout.scale).floor(),
+        (screen_h / layout.scale).floor(),
+        layout.scale,
+        [0.06, 0.06, 0.06, 0.60],
+    );
+
+    // Inventory panel background (inventory.png).
+    push_textured_quad_gui(
+        &mut verts,
+        layout.left,
+        layout.top,
+        176.0,
+        166.0,
+        0.0,
+        0.0,
+        176.0,
+        166.0,
+        HUD_TEX_INVENTORY,
+        layout.scale,
+        WHITE,
+    );
+
+    let hovered = crate::inventory::hit_test_slot(
+        mouse_screen_pos[0],
+        mouse_screen_pos[1],
+        screen_w,
+        screen_h,
+    );
+
+    for i in 0..ARMOR_SLOT_COUNT {
+        let slot = PlayerSlot::Armor(i as u8);
+        render_inventory_slot_item(
+            &mut verts,
+            layout.left,
+            layout.top,
+            layout.scale,
+            inventory,
+            slot,
+            registry,
+        );
+    }
+    for i in 0..MAIN_SLOT_COUNT {
+        let slot = PlayerSlot::Main(i as u8);
+        render_inventory_slot_item(
+            &mut verts,
+            layout.left,
+            layout.top,
+            layout.scale,
+            inventory,
+            slot,
+            registry,
+        );
+    }
+    for i in 0..HOTBAR_SLOT_COUNT {
+        let slot = PlayerSlot::Hotbar(i as u8);
+        render_inventory_slot_item(
+            &mut verts,
+            layout.left,
+            layout.top,
+            layout.scale,
+            inventory,
+            slot,
+            registry,
+        );
+    }
+
+    if let Some(hovered_slot) = hovered {
+        let (sx, sy) = slot_gui_xy(hovered_slot);
+        push_colored_quad_gui(
+            &mut verts,
+            layout.left + sx - 1.0,
+            layout.top + sy - 1.0,
+            18.0,
+            18.0,
+            layout.scale,
+            [1.0, 1.0, 1.0, 0.28],
+        );
+    }
+
+    if let Some(cursor_stack) = inventory.cursor {
+        let item_x = mouse_screen_pos[0] / layout.scale - 8.0;
+        let item_y = mouse_screen_pos[1] / layout.scale - 8.0;
+        let ItemKey::Block(block_id) = cursor_stack.item;
+        push_hotbar_item_vertices(&mut verts, item_x, item_y, block_id, registry, layout.scale);
+    }
+
+    verts
+}
+
+fn render_inventory_slot_item(
+    verts: &mut Vec<HudVertex>,
+    panel_left: f32,
+    panel_top: f32,
+    scale: f32,
+    inventory: &PlayerInventoryState,
+    slot: PlayerSlot,
+    registry: &BlockRegistry,
+) {
+    let stack = match slot {
+        PlayerSlot::Hotbar(i) => inventory.hotbar_stack(usize::from(i)),
+        PlayerSlot::Main(i) => inventory
+            .main_stacks()
+            .get(usize::from(i))
+            .copied()
+            .flatten(),
+        PlayerSlot::Armor(i) => inventory
+            .armor_stacks()
+            .get(usize::from(i))
+            .copied()
+            .flatten(),
+    };
+    let Some(stack) = stack else {
+        return;
+    };
+    let (sx, sy) = slot_gui_xy(slot);
+    let ItemKey::Block(block_id) = stack.item;
+    push_hotbar_item_vertices(
+        verts,
+        panel_left + sx,
+        panel_top + sy,
+        block_id,
+        registry,
+        scale,
+    );
 }
 
 fn push_hotbar_item_vertices(

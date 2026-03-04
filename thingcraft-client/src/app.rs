@@ -12,6 +12,7 @@ use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
 use crate::ecs::EcsRuntime;
 use crate::hud;
+use crate::inventory::{hit_test_slot, InventoryCommand, ItemKey, PlayerInventoryState};
 use crate::mesh::{build_region_mesh, ChunkMesh, MeshVertex};
 use crate::renderer::{RenderError, Renderer};
 use crate::streaming::{
@@ -33,9 +34,7 @@ const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
 ];
 const APPLY_STREAM_UPDATES_TO_RENDERER: bool = true;
 const BLOCK_INTERACTION_REACH_BLOCKS: f64 = 5.0;
-const AIR_BLOCK_ID: u8 = 0;
-const HOTBAR_BLOCK_IDS: [u8; 9] = [3, 1, 4, 12, AIR_BLOCK_ID, 17, 5, 9, 50];
-const HOTBAR_STACK_LIMIT: u8 = 64;
+const AIR_BLOCK_ID: u8 = crate::inventory::AIR_BLOCK_ID;
 const EDIT_LATENCY_SAMPLE_WINDOW: usize = 128;
 const FLUID_TICK_BUDGET_DEFAULT: usize = 384;
 const FLUID_TICK_BUDGET_HARD_MAX: usize = 1_000;
@@ -51,7 +50,7 @@ const WORLD_SEED: u64 = 0xA126_0001;
 #[derive(Debug, Clone, Copy)]
 enum BlockInteractionKind {
     Break,
-    Place { slot: usize },
+    Place,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,26 +64,6 @@ struct BlockInteractionRequest {
 struct BlockRayHit {
     block: [i32; 3],
     normal: [i32; 3],
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct HotbarSlot {
-    block_id: u8,
-    count: u8,
-}
-
-impl Default for HotbarSlot {
-    fn default() -> Self {
-        Self {
-            block_id: AIR_BLOCK_ID,
-            count: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct HotbarInventory {
-    slots: [HotbarSlot; HOTBAR_BLOCK_IDS.len()],
 }
 
 #[derive(Debug, Default)]
@@ -126,60 +105,6 @@ struct AdaptiveFluidBudget {
     current: usize,
     min: usize,
     max: usize,
-}
-
-impl HotbarInventory {
-    fn alpha_defaults() -> Self {
-        Self {
-            slots: HOTBAR_BLOCK_IDS.map(|block_id| {
-                if block_id == AIR_BLOCK_ID {
-                    HotbarSlot::default()
-                } else {
-                    HotbarSlot {
-                        block_id,
-                        count: HOTBAR_STACK_LIMIT,
-                    }
-                }
-            }),
-        }
-    }
-
-    fn slot(&self, index: usize) -> Option<HotbarSlot> {
-        self.slots.get(index).copied()
-    }
-
-    fn try_consume_from_slot(&mut self, index: usize) -> bool {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return false;
-        };
-        if slot.count == 0 {
-            return false;
-        }
-        slot.count -= 1;
-        true
-    }
-
-    pub(crate) fn try_pickup_block(&mut self, block_id: u8) -> bool {
-        if block_id == AIR_BLOCK_ID {
-            return false;
-        }
-
-        let Some(slot) = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.block_id == block_id && slot.count < HOTBAR_STACK_LIMIT)
-        else {
-            return false;
-        };
-
-        slot.count += 1;
-        true
-    }
-
-    /// Lightweight snapshot of all slot counts for dirty-checking.
-    fn snapshot_counts(&self) -> [u8; HOTBAR_BLOCK_IDS.len()] {
-        std::array::from_fn(|i| self.slots[i].count)
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -462,10 +387,12 @@ pub fn run() -> Result<()> {
     let mut last_frame_start = Instant::now();
     let mut loop_stats = LoopStats::default();
     let mut mouse_captured = false;
+    let mut inventory_open = false;
+    let mut mouse_screen_pos = [0.0_f32, 0.0_f32];
     let mut block_interaction_requests = VecDeque::new();
+    let mut inventory_commands: VecDeque<InventoryCommand> = VecDeque::new();
     let mut edit_latency_tracker = EditLatencyTracker::default();
-    let mut hotbar_inventory = HotbarInventory::alpha_defaults();
-    let mut selected_hotbar_slot = 0_usize;
+    let mut inventory_state = PlayerInventoryState::alpha_defaults();
     let mut first_person_hand = FirstPersonHandState::default();
     let mut hud_dirty = true;
     let mut sim_ticks: u64 = 0;
@@ -475,9 +402,7 @@ pub fn run() -> Result<()> {
     let mut fog_brightness = 1.0_f32;
     let base_fluid_tick_budget = resolve_fluid_tick_budget();
     let mut adaptive_fluid_budget = AdaptiveFluidBudget::new(base_fluid_tick_budget);
-    let selected_slot = hotbar_inventory
-        .slot(selected_hotbar_slot)
-        .unwrap_or_default();
+    let selected_slot = inventory_state.selected_stack();
 
     info!(
         tick_hz = fixed_config.tick_hz,
@@ -502,9 +427,12 @@ pub fn run() -> Result<()> {
         fluid_tick_budget_min = adaptive_fluid_budget.min(),
         fluid_tick_budget_max = adaptive_fluid_budget.max(),
         fancy_graphics,
-        selected_hotbar_slot = 1,
-        selected_place_block = selected_slot.block_id,
-        selected_place_count = selected_slot.count,
+        selected_hotbar_slot = usize::from(inventory_state.selected_hotbar) + 1,
+        selected_place_block = selected_slot.and_then(|stack| match stack.item {
+            ItemKey::Block(id) if stack.count > 0 => Some(id),
+            _ => None,
+        }),
+        selected_place_count = selected_slot.map_or(0, |stack| stack.count),
         "thingcraft client booted"
     );
 
@@ -564,12 +492,36 @@ pub fn run() -> Result<()> {
                             &bootstrap_world.registry,
                         );
 
-                        let pre_inv = hotbar_inventory.snapshot_counts();
+                        let pre_inv = inventory_state.snapshot();
+
+                        // Apply queued inventory commands in fixed tick (authoritative path).
+                        while let Some(cmd) = inventory_commands.pop_front() {
+                            let result = inventory_state.apply(cmd);
+                            if result.changed {
+                                hud_dirty = true;
+                            }
+                            if !result.dropped_to_world.is_empty() {
+                                let drop_pos = ecs_runtime
+                                    .camera_snapshot()
+                                    .map(|snapshot| snapshot.authoritative.position + DVec3::new(0.0, 1.2, 0.0))
+                                    .unwrap_or(DVec3::ZERO);
+                                for dropped in result.dropped_to_world {
+                                    let ItemKey::Block(block_id) = dropped.item;
+                                    for _ in 0..dropped.count {
+                                        crate::entity::spawn_dropped_item(
+                                            ecs_runtime.world_mut(),
+                                            block_id,
+                                            drop_pos,
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
                         // Item pickup (player walks over dropped items).
                         if crate::entity::check_item_pickup(
                             ecs_runtime.world_mut(),
-                            &mut hotbar_inventory,
+                            &mut inventory_state,
                         ) {
                             hud_dirty = true;
                         }
@@ -579,7 +531,7 @@ pub fn run() -> Result<()> {
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
                             &mut edit_latency_tracker,
-                            &mut hotbar_inventory,
+                            &mut inventory_state,
                         );
                         for (block_id, spawn_pos) in item_spawns {
                             crate::entity::spawn_dropped_item(
@@ -589,17 +541,10 @@ pub fn run() -> Result<()> {
                             );
                         }
 
-                        if hotbar_inventory.snapshot_counts() != pre_inv {
+                        if inventory_state.snapshot() != pre_inv {
                             hud_dirty = true;
                         }
-                        let selected_for_hand =
-                            hotbar_inventory.slot(selected_hotbar_slot).and_then(|slot| {
-                                if slot.count > 0 {
-                                    Some(slot.block_id)
-                                } else {
-                                    None
-                                }
-                            });
+                        let selected_for_hand = inventory_state.selected_block_id();
                         first_person_hand.tick(selected_for_hand);
                         if fluid_budget_remaining > 0 {
                             let ticks_left = usize::try_from(ticks_to_run - tick_index).unwrap_or(1);
@@ -829,36 +774,50 @@ pub fn run() -> Result<()> {
                     // Build and upload HUD vertices only when state changes.
                     if hud_dirty {
                         let (sw, sh) = renderer.screen_size();
-                        let slot_counts: [u8; HOTBAR_BLOCK_IDS.len()] =
-                            std::array::from_fn(|i| hotbar_inventory.slot(i).map_or(0, |s| s.count));
-                        let slot_block_ids: [u8; HOTBAR_BLOCK_IDS.len()] = std::array::from_fn(
-                            |i| hotbar_inventory.slot(i).map_or(AIR_BLOCK_ID, |s| s.block_id),
-                        );
-                        let hud_state = hud::HudState {
-                            selected_slot: selected_hotbar_slot,
-                            slot_counts,
-                            slot_block_ids,
-                            health: frame_camera.map_or(20, |snapshot| snapshot.vitals.health),
-                            prev_health: frame_camera
-                                .map_or(20, |snapshot| snapshot.vitals.prev_health),
-                            invulnerable_timer: frame_camera
-                                .map_or(0, |snapshot| snapshot.vitals.invulnerable_timer),
-                            breath: frame_camera.map_or(300, |snapshot| snapshot.vitals.breath),
-                            breath_capacity: frame_camera
-                                .map_or(300, |snapshot| snapshot.vitals.breath_capacity),
-                            submerged_in_water: frame_camera
-                                .is_some_and(|snapshot| snapshot.vitals.submerged_in_water),
-                            armor_points: 0,
-                            is_dead: frame_camera.is_some_and(|snapshot| snapshot.vitals.health <= 0),
-                            death_ticks: frame_camera.map_or(0, |snapshot| snapshot.vitals.death_ticks),
-                            sim_ticks,
+                        let hud_verts = if inventory_open {
+                            hud::build_inventory_vertices(
+                                sw,
+                                sh,
+                                &inventory_state,
+                                mouse_screen_pos,
+                                &bootstrap_world.registry,
+                            )
+                        } else {
+                            let slot_counts: [u8; crate::inventory::HOTBAR_SLOT_COUNT] =
+                                std::array::from_fn(|i| {
+                                    inventory_state.hotbar_stack(i).map_or(0, |stack| stack.count)
+                                });
+                            let slot_block_ids: [u8; crate::inventory::HOTBAR_SLOT_COUNT] =
+                                std::array::from_fn(|i| {
+                                    inventory_state.hotbar_stack(i).map_or(AIR_BLOCK_ID, |stack| {
+                                        match stack.item {
+                                            ItemKey::Block(block_id) => block_id,
+                                        }
+                                    })
+                                });
+                            let hud_state = hud::HudState {
+                                selected_slot: usize::from(inventory_state.selected_hotbar),
+                                slot_counts,
+                                slot_block_ids,
+                                health: frame_camera.map_or(20, |snapshot| snapshot.vitals.health),
+                                prev_health: frame_camera
+                                    .map_or(20, |snapshot| snapshot.vitals.prev_health),
+                                invulnerable_timer: frame_camera
+                                    .map_or(0, |snapshot| snapshot.vitals.invulnerable_timer),
+                                breath: frame_camera.map_or(300, |snapshot| snapshot.vitals.breath),
+                                breath_capacity: frame_camera
+                                    .map_or(300, |snapshot| snapshot.vitals.breath_capacity),
+                                submerged_in_water: frame_camera
+                                    .is_some_and(|snapshot| snapshot.vitals.submerged_in_water),
+                                armor_points: 0,
+                                is_dead: frame_camera
+                                    .is_some_and(|snapshot| snapshot.vitals.health <= 0),
+                                death_ticks: frame_camera
+                                    .map_or(0, |snapshot| snapshot.vitals.death_ticks),
+                                sim_ticks,
+                            };
+                            hud::build_hud_vertices(sw, sh, &hud_state, &bootstrap_world.registry)
                         };
-                        let hud_verts = hud::build_hud_vertices(
-                            sw,
-                            sh,
-                            &hud_state,
-                            &bootstrap_world.registry,
-                        );
                         renderer.update_hud(&hud_verts);
                         hud_dirty = false;
                     }
@@ -960,7 +919,7 @@ pub fn run() -> Result<()> {
                         let player_dead = ecs_runtime.player_is_dead();
                         let allow_input_passthrough =
                             !player_dead || matches!(code, KeyCode::Escape | KeyCode::KeyR);
-                        if allow_input_passthrough {
+                        if allow_input_passthrough && !inventory_open {
                             ecs_runtime.handle_key(code, is_pressed);
                         }
 
@@ -969,12 +928,17 @@ pub fn run() -> Result<()> {
                                 return;
                             }
                             if let Some(slot) = hotbar_slot_for_key(code) {
-                                selected_hotbar_slot = slot;
+                                inventory_commands.push_back(InventoryCommand::SelectHotbar {
+                                    index: slot as u8,
+                                });
                                 hud_dirty = true;
-                                let slot_state = hotbar_inventory.slot(slot).unwrap_or_default();
-                                let block_id = slot_state.block_id;
-                                let count = slot_state.count;
-                                if bootstrap_world.registry.is_defined_block(block_id) {
+                                let slot_state = inventory_state.hotbar_stack(slot);
+                                let block_id = slot_state.and_then(|stack| match stack.item {
+                                    ItemKey::Block(id) if stack.count > 0 => Some(id),
+                                    _ => None,
+                                });
+                                let count = slot_state.map_or(0, |stack| stack.count);
+                                if let Some(block_id) = block_id {
                                     let block_name = bootstrap_world
                                         .registry
                                         .get(block_id)
@@ -1011,8 +975,25 @@ pub fn run() -> Result<()> {
                         }
 
                         if code == KeyCode::Escape && is_pressed {
-                            mouse_captured = false;
-                            set_mouse_capture(window, false);
+                            if inventory_open {
+                                inventory_commands.push_back(InventoryCommand::CloseInventory);
+                                inventory_open = false;
+                            } else {
+                                mouse_captured = false;
+                                set_mouse_capture(window, false);
+                            }
+                            hud_dirty = true;
+                        }
+
+                        if code == KeyCode::KeyE && is_pressed && !event.repeat {
+                            inventory_open = !inventory_open;
+                            if inventory_open {
+                                mouse_captured = false;
+                                set_mouse_capture(window, false);
+                            } else {
+                                inventory_commands.push_back(InventoryCommand::CloseInventory);
+                            }
+                            hud_dirty = true;
                         }
 
                         if code == KeyCode::KeyR && is_pressed && !event.repeat {
@@ -1031,6 +1012,23 @@ pub fn run() -> Result<()> {
                     if ecs_runtime.player_is_dead() {
                         return;
                     }
+                    if inventory_open {
+                        let (sw, sh) = renderer.screen_size();
+                        if let Some(slot) =
+                            hit_test_slot(mouse_screen_pos[0], mouse_screen_pos[1], sw, sh)
+                        {
+                            inventory_commands.push_back(InventoryCommand::ClickSlot {
+                                slot,
+                                button: MouseButton::Left,
+                            });
+                        } else {
+                            inventory_commands.push_back(InventoryCommand::ClickOutside {
+                                button: MouseButton::Left,
+                            });
+                        }
+                        hud_dirty = true;
+                        return;
+                    }
                     if !mouse_captured {
                         mouse_captured = true;
                         set_mouse_capture(window, true);
@@ -1047,8 +1045,28 @@ pub fn run() -> Result<()> {
                     button: MouseButton::Right,
                     state: ElementState::Pressed,
                     ..
-                } if mouse_captured => {
+                } => {
                     if ecs_runtime.player_is_dead() {
+                        return;
+                    }
+                    if inventory_open {
+                        let (sw, sh) = renderer.screen_size();
+                        if let Some(slot) =
+                            hit_test_slot(mouse_screen_pos[0], mouse_screen_pos[1], sw, sh)
+                        {
+                            inventory_commands.push_back(InventoryCommand::ClickSlot {
+                                slot,
+                                button: MouseButton::Right,
+                            });
+                        } else {
+                            inventory_commands.push_back(InventoryCommand::ClickOutside {
+                                button: MouseButton::Right,
+                            });
+                        }
+                        hud_dirty = true;
+                        return;
+                    }
+                    if !mouse_captured {
                         return;
                     }
                     first_person_hand.trigger_swing();
@@ -1056,17 +1074,36 @@ pub fn run() -> Result<()> {
                     enqueue_block_interaction_request(
                         &mut ecs_runtime,
                         &mut block_interaction_requests,
-                        BlockInteractionKind::Place {
-                            slot: selected_hotbar_slot,
-                        },
+                        BlockInteractionKind::Place,
                     );
                 },
+                WindowEvent::MouseWheel { delta, .. } => {
+                    if inventory_open || ecs_runtime.player_is_dead() {
+                        return;
+                    }
+                    let amount = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y as i32,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as i32,
+                    };
+                    if amount != 0 {
+                        inventory_commands.push_back(InventoryCommand::ScrollHotbar {
+                            delta: amount.signum() as i8,
+                        });
+                        hud_dirty = true;
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    mouse_screen_pos = [position.x as f32, position.y as f32];
+                    if inventory_open {
+                        hud_dirty = true;
+                    }
+                }
                 _ => {}
             },
             Event::DeviceEvent {
                 event: DeviceEvent::MouseMotion { delta },
                 ..
-            } if mouse_captured => {
+            } if mouse_captured && !inventory_open => {
                 if ecs_runtime.player_is_dead() {
                     return;
                 }
@@ -1200,7 +1237,7 @@ fn process_block_interaction_requests(
     chunk_streamer: &mut ChunkStreamer,
     queue: &mut VecDeque<BlockInteractionRequest>,
     edit_latency_tracker: &mut EditLatencyTracker,
-    hotbar_inventory: &mut HotbarInventory,
+    inventory: &mut PlayerInventoryState,
 ) -> Vec<(u8, DVec3)> {
     let mut item_spawns = Vec::new();
     while let Some(request) = queue.pop_front() {
@@ -1208,7 +1245,7 @@ fn process_block_interaction_requests(
             chunk_streamer,
             request,
             edit_latency_tracker,
-            hotbar_inventory,
+            inventory,
             &mut item_spawns,
         );
     }
@@ -1219,7 +1256,7 @@ fn process_single_block_interaction_request(
     chunk_streamer: &mut ChunkStreamer,
     request: BlockInteractionRequest,
     edit_latency_tracker: &mut EditLatencyTracker,
-    hotbar_inventory: &mut HotbarInventory,
+    inventory: &mut PlayerInventoryState,
     item_spawns: &mut Vec<(u8, DVec3)>,
 ) {
     let Some(hit) = raycast_first_solid_block(
@@ -1253,18 +1290,13 @@ fn process_single_block_interaction_request(
                 edit_latency_tracker.record_block_edit(hit.block[0], hit.block[2]);
             }
         }
-        BlockInteractionKind::Place { slot } => {
+        BlockInteractionKind::Place => {
             if hit.normal == [0, 0, 0] {
                 return;
             }
-            let Some(slot_data) = hotbar_inventory.slot(slot) else {
+            let Some(block_id) = inventory.selected_block_id() else {
                 return;
             };
-            if slot_data.count == 0 {
-                return;
-            }
-
-            let block_id = slot_data.block_id;
             let [x, y, z] = hit.block;
             let Some(place_x) = x.checked_add(hit.normal[0]) else {
                 return;
@@ -1279,7 +1311,7 @@ fn process_single_block_interaction_request(
             if chunk_streamer.block_at_world(place_x, place_y, place_z) == Some(AIR_BLOCK_ID)
                 && chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id)
             {
-                hotbar_inventory.try_consume_from_slot(slot);
+                let _ = inventory.apply(InventoryCommand::ConsumeSelected { amount: 1 });
                 edit_latency_tracker.record_block_edit(place_x, place_z);
             }
         }
@@ -2565,8 +2597,7 @@ mod tests {
         alpha_brightness_from_light_level, alpha_fog_brightness_target, alpha_star_brightness,
         alpha_sunrise_color, alpha_time_of_day, has_target_directive, hotbar_slot_for_key,
         parse_env_bool, parse_env_u32, raycast_first_solid_block, resolve_axis,
-        AdaptiveFluidBudget, BlockRayHit, HotbarInventory, AIR_BLOCK_ID, HOTBAR_BLOCK_IDS,
-        HOTBAR_STACK_LIMIT,
+        AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID,
     };
     use crate::streaming::{ChunkStreamer, ResidencyConfig};
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
@@ -2626,67 +2657,6 @@ mod tests {
         assert_eq!(hotbar_slot_for_key(KeyCode::Digit5), Some(4));
         assert_eq!(hotbar_slot_for_key(KeyCode::Digit9), Some(8));
         assert_eq!(hotbar_slot_for_key(KeyCode::KeyB), None);
-    }
-
-    #[test]
-    fn hotbar_blocks_are_defined_in_alpha_registry() {
-        let registry = BlockRegistry::alpha_1_2_6();
-        assert_eq!(HOTBAR_BLOCK_IDS.len(), 9);
-        for block_id in HOTBAR_BLOCK_IDS {
-            if block_id != AIR_BLOCK_ID {
-                assert!(registry.is_defined_block(block_id));
-            }
-        }
-    }
-
-    #[test]
-    fn hotbar_defaults_start_full_stacks() {
-        let hotbar = HotbarInventory::alpha_defaults();
-        for (slot_index, slot) in hotbar.slots.iter().enumerate() {
-            assert_eq!(slot.block_id, HOTBAR_BLOCK_IDS[slot_index]);
-            let expected_count = if slot.block_id == AIR_BLOCK_ID {
-                0
-            } else {
-                HOTBAR_STACK_LIMIT
-            };
-            assert_eq!(slot.count, expected_count);
-        }
-    }
-
-    #[test]
-    fn hotbar_consume_stops_at_zero() {
-        let mut hotbar = HotbarInventory::alpha_defaults();
-        let slot = 0;
-        for _ in 0..HOTBAR_STACK_LIMIT {
-            assert!(hotbar.try_consume_from_slot(slot));
-        }
-        assert!(!hotbar.try_consume_from_slot(slot));
-        assert_eq!(hotbar.slot(slot).map(|state| state.count), Some(0));
-    }
-
-    #[test]
-    fn hotbar_pickup_requires_matching_slot_and_stack_space() {
-        let mut hotbar = HotbarInventory::alpha_defaults();
-        let dirt_slot = 0;
-        assert!(hotbar.try_consume_from_slot(dirt_slot));
-        assert_eq!(
-            hotbar.slot(dirt_slot),
-            Some(super::HotbarSlot {
-                block_id: HOTBAR_BLOCK_IDS[dirt_slot],
-                count: HOTBAR_STACK_LIMIT - 1,
-            })
-        );
-
-        assert!(hotbar.try_pickup_block(HOTBAR_BLOCK_IDS[dirt_slot]));
-        assert_eq!(
-            hotbar.slot(dirt_slot),
-            Some(super::HotbarSlot {
-                block_id: HOTBAR_BLOCK_IDS[dirt_slot],
-                count: HOTBAR_STACK_LIMIT,
-            })
-        );
-        assert!(!hotbar.try_pickup_block(HOTBAR_BLOCK_IDS[dirt_slot]));
-        assert!(!hotbar.try_pickup_block(2));
     }
 
     #[test]

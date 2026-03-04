@@ -7,6 +7,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use crate::ecs::{PhysicsBody, Player, RenderAlpha, Transform64};
+use crate::inventory::PlayerInventoryState;
 use crate::mesh::{ChunkMesh, MeshVertex};
 use crate::streaming::ChunkStreamer;
 use crate::world::{BlockRegistry, CHUNK_HEIGHT};
@@ -377,7 +378,7 @@ pub fn tick_entity_physics(
 // ---------------------------------------------------------------------------
 
 /// Check AABB overlap between player and dropped items. Returns true if any pickup happened.
-pub fn check_item_pickup(world: &mut World, hotbar: &mut crate::app::HotbarInventory) -> bool {
+pub fn check_item_pickup(world: &mut World, inventory: &mut PlayerInventoryState) -> bool {
     // Read player position + physics.
     let mut player_query = world.query_filtered::<(&Transform64, &PhysicsBody), With<Player>>();
     let Some((player_t, player_p)) = player_query.iter(world).next().map(|(t, p)| (*t, *p)) else {
@@ -429,7 +430,7 @@ pub fn check_item_pickup(world: &mut World, hotbar: &mut crate::app::HotbarInven
             && p_max.y > i_min.y
             && p_min.z < i_max.z
             && p_max.z > i_min.z
-            && hotbar.try_pickup_block(block_id)
+            && inventory.try_add_block_pickup(block_id)
         {
             to_despawn.push(entity);
             any_pickup = true;
