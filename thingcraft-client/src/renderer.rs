@@ -60,7 +60,8 @@ pub struct Renderer<'w> {
     visible_chunk_meshes: usize,
     hud_pipeline: wgpu::RenderPipeline,
     hud_uniform_buffer: wgpu::Buffer,
-    hud_bind_group: wgpu::BindGroup,
+    hud_uniform_bind_group: wgpu::BindGroup,
+    hud_texture_bind_group: wgpu::BindGroup,
     hud_vertex_buffer: Option<wgpu::Buffer>,
     hud_vertex_count: u32,
     fog_color: [f32; 3],
@@ -744,61 +745,60 @@ impl<'w> Renderer<'w> {
                 ],
                 push_constant_ranges: &[],
             });
-        let celestial_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("thingcraft-celestial-pipeline"),
-                layout: Some(&celestial_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &celestial_shader,
-                    entry_point: "vs_main",
-                    buffers: &[CelestialVertex::layout()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Always,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &celestial_shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        // Additive blending: GL_ONE, GL_ONE (MC Alpha)
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                multiview: None,
-            });
+        let celestial_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thingcraft-celestial-pipeline"),
+            layout: Some(&celestial_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &celestial_shader,
+                entry_point: "vs_main",
+                buffers: &[CelestialVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &celestial_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    // Additive blending: GL_ONE, GL_ONE (MC Alpha)
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
 
         let terrain_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1201,9 +1201,9 @@ impl<'w> Renderer<'w> {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let hud_bind_group_layout =
+        let hud_uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("thingcraft-hud-bind-group-layout"),
+                label: Some("thingcraft-hud-uniform-bind-group-layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -1216,13 +1216,167 @@ impl<'w> Renderer<'w> {
                 }],
             });
 
-        let hud_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("thingcraft-hud-bind-group"),
-            layout: &hud_bind_group_layout,
+        let hud_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thingcraft-hud-uniform-bind-group"),
+            layout: &hud_uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: hud_uniform_buffer.as_entire_binding(),
             }],
+        });
+
+        let hud_texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("thingcraft-hud-texture-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let (gui_w, gui_h, gui_rgba) =
+            load_png_rgba(Path::new("resources/minecraft-a1.2.6-client/gui/gui.png"));
+        let gui_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thingcraft-hud-gui-texture"),
+            size: wgpu::Extent3d {
+                width: gui_w,
+                height: gui_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // HUD textures in this pipeline are authored for direct gamma-space output to the
+            // non-sRGB swapchain (matching the rest of ThingCraft's Alpha-style path).
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &gui_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &gui_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * gui_w),
+                rows_per_image: Some(gui_h),
+            },
+            wgpu::Extent3d {
+                width: gui_w,
+                height: gui_h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let (icons_w, icons_h, icons_rgba) =
+            load_png_rgba(Path::new("resources/minecraft-a1.2.6-client/gui/icons.png"));
+        let icons_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thingcraft-hud-icons-texture"),
+            size: wgpu::Extent3d {
+                width: icons_w,
+                height: icons_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &icons_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &icons_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * icons_w),
+                rows_per_image: Some(icons_h),
+            },
+            wgpu::Extent3d {
+                width: icons_w,
+                height: icons_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let hud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("thingcraft-hud-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        let gui_view = gui_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let icons_view = icons_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let terrain_view = terrain_atlas
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let hud_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thingcraft-hud-texture-bind-group"),
+            layout: &hud_texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&gui_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&icons_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&terrain_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&hud_sampler),
+                },
+            ],
         });
 
         let hud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1232,7 +1386,10 @@ impl<'w> Renderer<'w> {
 
         let hud_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("thingcraft-hud-pipeline-layout"),
-            bind_group_layouts: &[&hud_bind_group_layout],
+            bind_group_layouts: &[
+                &hud_uniform_bind_group_layout,
+                &hud_texture_bind_group_layout,
+            ],
             push_constant_ranges: &[],
         });
 
@@ -1425,7 +1582,8 @@ impl<'w> Renderer<'w> {
             visible_chunk_meshes: 0,
             hud_pipeline,
             hud_uniform_buffer,
-            hud_bind_group,
+            hud_uniform_bind_group,
+            hud_texture_bind_group,
             hud_vertex_buffer: None,
             hud_vertex_count: 0,
             fog_color: DEFAULT_FOG_COLOR,
@@ -1910,7 +2068,8 @@ impl<'w> Renderer<'w> {
                 render_pass.draw_indexed(0..self.sky_dome.light_index_count, 0, 0..1);
                 // Dark dome (lower hemisphere)
                 render_pass.draw_indexed(
-                    self.sky_dome.dark_index_offset..self.sky_dome.dark_index_offset + self.sky_dome.dark_index_count,
+                    self.sky_dome.dark_index_offset
+                        ..self.sky_dome.dark_index_offset + self.sky_dome.dark_index_count,
                     0,
                     0..1,
                 );
@@ -2089,7 +2248,8 @@ impl<'w> Renderer<'w> {
             });
 
             hud_pass.set_pipeline(&self.hud_pipeline);
-            hud_pass.set_bind_group(0, &self.hud_bind_group, &[]);
+            hud_pass.set_bind_group(0, &self.hud_uniform_bind_group, &[]);
+            hud_pass.set_bind_group(1, &self.hud_texture_bind_group, &[]);
             hud_pass.set_vertex_buffer(0, hud_vb.slice(..));
             hud_pass.draw(0..self.hud_vertex_count, 0..1);
         }
@@ -2229,24 +2389,70 @@ fn create_celestial_bodies(
     // Sun quad: centered at (0, +100, 0), size 30×30 in XZ plane
     let r = 30.0_f32;
     let sun_base = vertices.len() as u32;
-    vertices.push(CelestialVertex { position: [-r, 100.0, -r], uv: [0.0, 0.0], body_id: 0.0 });
-    vertices.push(CelestialVertex { position: [r, 100.0, -r], uv: [1.0, 0.0], body_id: 0.0 });
-    vertices.push(CelestialVertex { position: [r, 100.0, r], uv: [1.0, 1.0], body_id: 0.0 });
-    vertices.push(CelestialVertex { position: [-r, 100.0, r], uv: [0.0, 1.0], body_id: 0.0 });
+    vertices.push(CelestialVertex {
+        position: [-r, 100.0, -r],
+        uv: [0.0, 0.0],
+        body_id: 0.0,
+    });
+    vertices.push(CelestialVertex {
+        position: [r, 100.0, -r],
+        uv: [1.0, 0.0],
+        body_id: 0.0,
+    });
+    vertices.push(CelestialVertex {
+        position: [r, 100.0, r],
+        uv: [1.0, 1.0],
+        body_id: 0.0,
+    });
+    vertices.push(CelestialVertex {
+        position: [-r, 100.0, r],
+        uv: [0.0, 1.0],
+        body_id: 0.0,
+    });
     let sun_index_offset = indices.len() as u32;
-    indices.extend_from_slice(&[sun_base, sun_base + 1, sun_base + 2, sun_base + 2, sun_base + 3, sun_base]);
+    indices.extend_from_slice(&[
+        sun_base,
+        sun_base + 1,
+        sun_base + 2,
+        sun_base + 2,
+        sun_base + 3,
+        sun_base,
+    ]);
     let sun_index_count = 6;
 
     // Moon quad: centered at (0, -100, 0), size 20×20, reversed winding (viewed from below)
     let r = 20.0_f32;
     let moon_base = vertices.len() as u32;
     // MC Alpha: vertex order is reversed for moon (WorldRenderer.java:601-606)
-    vertices.push(CelestialVertex { position: [-r, -100.0, r], uv: [1.0, 1.0], body_id: 1.0 });
-    vertices.push(CelestialVertex { position: [r, -100.0, r], uv: [0.0, 1.0], body_id: 1.0 });
-    vertices.push(CelestialVertex { position: [r, -100.0, -r], uv: [0.0, 0.0], body_id: 1.0 });
-    vertices.push(CelestialVertex { position: [-r, -100.0, -r], uv: [1.0, 0.0], body_id: 1.0 });
+    vertices.push(CelestialVertex {
+        position: [-r, -100.0, r],
+        uv: [1.0, 1.0],
+        body_id: 1.0,
+    });
+    vertices.push(CelestialVertex {
+        position: [r, -100.0, r],
+        uv: [0.0, 1.0],
+        body_id: 1.0,
+    });
+    vertices.push(CelestialVertex {
+        position: [r, -100.0, -r],
+        uv: [0.0, 0.0],
+        body_id: 1.0,
+    });
+    vertices.push(CelestialVertex {
+        position: [-r, -100.0, -r],
+        uv: [1.0, 0.0],
+        body_id: 1.0,
+    });
     let moon_index_offset = indices.len() as u32;
-    indices.extend_from_slice(&[moon_base, moon_base + 1, moon_base + 2, moon_base + 2, moon_base + 3, moon_base]);
+    indices.extend_from_slice(&[
+        moon_base,
+        moon_base + 1,
+        moon_base + 2,
+        moon_base + 2,
+        moon_base + 3,
+        moon_base,
+    ]);
     let moon_index_count = 6;
 
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2427,8 +2633,14 @@ fn build_block_outline_vertices(block: [i32; 3]) -> Vec<OutlineVertex> {
 
     let mut verts = Vec::with_capacity(24);
     let mut line = |a: [f32; 3], b: [f32; 3]| {
-        verts.push(OutlineVertex { position: a, color: COLOR });
-        verts.push(OutlineVertex { position: b, color: COLOR });
+        verts.push(OutlineVertex {
+            position: a,
+            color: COLOR,
+        });
+        verts.push(OutlineVertex {
+            position: b,
+            color: COLOR,
+        });
     };
 
     // Bottom ring
@@ -3536,15 +3748,23 @@ struct HudScreen {
 
 @group(0) @binding(0)
 var<uniform> screen: HudScreen;
+@group(1) @binding(0) var hud_gui_tex: texture_2d<f32>;
+@group(1) @binding(1) var hud_icons_tex: texture_2d<f32>;
+@group(1) @binding(2) var hud_terrain_tex: texture_2d<f32>;
+@group(1) @binding(3) var hud_sampler: sampler;
 
 struct VertexIn {
     @location(0) position: vec2<f32>,
-    @location(1) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) texture_kind: f32,
 };
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
-    @location(0) color: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) texture_kind: f32,
 };
 
 @vertex
@@ -3555,13 +3775,24 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
     var out: VertexOut;
     out.clip_pos = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    out.uv = input.uv;
     out.color = input.color;
+    out.texture_kind = input.texture_kind;
     return out;
 }
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-    return input.color;
+    var texel = textureSample(hud_gui_tex, hud_sampler, input.uv);
+    if (input.texture_kind > 0.5 && input.texture_kind < 1.5) {
+        texel = textureSample(hud_icons_tex, hud_sampler, input.uv);
+    } else if (input.texture_kind >= 1.5) {
+        texel = textureSample(hud_terrain_tex, hud_sampler, input.uv);
+    }
+    if (texel.a <= 0.01) {
+        discard;
+    }
+    return texel * input.color;
 }
 "#;
 

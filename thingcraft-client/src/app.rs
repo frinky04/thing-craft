@@ -551,6 +551,9 @@ pub fn run() -> Result<()> {
                         fog_brightness += (target_fog_brightness - fog_brightness) * 0.1;
                     }
                     let tick_duration = tick_timer_start.elapsed();
+                    if ticks_to_run > 0 {
+                        hud_dirty = true;
+                    }
                     adaptive_fluid_budget.observe_frame(
                         frame_delta,
                         ticks_to_run,
@@ -614,6 +617,9 @@ pub fn run() -> Result<()> {
                             snapshot.interpolated.yaw,
                             snapshot.interpolated.pitch,
                         );
+                        let view_bob = alpha_view_bob_matrix(&snapshot, render_alpha);
+                        let mut sky_view_bob = view_bob;
+                        sky_view_bob.w_axis = glam::Vec4::W;
                         let view =
                             Mat4::look_to_rh(snapshot.interpolated.position, direction, Vec3::Y);
                         let projection = Mat4::perspective_rh_gl(
@@ -625,8 +631,8 @@ pub fn run() -> Result<()> {
                         // Rotation-only view for sky/celestial (strips translation → infinite distance).
                         let sky_view = Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Y);
                         renderer.update_camera(
-                            (projection * view).to_cols_array_2d(),
-                            (projection * sky_view).to_cols_array_2d(),
+                            (projection * view_bob * view).to_cols_array_2d(),
+                            (projection * sky_view_bob * sky_view).to_cols_array_2d(),
                             snapshot.interpolated.position.to_array(),
                             render_distance_blocks * 0.25,
                             render_distance_blocks,
@@ -690,15 +696,28 @@ pub fn run() -> Result<()> {
                     // Build and upload HUD vertices only when state changes.
                     if hud_dirty {
                         let (sw, sh) = renderer.screen_size();
-                        let mut hud_verts = hud::build_crosshair_vertices(sw, sh);
                         let slot_counts: [u8; HOTBAR_BLOCK_IDS.len()] =
                             std::array::from_fn(|i| hotbar_inventory.slot(i).map_or(0, |s| s.count));
-                        hud_verts.extend(hud::build_hotbar_vertices(
+                        let slot_block_ids: [u8; HOTBAR_BLOCK_IDS.len()] = std::array::from_fn(
+                            |i| hotbar_inventory.slot(i).map_or(AIR_BLOCK_ID, |s| s.block_id),
+                        );
+                        let hud_state = hud::HudState {
+                            selected_slot: selected_hotbar_slot,
+                            slot_counts,
+                            slot_block_ids,
+                            health: frame_camera.map_or(20, |snapshot| snapshot.vitals.health),
+                            prev_health: frame_camera
+                                .map_or(20, |snapshot| snapshot.vitals.prev_health),
+                            invulnerable_timer: frame_camera
+                                .map_or(0, |snapshot| snapshot.vitals.invulnerable_timer),
+                            sim_ticks,
+                        };
+                        let hud_verts = hud::build_hud_vertices(
                             sw,
                             sh,
-                            selected_hotbar_slot,
-                            &slot_counts,
-                        ));
+                            &hud_state,
+                            &bootstrap_world.registry,
+                        );
                         renderer.update_hud(&hud_verts);
                         hud_dirty = false;
                     }
@@ -903,6 +922,35 @@ fn direction_from_angles(yaw: f32, pitch: f32) -> Vec3 {
     let y = pitch.sin();
     let z = yaw.cos() * pitch.cos();
     Vec3::new(x as f32, y as f32, z as f32).normalize_or_zero()
+}
+
+fn alpha_view_bob_matrix(snapshot: &crate::ecs::CameraSnapshot, render_alpha: f32) -> Mat4 {
+    if snapshot.fly_mode {
+        return Mat4::IDENTITY;
+    }
+
+    let walk_delta = snapshot.walk_bob.walk_distance - snapshot.walk_bob.last_walk_distance;
+    let walk = snapshot.walk_bob.walk_distance + walk_delta * render_alpha;
+    let bob = snapshot.walk_bob.last_bob
+        + (snapshot.walk_bob.bob - snapshot.walk_bob.last_bob) * render_alpha;
+    let tilt = snapshot.walk_bob.last_tilt
+        + (snapshot.walk_bob.tilt - snapshot.walk_bob.last_tilt) * render_alpha;
+
+    let sin_walk = (walk * std::f32::consts::PI).sin();
+    let cos_walk = (walk * std::f32::consts::PI).cos();
+
+    let translate = Mat4::from_translation(Vec3::new(
+        sin_walk * bob * 0.5,
+        -(cos_walk.abs() * bob),
+        0.0,
+    ));
+    let roll = Mat4::from_rotation_z((sin_walk * bob * 3.0).to_radians());
+    let pitch = Mat4::from_rotation_x(
+        (((walk * std::f32::consts::PI + 0.2).cos().abs()) * bob * 5.0).to_radians(),
+    );
+    let tilt_rot = Mat4::from_rotation_x(tilt.to_radians());
+
+    tilt_rot * pitch * roll * translate
 }
 
 fn direction_from_angles64(yaw: f64, pitch: f64) -> DVec3 {
@@ -1602,7 +1650,11 @@ fn resolve_player_physics(
     } else {
         fall_distance = 0.0;
     }
+    let mut damage_taken = 0;
     if on_ground {
+        if fall_distance > 3.0 {
+            damage_taken = (fall_distance - 3.0).ceil() as i32;
+        }
         fall_distance = 0.0;
     }
 
@@ -1618,7 +1670,7 @@ fn resolve_player_physics(
         velocity.z = 0.0;
     }
 
-    ecs_runtime.apply_resolved_physics(pos, velocity, on_ground, fall_distance);
+    ecs_runtime.apply_resolved_physics(pos, velocity, on_ground, fall_distance, damage_taken);
 }
 
 /// Collect AABBs of all solid blocks overlapping the given region into `out`.

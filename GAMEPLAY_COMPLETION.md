@@ -35,6 +35,8 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 ## Entities and Mobs
 - [x] Entity Framework: bevy_ecs entity lifecycle with components for physics, age, pickup delay, and render interpolation. Simplified AABB collision (Alpha ItemEntity constants), solid-block ejection, and age-based despawn.
 - [x] Dropped Items: Breaking a block spawns a dropped item entity with Alpha-faithful physics (gravity 0.04, bounce, drag, 10-tick pickup delay, 5-minute despawn). Items render as billboarded terrain atlas sprites with bobbing animation.
+- [~] Player Survival Loop: Core vitals state is now active (20 HP hearts, invulnerability damage window, hurt timer, fall-damage application from landing distance), but full survival parity (mob combat, drowning/lava/environmental damage, death flow, respawn UX, food-based healing) is still pending.
+- [~] In-Game HUD: Alpha-style textured HUD rendering is now active (`gui.png` + `icons.png` + terrain item sprites) with real hotbar art, crosshair, selected-slot frame, item icons, and heart bar flash/jitter behavior; armor/air/chat/debug overlays remain pending.
 - [ ] Passive Mobs: Pigs, Sheep, Cows, Chickens.
 - [ ] Hostile Mobs: Zombies, Skeletons, Spiders, Creepers, Slimes.
 - [ ] Nether Mobs: Ghasts, Zombie Pigmen.

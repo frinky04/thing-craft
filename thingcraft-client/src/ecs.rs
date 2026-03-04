@@ -72,6 +72,70 @@ impl Default for PhysicsBody {
     }
 }
 
+/// Player health/damage state based on Alpha MobEntity fields.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PlayerVitals {
+    pub health: i32,
+    pub prev_health: i32,
+    pub invulnerable_ticks: i32,
+    pub invulnerable_timer: i32,
+    pub prev_damage_taken: i32,
+    pub damaged_time: i32,
+    pub damaged_timer: i32,
+}
+
+impl Default for PlayerVitals {
+    fn default() -> Self {
+        Self {
+            health: 20,
+            prev_health: 20,
+            invulnerable_ticks: 20,
+            invulnerable_timer: 0,
+            prev_damage_taken: 0,
+            damaged_time: 0,
+            damaged_timer: 0,
+        }
+    }
+}
+
+impl PlayerVitals {
+    /// Alpha-like damage handling with invulnerability window behavior.
+    pub fn apply_damage(&mut self, amount: i32) -> bool {
+        if amount <= 0 || self.health <= 0 {
+            return false;
+        }
+
+        if self.invulnerable_timer > self.invulnerable_ticks / 2 {
+            if amount <= self.prev_damage_taken {
+                return false;
+            }
+            self.health -= amount - self.prev_damage_taken;
+            self.prev_damage_taken = amount;
+        } else {
+            self.prev_damage_taken = amount;
+            self.prev_health = self.health;
+            self.invulnerable_timer = self.invulnerable_ticks;
+            self.health -= amount;
+            self.damaged_time = 10;
+            self.damaged_timer = 10;
+        }
+
+        self.health = self.health.max(0);
+        true
+    }
+}
+
+/// Player first-person bobbing state, mirroring Alpha player fields.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct PlayerWalkBob {
+    pub walk_distance: f32,
+    pub last_walk_distance: f32,
+    pub bob: f32,
+    pub last_bob: f32,
+    pub tilt: f32,
+    pub last_tilt: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum SimCommandEvent {
     MoveIntent { x: f32, y: f32, z: f32 },
@@ -131,6 +195,8 @@ pub struct CameraSnapshot {
     pub interpolated: RenderTransform,
     pub fly_mode: bool,
     pub physics: PhysicsBody,
+    pub vitals: PlayerVitals,
+    pub walk_bob: PlayerWalkBob,
 }
 
 pub struct EcsRuntime {
@@ -160,6 +226,8 @@ impl EcsRuntime {
             },
             RenderTransform::default(),
             PhysicsBody::default(),
+            PlayerVitals::default(),
+            PlayerWalkBob::default(),
         ));
 
         let mut input_schedule = Schedule::default();
@@ -222,14 +290,19 @@ impl EcsRuntime {
             &RenderTransform,
             &FlyCamera,
             &PhysicsBody,
+            &PlayerVitals,
+            &PlayerWalkBob,
         ), With<Player>>();
-        let (transform, render_transform, fly_camera, physics) = query.iter(&self.world).next()?;
+        let (transform, render_transform, fly_camera, physics, vitals, walk_bob) =
+            query.iter(&self.world).next()?;
 
         Some(CameraSnapshot {
             authoritative: *transform,
             interpolated: *render_transform,
             fly_mode: fly_camera.fly_mode,
             physics: *physics,
+            vitals: *vitals,
+            walk_bob: *walk_bob,
         })
     }
 
@@ -258,15 +331,61 @@ impl EcsRuntime {
         velocity: DVec3,
         on_ground: bool,
         fall_distance: f64,
+        damage_taken: i32,
     ) {
-        let mut query = self
-            .world
-            .query_filtered::<(&mut Transform64, &mut PhysicsBody), With<Player>>();
-        if let Some((mut transform, mut physics)) = query.iter_mut(&mut self.world).next() {
+        let mut query = self.world.query_filtered::<(
+            &mut Transform64,
+            &mut PhysicsBody,
+            &mut PlayerVitals,
+            &mut PlayerWalkBob,
+        ), With<Player>>();
+        if let Some((mut transform, mut physics, mut vitals, mut walk_bob)) =
+            query.iter_mut(&mut self.world).next()
+        {
+            // Alpha walkDistance increments from horizontal movement after collision resolution.
+            let delta_x = position.x - transform.prev_position.x;
+            let delta_z = position.z - transform.prev_position.z;
+            walk_bob.last_walk_distance = walk_bob.walk_distance;
+            walk_bob.walk_distance += (delta_x * delta_x + delta_z * delta_z).sqrt() as f32 * 0.6;
+
             transform.position = position;
-            physics.velocity = velocity;
+            // Alpha post-move velocity integration for next tick.
+            let mut next_velocity = velocity;
+            next_velocity.y -= GRAVITY;
+            next_velocity.y *= AIR_DRAG_Y;
+            let h_friction = if on_ground {
+                GROUND_FRICTION
+            } else {
+                AIR_FRICTION_H
+            };
+            next_velocity.x *= h_friction;
+            next_velocity.z *= h_friction;
+            physics.velocity = next_velocity;
             physics.on_ground = on_ground;
             physics.fall_distance = fall_distance;
+
+            // Alpha bob/tilt smoothing from horizontal/vertical motion.
+            walk_bob.last_bob = walk_bob.bob;
+            walk_bob.last_tilt = walk_bob.tilt;
+            let mut bob_target =
+                (next_velocity.x * next_velocity.x + next_velocity.z * next_velocity.z).sqrt()
+                    as f32;
+            let mut tilt_target = (-next_velocity.y * 0.2).atan() as f32 * 15.0;
+            if bob_target > 0.1 {
+                bob_target = 0.1;
+            }
+            if !on_ground || vitals.health <= 0 {
+                bob_target = 0.0;
+            }
+            if on_ground || vitals.health <= 0 {
+                tilt_target = 0.0;
+            }
+            walk_bob.bob += (bob_target - walk_bob.bob) * 0.4;
+            walk_bob.tilt += (tilt_target - walk_bob.tilt) * 0.8;
+
+            if damage_taken > 0 {
+                let _ = vitals.apply_damage(damage_taken);
+            }
         }
     }
 
@@ -347,9 +466,26 @@ const JUMP_VELOCITY: f64 = 0.42;
 fn apply_player_motion_system(
     fixed_dt: Res<'_, FixedDeltaSeconds>,
     mut intent: ResMut<'_, PlayerIntentState>,
-    mut players: Query<'_, '_, (&mut Transform64, &mut FlyCamera, &mut PhysicsBody), With<Player>>,
+    mut players: Query<
+        '_,
+        '_,
+        (
+            &mut Transform64,
+            &mut FlyCamera,
+            &mut PhysicsBody,
+            &mut PlayerVitals,
+        ),
+        With<Player>,
+    >,
 ) {
-    for (mut transform, mut camera, mut physics) in &mut players {
+    for (mut transform, mut camera, mut physics, mut vitals) in &mut players {
+        if vitals.damaged_timer > 0 {
+            vitals.damaged_timer -= 1;
+        }
+        if vitals.invulnerable_timer > 0 {
+            vitals.invulnerable_timer -= 1;
+        }
+
         // Handle fly toggle with position adjustment to prevent coordinate-space jump.
         // In fly mode, position = camera (eye). In physics mode, position = feet.
         if intent.toggle_fly_requested {
@@ -396,11 +532,9 @@ fn apply_player_motion_system(
             transform.position += desired_direction * camera.speed * fixed_dt.0;
             physics.velocity = DVec3::ZERO;
         } else {
-            // Physics mode: Alpha-faithful gravity + friction + acceleration.
-            // The system computes velocity; collision resolution is done in app.rs.
-
-            // Gravity.
-            physics.velocity.y -= GRAVITY;
+            // Physics mode: apply jump + input acceleration and integrate position.
+            // Collision resolution and post-move drag/friction are handled after
+            // this system in app.rs via `apply_resolved_physics`.
 
             // Jump: apply impulse if on_ground and jump requested.
             if intent.jump_requested && physics.on_ground {
@@ -424,18 +558,10 @@ fn apply_player_motion_system(
             physics.velocity.x += move_dir.x * acceleration;
             physics.velocity.z += move_dir.z * acceleration;
 
-            // Apply friction / drag.
-            physics.velocity.y *= AIR_DRAG_Y;
-            let h_friction = if physics.on_ground {
-                GROUND_FRICTION
-            } else {
-                AIR_FRICTION_H
-            };
-            physics.velocity.x *= h_friction;
-            physics.velocity.z *= h_friction;
-
-            // Apply velocity to position (collision resolution happens in app.rs).
+            // Apply current velocity to position first (Alpha Entity.move path).
+            // Collision resolution happens in app.rs after this system.
             transform.position += physics.velocity;
+
         }
     }
 
@@ -569,5 +695,46 @@ mod tests {
             .authoritative
             .position;
         assert!(after.x < before.x);
+    }
+
+    #[test]
+    fn grounded_forward_tick_applies_pre_friction_displacement() {
+        let mut runtime = EcsRuntime::new();
+        {
+            let mut query = runtime.world.query_filtered::<
+                (&mut FlyCamera, &mut PhysicsBody, &mut Transform64),
+                With<Player>,
+            >();
+            let (mut camera, mut physics, mut transform) = query
+                .iter_mut(&mut runtime.world)
+                .next()
+                .expect("expected player");
+            camera.fly_mode = false;
+            physics.on_ground = true;
+            physics.velocity = DVec3::ZERO;
+            transform.yaw = 0.0;
+            transform.pitch = 0.0;
+        }
+
+        let before = runtime
+            .camera_snapshot()
+            .expect("expected player snapshot")
+            .authoritative
+            .position;
+
+        runtime.handle_key(KeyCode::KeyW, true);
+        runtime.run_input();
+        runtime.run_fixed(1.0 / 20.0);
+
+        let after = runtime
+            .camera_snapshot()
+            .expect("expected player snapshot")
+            .authoritative
+            .position;
+        let dz = after.z - before.z;
+        assert!(
+            dz > 0.09,
+            "expected Alpha-like ~0.1 pre-friction displacement, got {dz}"
+        );
     }
 }
