@@ -34,7 +34,7 @@ const NOISY_LOG_TARGET_DEFAULTS: [&str; 5] = [
 const APPLY_STREAM_UPDATES_TO_RENDERER: bool = true;
 const BLOCK_INTERACTION_REACH_BLOCKS: f64 = 5.0;
 const AIR_BLOCK_ID: u8 = 0;
-const HOTBAR_BLOCK_IDS: [u8; 9] = [3, 1, 4, 12, 13, 17, 5, 9, 50];
+const HOTBAR_BLOCK_IDS: [u8; 9] = [3, 1, 4, 12, AIR_BLOCK_ID, 17, 5, 9, 50];
 const HOTBAR_STACK_LIMIT: u8 = 64;
 const EDIT_LATENCY_SAMPLE_WINDOW: usize = 128;
 const FLUID_TICK_BUDGET_DEFAULT: usize = 384;
@@ -131,9 +131,15 @@ struct AdaptiveFluidBudget {
 impl HotbarInventory {
     fn alpha_defaults() -> Self {
         Self {
-            slots: HOTBAR_BLOCK_IDS.map(|block_id| HotbarSlot {
-                block_id,
-                count: HOTBAR_STACK_LIMIT,
+            slots: HOTBAR_BLOCK_IDS.map(|block_id| {
+                if block_id == AIR_BLOCK_ID {
+                    HotbarSlot::default()
+                } else {
+                    HotbarSlot {
+                        block_id,
+                        count: HOTBAR_STACK_LIMIT,
+                    }
+                }
             }),
         }
     }
@@ -181,7 +187,9 @@ struct FirstPersonHandState {
     shown_block_id: Option<u8>,
     hand_height: f32,
     last_hand_height: f32,
-    swing_ticks: u8,
+    attack_progress: f32,
+    last_attack_progress: f32,
+    swing_ticks: i32,
     swing_active: bool,
 }
 
@@ -191,6 +199,8 @@ impl Default for FirstPersonHandState {
             shown_block_id: None,
             hand_height: 0.0,
             last_hand_height: 0.0,
+            attack_progress: 0.0,
+            last_attack_progress: 0.0,
             swing_ticks: 0,
             swing_active: false,
         }
@@ -198,14 +208,20 @@ impl Default for FirstPersonHandState {
 }
 
 impl FirstPersonHandState {
-    fn trigger_use(&mut self) {
-        self.hand_height = 0.0;
-        self.swing_ticks = 0;
+    fn trigger_swing(&mut self) {
+        // Matches PlayerEntity.swingArm(): starts at -1 so the next tick begins at 0.
+        self.swing_ticks = -1;
         self.swing_active = true;
+    }
+
+    fn trigger_item_used(&mut self) {
+        // Matches ItemInHandRenderer.onBlockUsed()/onItemUsed().
+        self.hand_height = 0.0;
     }
 
     fn tick(&mut self, selected_block_id: Option<u8>) {
         self.last_hand_height = self.hand_height;
+        self.last_attack_progress = self.attack_progress;
         let target = if selected_block_id == self.shown_block_id {
             1.0
         } else {
@@ -219,12 +235,15 @@ impl FirstPersonHandState {
         }
 
         if self.swing_active {
-            self.swing_ticks = self.swing_ticks.saturating_add(1);
+            self.swing_ticks += 1;
             if self.swing_ticks >= 8 {
                 self.swing_active = false;
                 self.swing_ticks = 0;
             }
+        } else {
+            self.swing_ticks = 0;
         }
+        self.attack_progress = self.swing_ticks as f32 / 8.0;
     }
 
     fn equip_progress(self, render_alpha: f32) -> f32 {
@@ -232,11 +251,12 @@ impl FirstPersonHandState {
     }
 
     fn attack_progress(self, render_alpha: f32) -> f32 {
-        if !self.swing_active {
-            0.0
-        } else {
-            (self.swing_ticks as f32 + render_alpha) / 8.0
+        // Matches MobEntity.getAttackAnimationProgress interpolation.
+        let mut delta = self.attack_progress - self.last_attack_progress;
+        if delta < 0.0 {
+            delta += 1.0;
         }
+        self.last_attack_progress + delta * render_alpha
     }
 }
 
@@ -1015,7 +1035,7 @@ pub fn run() -> Result<()> {
                         mouse_captured = true;
                         set_mouse_capture(window, true);
                     } else {
-                        first_person_hand.trigger_use();
+                        first_person_hand.trigger_swing();
                         enqueue_block_interaction_request(
                             &mut ecs_runtime,
                             &mut block_interaction_requests,
@@ -1031,7 +1051,8 @@ pub fn run() -> Result<()> {
                     if ecs_runtime.player_is_dead() {
                         return;
                     }
-                    first_person_hand.trigger_use();
+                    first_person_hand.trigger_swing();
+                    first_person_hand.trigger_item_used();
                     enqueue_block_interaction_request(
                         &mut ecs_runtime,
                         &mut block_interaction_requests,
@@ -1841,6 +1862,7 @@ fn alpha_first_person_arm_transform(equip_progress: f32, attack_progress: f32) -
     let attack = attack_progress.clamp(0.0, 1.0);
     let attack_sqrt = attack.sqrt();
     let swing_sin = (attack * std::f32::consts::PI).sin();
+    let swing_sin_sq = (attack * attack * std::f32::consts::PI).sin();
     let swing_sin_sqrt = (attack_sqrt * std::f32::consts::PI).sin();
     let swing_sin_sqrt_twice = (attack_sqrt * std::f32::consts::TAU).sin();
     let equip = equip_progress.clamp(0.0, 1.0);
@@ -1856,7 +1878,7 @@ fn alpha_first_person_arm_transform(equip_progress: f32, attack_progress: f32) -
         -0.9 * i,
     )) * Mat4::from_rotation_y(45.0_f32.to_radians())
         * Mat4::from_rotation_y((swing_sin_sqrt * 70.0).to_radians())
-        * Mat4::from_rotation_z((-swing_sin * 20.0).to_radians())
+        * Mat4::from_rotation_z((-swing_sin_sq * 20.0).to_radians())
         * Mat4::from_translation(Vec3::new(-1.0, 3.6, 3.5))
         * Mat4::from_rotation_z(120.0_f32.to_radians())
         * Mat4::from_rotation_x(200.0_f32.to_radians())
@@ -2611,7 +2633,9 @@ mod tests {
         let registry = BlockRegistry::alpha_1_2_6();
         assert_eq!(HOTBAR_BLOCK_IDS.len(), 9);
         for block_id in HOTBAR_BLOCK_IDS {
-            assert!(registry.is_defined_block(block_id));
+            if block_id != AIR_BLOCK_ID {
+                assert!(registry.is_defined_block(block_id));
+            }
         }
     }
 
@@ -2620,7 +2644,12 @@ mod tests {
         let hotbar = HotbarInventory::alpha_defaults();
         for (slot_index, slot) in hotbar.slots.iter().enumerate() {
             assert_eq!(slot.block_id, HOTBAR_BLOCK_IDS[slot_index]);
-            assert_eq!(slot.count, HOTBAR_STACK_LIMIT);
+            let expected_count = if slot.block_id == AIR_BLOCK_ID {
+                0
+            } else {
+                HOTBAR_STACK_LIMIT
+            };
+            assert_eq!(slot.count, expected_count);
         }
     }
 
