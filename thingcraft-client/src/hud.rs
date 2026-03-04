@@ -316,38 +316,7 @@ fn push_hotbar_item_vertices(
 ) {
     if registry.is_solid(block_id) && !registry.is_liquid(block_id) && !registry.is_billboard_plant(block_id)
     {
-        let top = registry.sprite_index_for_face(block_id, [0, 1, 0]);
-        let side = registry.sprite_index_for_face(block_id, [0, 0, 1]);
-
-        let top_uv = sprite_uv(top);
-        let side_uv = sprite_uv(side);
-        // Top face (diamond-ish quad).
-        push_textured_quad_points_gui(
-            verts,
-            [[x + 4.0, y + 1.0], [x + 13.0, y + 1.0], [x + 11.0, y + 5.0], [x + 2.0, y + 5.0]],
-            top_uv,
-            HUD_TEX_TERRAIN,
-            scale,
-            [1.0, 1.0, 1.0, 1.0],
-        );
-        // Left/front side.
-        push_textured_quad_points_gui(
-            verts,
-            [[x + 2.0, y + 5.0], [x + 11.0, y + 5.0], [x + 11.0, y + 14.0], [x + 2.0, y + 14.0]],
-            side_uv,
-            HUD_TEX_TERRAIN,
-            scale,
-            [0.8, 0.8, 0.8, 1.0],
-        );
-        // Right side.
-        push_textured_quad_points_gui(
-            verts,
-            [[x + 11.0, y + 5.0], [x + 13.0, y + 1.0], [x + 13.0, y + 10.0], [x + 11.0, y + 14.0]],
-            side_uv,
-            HUD_TEX_TERRAIN,
-            scale,
-            [0.6, 0.6, 0.6, 1.0],
-        );
+        push_alpha_item3d_block(verts, x, y, block_id, registry, scale);
     } else {
         let sprite = registry.sprite_index_of(block_id);
         let u = (sprite % 16) as f32 * 16.0;
@@ -367,6 +336,125 @@ fn push_hotbar_item_vertices(
             WHITE,
         );
     }
+}
+
+fn push_alpha_item3d_block(
+    verts: &mut Vec<HudVertex>,
+    x: f32,
+    y: f32,
+    block_id: u8,
+    registry: &BlockRegistry,
+    scale: f32,
+) {
+    let vertices = [
+        [-0.5, -0.5, -0.5],
+        [0.5, -0.5, -0.5],
+        [0.5, 0.5, -0.5],
+        [-0.5, 0.5, -0.5],
+        [-0.5, -0.5, 0.5],
+        [0.5, -0.5, 0.5],
+        [0.5, 0.5, 0.5],
+        [-0.5, 0.5, 0.5],
+    ];
+
+    // Mirrors ItemRenderer.renderGuiItem + BlockRenderer.renderAsItem transforms in Alpha.
+    let transformed = vertices.map(|v| alpha_item3d_transform(v, x, y));
+    let face_defs = [
+        // block.getSprite(face): 0=bottom, 1=top, 2=north, 3=south, 4=west, 5=east
+        ([0_usize, 1, 5, 4], [0.0, -1.0, 0.0], registry.sprite_index_for_face(block_id, [0, -1, 0])),
+        ([3, 2, 6, 7], [0.0, 1.0, 0.0], registry.sprite_index_for_face(block_id, [0, 1, 0])),
+        ([1, 0, 3, 2], [0.0, 0.0, -1.0], registry.sprite_index_for_face(block_id, [0, 0, -1])),
+        ([4, 5, 6, 7], [0.0, 0.0, 1.0], registry.sprite_index_for_face(block_id, [0, 0, 1])),
+        ([0, 4, 7, 3], [-1.0, 0.0, 0.0], registry.sprite_index_for_face(block_id, [-1, 0, 0])),
+        ([5, 1, 2, 6], [1.0, 0.0, 0.0], registry.sprite_index_for_face(block_id, [1, 0, 0])),
+    ];
+
+    let mut faces: Vec<(f32, [[f32; 2]; 4], [[f32; 2]; 4], [f32; 4])> = Vec::with_capacity(3);
+    for (idx, normal, sprite) in face_defs {
+        let n = alpha_item3d_rotate_normal(normal);
+        // Alpha GUI item path renders with backface culling; this keeps only camera-facing faces.
+        if n[2] >= 0.0 {
+            continue;
+        }
+        let brightness = alpha_item3d_face_brightness(n);
+        let points = [
+            [transformed[idx[0]][0], transformed[idx[0]][1]],
+            [transformed[idx[1]][0], transformed[idx[1]][1]],
+            [transformed[idx[2]][0], transformed[idx[2]][1]],
+            [transformed[idx[3]][0], transformed[idx[3]][1]],
+        ];
+        let avg_z =
+            (transformed[idx[0]][2] + transformed[idx[1]][2] + transformed[idx[2]][2] + transformed[idx[3]][2])
+                * 0.25;
+        faces.push((
+            avg_z,
+            points,
+            sprite_uv(sprite),
+            [brightness, brightness, brightness, 1.0],
+        ));
+    }
+
+    // Painter order for 2D HUD path (far to near).
+    faces.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, points, uv, color) in faces {
+        push_textured_quad_points_gui(verts, points, uv, HUD_TEX_TERRAIN, scale, color);
+    }
+}
+
+fn alpha_item3d_transform(v: [f32; 3], x: f32, y: f32) -> [f32; 3] {
+    let mut p = v;
+    // ItemRenderer.renderGuiItem:
+    // glTranslatef(x - 2, y + 3, 0)
+    // glScalef(10, 10, 10)
+    // glTranslatef(1, 0.5, 8)
+    // glRotatef(210, 1,0,0)
+    // glRotatef(45, 0,1,0)
+    p = rotate_y(p, 45.0_f32.to_radians());
+    p = rotate_x(p, 210.0_f32.to_radians());
+    p[0] += 1.0;
+    p[1] += 0.5;
+    p[2] += 8.0;
+    p[0] *= 10.0;
+    p[1] *= 10.0;
+    p[2] *= 10.0;
+    p[0] += x - 2.0;
+    p[1] += y + 3.0;
+    p
+}
+
+fn alpha_item3d_rotate_normal(n: [f32; 3]) -> [f32; 3] {
+    let n = rotate_y(n, 45.0_f32.to_radians());
+    rotate_x(n, 210.0_f32.to_radians())
+}
+
+fn alpha_item3d_face_brightness(n: [f32; 3]) -> f32 {
+    // GameGui applies glRotatef(180, 1, 0, 0) before Lighting.turnOn(), so GUI
+    // light vectors from Lighting.turnOn() are effectively rotated in X.
+    let light0 = normalize3([0.2, -1.0, 0.7]);
+    let light1 = normalize3([-0.2, -1.0, -0.7]);
+    let ambient = 0.4_f32;
+    let diffuse = 0.6_f32;
+    let b = ambient + diffuse * dot3(n, light0).max(0.0) + diffuse * dot3(n, light1).max(0.0);
+    b.clamp(0.0, 1.0)
+}
+
+fn rotate_x(v: [f32; 3], radians: f32) -> [f32; 3] {
+    let (s, c) = radians.sin_cos();
+    [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c]
+}
+
+fn rotate_y(v: [f32; 3], radians: f32) -> [f32; 3] {
+    let (s, c) = radians.sin_cos();
+    [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+    [v[0] / len, v[1] / len, v[2] / len]
 }
 
 fn sprite_uv(sprite: u16) -> [[f32; 2]; 4] {
