@@ -247,8 +247,7 @@ struct Starfield {
 #[repr(C)]
 struct StarsUniform {
     sky_view_proj: [[f32; 4]; 4],
-    brightness: f32,
-    _pad: [f32; 3],
+    brightness: [f32; 4],
 }
 
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -727,8 +726,7 @@ impl<'w> Renderer<'w> {
         let sky_dome = create_sky_dome(&device);
         let stars_uniform = StarsUniform {
             sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-            brightness: 0.0,
-            _pad: [0.0; 3],
+            brightness: [0.0, 0.0, 0.0, 0.0],
         };
         let stars_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("thingcraft-stars-uniform-buffer"),
@@ -2131,8 +2129,7 @@ impl<'w> Renderer<'w> {
     fn update_stars_uniform(&mut self) {
         let uniform = StarsUniform {
             sky_view_proj: self.cached_sky_view_proj,
-            brightness: self.star_brightness.clamp(0.0, 1.0),
-            _pad: [0.0; 3],
+            brightness: [self.star_brightness.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.stars_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -4098,8 +4095,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 const STARS_SHADER: &str = r#"
 struct Stars {
     sky_view_proj: mat4x4<f32>,
-    brightness: f32,
-    _pad: vec3<f32>,
+    brightness: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -4122,7 +4118,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(_input: VertexOut) -> @location(0) vec4<f32> {
-    let b = clamp(stars.brightness, 0.0, 1.0);
+    let b = clamp(stars.brightness.x, 0.0, 1.0);
     return vec4<f32>(b, b, b, b);
 }
 "#;
