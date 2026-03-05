@@ -473,16 +473,7 @@ impl BlockRegistry {
             0,
             7,
         );
-        add(
-            &mut by_id,
-            ICE_ID,
-            "ice",
-            67,
-            MaterialKind::Ice,
-            true,
-            3,
-            0,
-        );
+        add(&mut by_id, ICE_ID, "ice", 67, MaterialKind::Ice, true, 3, 0);
         add(
             &mut by_id,
             87,
@@ -652,7 +643,8 @@ impl BlockRegistry {
 
     #[must_use]
     pub fn mining_hardness_of(&self, block_id: u8) -> f32 {
-        self.get(block_id).map_or(1.0, |block| block.mining_hardness)
+        self.get(block_id)
+            .map_or(1.0, |block| block.mining_hardness)
     }
 
     #[must_use]
@@ -4119,9 +4111,15 @@ mod tests {
     fn alpha_registry_collision_flags_cover_special_non_cube_blocks() {
         let registry = BlockRegistry::alpha_1_2_6();
         assert!(registry.is_collidable(65), "ladders should have collision");
-        assert!(!registry.is_collidable(63), "standing signs should not collide");
+        assert!(
+            !registry.is_collidable(63),
+            "standing signs should not collide"
+        );
         assert!(!registry.is_collidable(50), "torches should not collide");
-        assert!(!registry.is_collidable(WATER_ID), "water should not collide");
+        assert!(
+            !registry.is_collidable(WATER_ID),
+            "water should not collide"
+        );
     }
 
     #[test]

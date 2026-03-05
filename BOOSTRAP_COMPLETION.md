@@ -56,8 +56,11 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Terrain chunk shader now applies Alpha-style transparent alpha-test discard (`a <= 0.1`) and distance fog blend against sky clear color.
 - [x] Meshing pipeline now supports section-level (`16x16x16`) dirty tracking and worker rebuilds with per-section incremental render uploads.
 - [x] Streaming lane workers now run as per-lane configurable worker pools (`THINGCRAFT_GEN_WORKERS`, `THINGCRAFT_LIGHT_WORKERS`, `THINGCRAFT_MESH_WORKERS`).
+- [x] Streaming defaults now auto-scale worker counts from available CPU parallelism (with reserved main/render headroom and deterministic generation/lighting/meshing split), while keeping explicit env worker overrides.
 - [x] Lighting/meshing neighbor payloads now use boundary edge snapshots instead of full cardinal `ChunkData` clones.
 - [x] Renderer mesh uploads now use a reusable GPU buffer pool for section vertex/index buffers (bounded byte budget).
+- [x] Renderer chunk passes now perform chunk-level frustum early-out before per-section tests, and scene/chunk index uploads now use automatic `u16` packing with `u32` fallback plus per-mesh index-format binding.
+- [x] Meshing now includes a greedy top-face merge pass for merge-safe opaque terrain quads (same sprite/tint/light/material marker), reducing face count on broad exposed terrain while preserving existing non-cube/liquid paths.
 - [x] Transparent render pipeline added: split opaque/transparent chunk meshing, alpha-blended water pass (no depth write, double-sided), shader `vec4` light channel with vertex alpha passthrough.
 - [x] Foliage biome tinting added: generic `BiomeColorMap` loader used for both grass and foliage color maps, leaf blocks tinted per-column from Alpha `foliagecolor.png`.
 - [x] Birch and pine tree shape variants added: biome-driven tree kind selection (Taiga→pine, Forest/SeasonalForest→1-in-3 birch, others→oak) with distinct canopy geometries.

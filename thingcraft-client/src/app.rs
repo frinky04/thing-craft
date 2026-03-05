@@ -4,6 +4,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use glam::{DVec3, Mat4, Vec3};
 use tracing::{debug, error, info, warn};
+#[cfg(feature = "tracy")]
+use tracing_subscriber::layer::SubscriberExt;
+#[cfg(feature = "tracy")]
+use tracing_subscriber::util::SubscriberInitExt;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -385,9 +389,7 @@ impl EditLatencyTracker {
 }
 
 pub fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(build_env_filter())
-        .init();
+    let tracy_enabled = init_tracing();
 
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new()
@@ -421,10 +423,13 @@ pub fn run() -> Result<()> {
     let alpha_view_distance = alpha_view_distance_setting(residency_config.view_radius);
     let render_distance_blocks = alpha_render_distance_blocks(alpha_view_distance);
     let _ = chunk_streamer.update_target(ChunkPos { x: 0, z: 0 });
-    for update in chunk_streamer.drain_render_updates() {
-        if apply_render_update(&mut renderer, update) && bootstrap_mesh_active {
-            renderer.set_scene_mesh(&ChunkMesh::default());
-            bootstrap_mesh_active = false;
+    {
+        let _span = tracing::info_span!("apply_render_updates_bootstrap").entered();
+        for update in chunk_streamer.drain_render_updates() {
+            if apply_render_update(&mut renderer, update) && bootstrap_mesh_active {
+                renderer.set_scene_mesh(&ChunkMesh::default());
+                bootstrap_mesh_active = false;
+            }
         }
     }
 
@@ -499,6 +504,7 @@ pub fn run() -> Result<()> {
                     hud_dirty = true;
                 },
                 WindowEvent::RedrawRequested => {
+                    let _frame_span = tracing::info_span!("frame").entered();
                     let now = Instant::now();
                     let frame_delta = now.saturating_duration_since(last_frame_start);
                     last_frame_start = now;
@@ -517,6 +523,7 @@ pub fn run() -> Result<()> {
                     let mut fluid_processed_this_frame = 0_usize;
                     let mut urgent_fluid_processed_this_frame = 0_usize;
                     for tick_index in 0..ticks_to_run {
+                        let _tick_span = tracing::info_span!("fixed_tick").entered();
                         sim_ticks = sim_ticks.wrapping_add(1);
                         if time_accel_held {
                             time_offset_ticks = time_offset_ticks.wrapping_add(200);
@@ -889,11 +896,15 @@ pub fn run() -> Result<()> {
                         renderer.set_block_crack_overlay(None, 0.0);
                     }
 
-                    chunk_streamer.tick(camera_chunk);
+                    {
+                        let _stream_span = tracing::info_span!("streaming_tick").entered();
+                        chunk_streamer.tick(camera_chunk);
+                    }
                     if renderer.chunk_border_debug_enabled() {
                         renderer.set_chunk_debug_states(chunk_streamer.debug_chunk_states());
                     }
                     if APPLY_STREAM_UPDATES_TO_RENDERER {
+                        let _span = tracing::info_span!("apply_render_updates").entered();
                         for update in chunk_streamer.drain_render_updates() {
                             let update_pos = match &update {
                                 RenderMeshUpdate::UpsertSection { pos, .. }
@@ -970,7 +981,11 @@ pub fn run() -> Result<()> {
                         hud_dirty = false;
                     }
 
-                    match renderer.render() {
+                    let render_result = {
+                        let _render_span = tracing::info_span!("render").entered();
+                        renderer.render()
+                    };
+                    match render_result {
                         Ok(()) => {}
                         Err(RenderError::Timeout) => {
                             warn!("surface timeout/loss while rendering; frame skipped");
@@ -980,6 +995,9 @@ pub fn run() -> Result<()> {
                             event_loop.exit();
                             return;
                         }
+                    }
+                    if tracy_enabled {
+                        trace_tracy_frame_mark();
                     }
 
                     if let Some(report) =
@@ -1305,6 +1323,30 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn init_tracing() -> bool {
+    #[cfg(feature = "tracy")]
+    {
+        if parse_env_bool("THINGCRAFT_TRACY").unwrap_or(false) {
+            tracing_subscriber::registry()
+                .with(build_env_filter())
+                .with(tracing_tracy::TracyLayer::default())
+                .init();
+            info!("tracy profiling enabled");
+            return true;
+        }
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(build_env_filter())
+        .init();
+    false
+}
+
+fn trace_tracy_frame_mark() {
+    #[cfg(feature = "tracy")]
+    tracing::info!(tracy.frame_mark = true);
+}
+
 fn direction_from_angles(yaw: f32, pitch: f32) -> Vec3 {
     let yaw = yaw as f64;
     let pitch = pitch as f64;
@@ -1413,12 +1455,7 @@ fn raycast_current_mining_target(
     registry: &BlockRegistry,
 ) -> Option<MiningTarget> {
     let allow_liquids = false;
-    let hit = raycast_interaction_target(
-        ecs_runtime,
-        chunk_streamer,
-        registry,
-        allow_liquids,
-    )?;
+    let hit = raycast_interaction_target(ecs_runtime, chunk_streamer, registry, allow_liquids)?;
     let block_id = chunk_streamer
         .block_at_world(hit.block[0], hit.block[1], hit.block[2])
         .unwrap_or(AIR_BLOCK_ID);
@@ -1633,10 +1670,7 @@ fn enqueue_block_interaction_request(
         return false;
     };
 
-    queue.push_back(BlockInteractionRequest {
-        origin,
-        direction,
-    });
+    queue.push_back(BlockInteractionRequest { origin, direction });
     true
 }
 
@@ -1669,12 +1703,21 @@ fn raycast_interaction_target(
     allow_liquids: bool,
 ) -> Option<BlockRayHit> {
     let (origin, direction) = current_block_interaction_ray(ecs_runtime)?;
-    raycast_first_solid_block(origin, direction, BLOCK_INTERACTION_REACH_BLOCKS, |x, y, z| {
-        let block_id = chunk_streamer.block_at_world(x, y, z)?;
-        let metadata = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
-        let can_hit = is_raycast_targetable_block(registry, block_id, metadata, allow_liquids);
-        if can_hit { Some(block_id) } else { None }
-    })
+    raycast_first_solid_block(
+        origin,
+        direction,
+        BLOCK_INTERACTION_REACH_BLOCKS,
+        |x, y, z| {
+            let block_id = chunk_streamer.block_at_world(x, y, z)?;
+            let metadata = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+            let can_hit = is_raycast_targetable_block(registry, block_id, metadata, allow_liquids);
+            if can_hit {
+                Some(block_id)
+            } else {
+                None
+            }
+        },
+    )
 }
 
 fn placement_intersects_player(
@@ -1758,7 +1801,11 @@ fn process_single_block_interaction_request(
             let block_id = chunk_streamer.block_at_world(x, y, z)?;
             let metadata = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
             let can_hit = is_raycast_targetable_block(registry, block_id, metadata, allow_liquids);
-            if can_hit { Some(block_id) } else { None }
+            if can_hit {
+                Some(block_id)
+            } else {
+                None
+            }
         },
     ) else {
         return;
@@ -3126,11 +3173,10 @@ mod tests {
     use super::{
         affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
         alpha_block_mining_progress_per_tick, alpha_brightness_from_light_level,
-        alpha_fog_brightness_target, alpha_star_brightness, alpha_sunrise_color,
-        alpha_time_of_day, has_target_directive, hotbar_slot_for_key,
-        can_replace_block_for_placement, is_raycast_targetable_block, parse_env_bool,
-        parse_env_u32, placement_intersects_player, raycast_first_solid_block, resolve_axis,
-        AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID,
+        alpha_fog_brightness_target, alpha_star_brightness, alpha_sunrise_color, alpha_time_of_day,
+        can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
+        is_raycast_targetable_block, parse_env_bool, parse_env_u32, placement_intersects_player,
+        raycast_first_solid_block, resolve_axis, AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID,
     };
     use crate::ecs::EcsRuntime;
     use crate::inventory::PlayerInventoryState;
@@ -3199,11 +3245,8 @@ mod tests {
         let inv = PlayerInventoryState::alpha_defaults();
         let registry = BlockRegistry::alpha_1_2_6();
         let per_tick = alpha_block_mining_progress_per_tick(
-            &registry,
-            1, // stone
-            &inv,
-            true,
-            false,
+            &registry, 1, // stone
+            &inv, true, false,
         );
         // 1.0 / 1.5 / 30.0
         assert!((per_tick - (1.0 / 45.0)).abs() < 1e-6);
@@ -3237,8 +3280,12 @@ mod tests {
     fn placement_collision_rejects_blocks_inside_player() {
         let mut ecs = EcsRuntime::new();
         let registry = BlockRegistry::alpha_1_2_6();
-        assert!(placement_intersects_player(&mut ecs, &registry, 1, 0, 72, 0));
-        assert!(!placement_intersects_player(&mut ecs, &registry, 1, 2, 72, 0));
+        assert!(placement_intersects_player(
+            &mut ecs, &registry, 1, 0, 72, 0
+        ));
+        assert!(!placement_intersects_player(
+            &mut ecs, &registry, 1, 2, 72, 0
+        ));
         // Torches have no collision shape in Alpha canPlace checks.
         assert!(!placement_intersects_player(
             &mut ecs, &registry, 50, 0, 72, 0

@@ -8,6 +8,8 @@ use crate::world::{
 };
 
 const AIR_ID: u8 = 0;
+const LEAF_MARKER_BIT: u8 = 1 << 0;
+const GREEDY_TOP_TILE_BIT: u8 = 1 << 1;
 
 // ---------------------------------------------------------------------------
 // Liquid height helpers (MC Alpha 1.2.6 formulas)
@@ -383,6 +385,15 @@ struct FaceDef {
     corners: [[f32; 3]; 4],
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct GreedyTopFaceCell {
+    sprite_index: u16,
+    tint_rgb: [u8; 3],
+    neighbor_sky_light: u8,
+    neighbor_block_light: u8,
+    is_leaves: bool,
+}
+
 const FACES: [FaceDef; 6] = [
     // -X
     FaceDef {
@@ -590,6 +601,9 @@ where
     let mut split = SplitChunkMesh::default();
     let chunk_origin_x = chunk.pos.x as f32 * CHUNK_WIDTH as f32;
     let chunk_origin_z = chunk.pos.z as f32 * CHUNK_DEPTH as f32;
+    let y_span = (y_end - y_start).max(0) as usize;
+    let mut greedy_top_faces: Vec<[Option<GreedyTopFaceCell>; CHUNK_WIDTH * CHUNK_DEPTH]> =
+        vec![[None; CHUNK_WIDTH * CHUNK_DEPTH]; y_span];
 
     for local_x in 0..CHUNK_WIDTH as i32 {
         for local_z in 0..CHUNK_DEPTH as i32 {
@@ -778,6 +792,25 @@ where
                             local_z as u8,
                         );
 
+                        if face.offset == [0, 1, 0]
+                            && face_adjust.side_inset == 0.0
+                            && face_adjust.side_y_shrink == 0.0
+                        {
+                            let layer = (y - y_start) as usize;
+                            if layer < greedy_top_faces.len() {
+                                let index = (local_z as usize * CHUNK_WIDTH) + local_x as usize;
+                                greedy_top_faces[layer][index] = Some(GreedyTopFaceCell {
+                                    sprite_index: registry
+                                        .sprite_index_for_face(block_id, face.offset),
+                                    tint_rgb: tint,
+                                    neighbor_sky_light: face_sky,
+                                    neighbor_block_light: face_block_light,
+                                    is_leaves: registry.is_leaves(block_id),
+                                });
+                                continue;
+                            }
+                        }
+
                         append_face(
                             &mut split.opaque,
                             [
@@ -799,7 +832,121 @@ where
         }
     }
 
+    append_greedy_top_faces(
+        &mut split.opaque,
+        &greedy_top_faces,
+        chunk_origin_x,
+        chunk_origin_z,
+        y_start,
+    );
+
     split
+}
+
+fn append_greedy_top_faces(
+    mesh: &mut ChunkMesh,
+    layers: &[[Option<GreedyTopFaceCell>; CHUNK_WIDTH * CHUNK_DEPTH]],
+    chunk_origin_x: f32,
+    chunk_origin_z: f32,
+    y_start: i32,
+) {
+    let atlas_tile = 1.0 / 16.0;
+    let face_scale = (alpha_face_scale([0, 1, 0]) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+
+    for (layer, mask) in layers.iter().enumerate() {
+        let mut consumed = [false; CHUNK_WIDTH * CHUNK_DEPTH];
+        for z in 0..CHUNK_DEPTH {
+            for x in 0..CHUNK_WIDTH {
+                let start = z * CHUNK_WIDTH + x;
+                if consumed[start] {
+                    continue;
+                }
+                let Some(cell) = mask[start] else {
+                    continue;
+                };
+
+                let mut width = 1;
+                while x + width < CHUNK_WIDTH {
+                    let idx = z * CHUNK_WIDTH + (x + width);
+                    if consumed[idx] || mask[idx] != Some(cell) {
+                        break;
+                    }
+                    width += 1;
+                }
+
+                let mut height = 1;
+                'height: while z + height < CHUNK_DEPTH {
+                    for scan_x in x..(x + width) {
+                        let idx = (z + height) * CHUNK_WIDTH + scan_x;
+                        if consumed[idx] || mask[idx] != Some(cell) {
+                            break 'height;
+                        }
+                    }
+                    height += 1;
+                }
+
+                for dz in z..(z + height) {
+                    for dx in x..(x + width) {
+                        consumed[dz * CHUNK_WIDTH + dx] = true;
+                    }
+                }
+
+                let world_y = (y_start + layer as i32 + 1) as f32;
+                let x0 = chunk_origin_x + x as f32;
+                let x1 = chunk_origin_x + (x + width) as f32;
+                let z0 = chunk_origin_z + z as f32;
+                let z1 = chunk_origin_z + (z + height) as f32;
+
+                let sprite_x = f32::from(cell.sprite_index % 16) * atlas_tile;
+                let sprite_y = f32::from(cell.sprite_index / 16) * atlas_tile;
+                // Keep UVs inside a single atlas tile. The terrain atlas sampler is clamp-to-edge,
+                // so extending UVs by merged width/height would bleed into adjacent sprites.
+                let uv = [
+                    [sprite_x, sprite_y + atlas_tile],
+                    [sprite_x, sprite_y],
+                    [sprite_x + atlas_tile, sprite_y],
+                    [sprite_x + atlas_tile, sprite_y + atlas_tile],
+                ];
+                let positions = [
+                    [x0, world_y, z0],
+                    [x0, world_y, z1],
+                    [x1, world_y, z1],
+                    [x1, world_y, z0],
+                ];
+
+                let base_index = mesh.vertices.len() as u32;
+                for (position, tex) in positions.iter().zip(uv.iter()) {
+                    mesh.vertices.push(MeshVertex {
+                        position: *position,
+                        uv: *tex,
+                        tint_rgba: [
+                            cell.tint_rgb[0],
+                            cell.tint_rgb[1],
+                            cell.tint_rgb[2],
+                            u8::MAX,
+                        ],
+                        light_data: [
+                            cell.neighbor_sky_light,
+                            cell.neighbor_block_light,
+                            face_scale,
+                            (u8::from(cell.is_leaves) * LEAF_MARKER_BIT)
+                                | GREEDY_TOP_TILE_BIT,
+                        ],
+                    });
+                }
+                mesh.indices.extend_from_slice(&[
+                    base_index,
+                    base_index + 1,
+                    base_index + 2,
+                    base_index,
+                    base_index + 2,
+                    base_index + 3,
+                ]);
+            }
+        }
+    }
 }
 
 fn resolve_fancy_graphics_for_meshing() -> bool {
@@ -1315,7 +1462,7 @@ fn append_face(
                 neighbor_sky_light,
                 neighbor_block_light,
                 face_scale,
-                u8::from(is_leaves),
+                u8::from(is_leaves) * LEAF_MARKER_BIT,
             ],
         });
     }
@@ -1537,8 +1684,8 @@ mod tests {
         chunk.set_block(2, 1, 1, 1);
 
         let mesh = build_chunk_mesh(&chunk, &registry);
-        assert_eq!(mesh.vertices.len(), 40);
-        assert_eq!(mesh.indices.len(), 60);
+        assert_eq!(mesh.vertices.len(), 36);
+        assert_eq!(mesh.indices.len(), 54);
     }
 
     #[test]
@@ -1549,8 +1696,8 @@ mod tests {
         chunk.set_block(2, 1, 1, 79);
 
         let mesh = build_chunk_mesh(&chunk, &registry);
-        assert_eq!(mesh.vertices.len(), 40);
-        assert_eq!(mesh.indices.len(), 60);
+        assert_eq!(mesh.vertices.len(), 36);
+        assert_eq!(mesh.indices.len(), 54);
     }
 
     #[test]
@@ -1562,8 +1709,8 @@ mod tests {
         chunk.set_block(2, 1, 1, leaves);
 
         let mesh = build_chunk_mesh(&chunk, &registry);
-        assert_eq!(mesh.vertices.len(), 48);
-        assert_eq!(mesh.indices.len(), 72);
+        assert_eq!(mesh.vertices.len(), 44);
+        assert_eq!(mesh.indices.len(), 66);
     }
 
     #[test]
@@ -1586,8 +1733,8 @@ mod tests {
             |x, y, z| neighbor_block_light(&chunk, x, y, z),
         );
 
-        assert_eq!(split.opaque.vertices.len(), 40);
-        assert_eq!(split.opaque.indices.len(), 60);
+        assert_eq!(split.opaque.vertices.len(), 36);
+        assert_eq!(split.opaque.indices.len(), 54);
     }
 
     #[test]
@@ -1743,23 +1890,40 @@ mod tests {
         let mesh = build_chunk_mesh(&chunk, &registry);
         assert_eq!(mesh.vertices.len(), 24);
 
-        let expected_levels = [5_u8, 15, 8, 12, 4, 10];
-        for (face_index, level) in expected_levels.into_iter().enumerate() {
-            let vertex = mesh.vertices[face_index * 4];
-            assert_eq!(vertex.light_data[0], level);
-            assert_eq!(vertex.light_data[1], 0);
-            let expected_scale = (alpha_face_scale(FACES[face_index].offset) * 255.0)
+        let probes = [
+            ((0_usize, 1.0_f32), 5_u8, [-1, 0, 0]), // -X
+            ((0_usize, 2.0_f32), 15_u8, [1, 0, 0]), // +X
+            ((1_usize, 1.0_f32), 8_u8, [0, -1, 0]), // -Y
+            ((1_usize, 2.0_f32), 12_u8, [0, 1, 0]), // +Y
+            ((2_usize, 1.0_f32), 4_u8, [0, 0, -1]), // -Z
+            ((2_usize, 2.0_f32), 10_u8, [0, 0, 1]), // +Z
+        ];
+        for ((axis, plane), level, face_offset) in probes {
+            let expected_scale = (alpha_face_scale(face_offset) * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
-            assert_eq!(vertex.light_data[2], expected_scale);
-            assert_eq!(vertex.light_data[3], 0);
+            assert!(
+                mesh.vertices.iter().any(|vertex| {
+                    (vertex.position[axis] - plane).abs() < f32::EPSILON
+                        && vertex.light_data[0] == level
+                        && vertex.light_data[1] == 0
+                        && vertex.light_data[2] == expected_scale
+                        && vertex.light_data[3] == 0
+                }),
+                "expected face probe not found for axis {axis} plane {plane}"
+            );
         }
 
         block[ChunkData::index(2, 1, 1)] = 14;
         sky[ChunkData::index(2, 1, 1)] = 2;
         chunk.apply_light_channels(&sky, &block);
         let mesh = build_chunk_mesh(&chunk, &registry);
-        let east = mesh.vertices[4];
+        let east = mesh
+            .vertices
+            .iter()
+            .find(|vertex| (vertex.position[0] - 2.0).abs() < f32::EPSILON)
+            .copied()
+            .expect("east face vertex should exist");
         assert_eq!(east.light_data[0], 2);
         assert_eq!(east.light_data[1], 14);
     }
@@ -1772,7 +1936,11 @@ mod tests {
 
         let mesh = build_chunk_mesh(&chunk, &registry);
         assert!(!mesh.vertices.is_empty());
-        assert!(mesh.vertices.iter().all(|vertex| vertex.light_data[3] == 1));
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|vertex| (vertex.light_data[3] & 1) == 1)
+        );
     }
 
     #[test]

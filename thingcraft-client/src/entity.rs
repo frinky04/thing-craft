@@ -468,8 +468,10 @@ pub fn check_item_pickup(world: &mut World, inventory: &mut PlayerInventoryState
     // Read player position + physics.
     let mut player_query =
         world.query_filtered::<(&Transform64, &PhysicsBody, Option<&PlayerVitals>), With<Player>>();
-    let Some((player_t, player_p, player_vitals)) =
-        player_query.iter(world).next().map(|(t, p, v)| (*t, *p, v.copied()))
+    let Some((player_t, player_p, player_vitals)) = player_query
+        .iter(world)
+        .next()
+        .map(|(t, p, v)| (*t, *p, v.copied()))
     else {
         return false;
     };
@@ -829,8 +831,9 @@ pub fn build_entity_sprite_mesh(
     if let Some(player_pos) = player_interp_pos {
         let mut fx_query = world.query::<&EntityPickupFx>();
         for fx in fx_query.iter(world) {
-            let progress = ((f32::from(fx.age_ticks) + render_alpha) / f32::from(fx.lifetime_ticks))
-                .clamp(0.0, 1.0);
+            let progress = ((f32::from(fx.age_ticks) + render_alpha)
+                / f32::from(fx.lifetime_ticks))
+            .clamp(0.0, 1.0);
             let progress_sq = progress * progress;
             let target = DVec3::new(
                 player_pos.x,
@@ -1229,13 +1232,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(RenderAlpha(0.0));
         // yaw = +90deg should throw toward +X in ThingCraft camera convention.
-        spawn_player_dropped_item(
-            &mut world,
-            1,
-            DVec3::ZERO,
-            std::f64::consts::FRAC_PI_2,
-            0.0,
-        );
+        spawn_player_dropped_item(&mut world, 1, DVec3::ZERO, std::f64::consts::FRAC_PI_2, 0.0);
 
         let mut query = world.query::<&EntityPhysics>();
         let physics = query.iter(&world).next().unwrap();
@@ -1253,7 +1250,13 @@ mod tests {
             0.0,
             std::f64::consts::FRAC_PI_4,
         );
-        let vy_up = up_world.query::<&EntityPhysics>().iter(&up_world).next().unwrap().velocity.y;
+        let vy_up = up_world
+            .query::<&EntityPhysics>()
+            .iter(&up_world)
+            .next()
+            .unwrap()
+            .velocity
+            .y;
 
         let mut down_world = World::new();
         down_world.insert_resource(RenderAlpha(0.0));
@@ -1272,7 +1275,10 @@ mod tests {
             .velocity
             .y;
 
-        assert!(vy_up > vy_down, "looking up should produce higher drop arc than looking down");
+        assert!(
+            vy_up > vy_down,
+            "looking up should produce higher drop arc than looking down"
+        );
     }
 
     #[test]

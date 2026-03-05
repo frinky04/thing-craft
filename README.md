@@ -51,6 +51,26 @@ Worker pool tuning:
 THINGCRAFT_GEN_WORKERS=2 THINGCRAFT_LIGHT_WORKERS=4 THINGCRAFT_MESH_WORKERS=4 cargo run -p thingcraft-client
 ```
 
+Tracy profiling (recommended for perf investigation):
+
+```bash
+THINGCRAFT_TRACY=1 cargo run -p thingcraft-client --features tracy
+
+# Optional GPU pass timings (if adapter supports timestamp queries)
+THINGCRAFT_GPU_TIMESTAMPS=1 cargo run -p thingcraft-client --features tracy
+
+# Pass toggles for quick A/B perf checks
+THINGCRAFT_RENDER_TRANSPARENT=0 THINGCRAFT_RENDER_CLOUDS=0 THINGCRAFT_RENDER_FIRST_PERSON=0 THINGCRAFT_RENDER_HUD=0 cargo run -p thingcraft-client --features tracy
+```
+
+When enabled, the client emits tracing spans for:
+- `frame`
+- `fixed_tick`
+- `streaming_tick`
+- `render`
+
+Open Tracy and connect to the running process to inspect these zones and identify hotspots.
+
 ## Controls
 
 - `W/A/S/D`: Move horizontally

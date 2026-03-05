@@ -30,6 +30,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - Block and sky light channels use nibble storage (`4-bit` packed values).
 - A deterministic Overworld generator uses Alpha-exact 3D density noise (7 `PerlinNoise` generators, 5x17x5 trilinear interpolation, climate-modulated shaping) plus a top-down surface builder (`buildSurfaces` port) to create startup chunks. Biome classification uses `PerlinSimplexNoise` with bulk region queries.
 - A CPU chunk mesher generates indexed triangle geometry with face-culling and atlas UVs (including face-aware texture selection from the block registry).
+- Meshing now includes a greedy merge pass for merge-safe opaque top faces, keyed by sprite+tint+light+leaf-marker to preserve shading/material correctness while reducing quad count.
 - Vertex color modulation is used as the tint path; grass top tint is generated per column from biome temperature/downfall and sampled through Alpha `misc/grasscolor.png` (with a fallback map when unavailable).
 - The chunk mesher now samples neighbor-facing raw light (`max(sky, block)`), maps it through Alpha's brightness curve, and applies Alpha face scales (`top=1.0`, `bottom=0.5`, `north/south=0.8`, `west/east=0.6`) before writing vertex color modulation.
 - Region meshing performs neighbor-aware culling across chunk boundaries so interior shared faces are not emitted.
@@ -41,6 +42,7 @@ Render transforms are projected to `f32` (`RenderTransform`) for GPU-facing data
 - Runtime chunk residency is managed with explicit states: `Requested`, `Generating`, `Meshing`, `Ready`, `Evicting`.
 - Residency targets are derived from the camera chunk position with a configurable square radius.
 - Chunk generation, chunk lighting, and chunk meshing run in per-lane worker pools (configurable worker counts per lane).
+- Default worker counts now auto-scale from `available_parallelism()` with deterministic lane split and reserved headroom for main/render threads; env overrides still take precedence.
 - Lighting jobs run a queue-based sunlight/block-light propagation pass against immutable chunk snapshots (center + cardinal neighbor edge-light slices), then return packed nibble-channel updates to the main thread plus section-diff masks.
 - Meshing jobs consume cardinal neighbor edge slices (block + light boundary bands) and rebuild only dirty `16x16x16` sections.
 - The main thread only:
@@ -73,6 +75,8 @@ This allows future network packets to feed the same command path without forking
 ## Renderer Culling
 
 - Chunk mesh draw calls are frustum-culled on CPU using camera view-projection planes and per-section AABBs (`16x16x16`).
+- Renderer culling now uses a chunk-level AABB early-out (`16x128x16`) before per-section tests to avoid redundant section frustum checks for fully offscreen chunks.
+- Chunk/scene mesh uploads now pack index buffers to `u16` when representable, with automatic `u32` fallback and per-mesh index-format binding at draw time.
 - Runtime debug stats include visible chunk count and edit-to-visible mesh latency metrics.
 - Chunk border debug mode now overlays per-chunk generation/lighting/meshing status bars to diagnose queue pressure and lighting churn near seams.
 - Terrain shading now includes Alpha-style alpha cutout discard and linear fog blending in WGSL.

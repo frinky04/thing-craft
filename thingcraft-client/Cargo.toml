@@ -7,6 +7,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+tracy = ["dep:tracing-tracy"]
+
 [dependencies]
 anyhow = "1.0"
 bevy_ecs = "0.15"
@@ -19,5 +23,6 @@ rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-tracy = { version = "0.11", optional = true }
 wgpu = "0.20"
 winit = "0.29"

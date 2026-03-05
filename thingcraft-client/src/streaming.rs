@@ -199,17 +199,69 @@ pub struct ResidencyConfig {
 
 impl Default for ResidencyConfig {
     fn default() -> Self {
+        let (generation_workers, lighting_workers, meshing_workers) =
+            default_worker_counts_from_cores(
+                std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(4),
+            );
         Self {
             view_radius: 5,
             max_generation_dispatch: 8,
             max_lighting_dispatch: 8,
             max_meshing_dispatch: 8,
             max_render_upload_sections_per_tick: 24,
-            generation_workers: 1,
-            lighting_workers: 2,
-            meshing_workers: 2,
+            generation_workers,
+            lighting_workers,
+            meshing_workers,
         }
     }
+}
+
+#[must_use]
+fn default_worker_counts_from_cores(cores: usize) -> (usize, usize, usize) {
+    // Reserve headroom for main/render threads and clamp to a practical range.
+    let worker_budget = cores.saturating_sub(2).clamp(3, 24);
+
+    // Target split: generation 25%, lighting 35%, meshing 40%.
+    let mut gen = (worker_budget * 25) / 100;
+    let mut light = (worker_budget * 35) / 100;
+    let mut mesh = worker_budget.saturating_sub(gen + light);
+
+    // Ensure each lane remains live.
+    if gen == 0 {
+        gen = 1;
+    }
+    if light == 0 {
+        light = 1;
+    }
+    if mesh == 0 {
+        mesh = 1;
+    }
+
+    // Normalize back to exact worker_budget after floor/guard adjustments.
+    while gen + light + mesh > worker_budget {
+        if mesh > light && mesh > 1 {
+            mesh -= 1;
+        } else if light > gen && light > 1 {
+            light -= 1;
+        } else if gen > 1 {
+            gen -= 1;
+        } else {
+            break;
+        }
+    }
+    while gen + light + mesh < worker_budget {
+        if mesh <= light {
+            mesh += 1;
+        } else if light <= gen {
+            light += 1;
+        } else {
+            gen += 1;
+        }
+    }
+
+    (gen, light, mesh)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -320,6 +372,7 @@ pub struct ChunkStreamer {
     config: ResidencyConfig,
     slots: HashMap<ChunkPos, ChunkResidencyEntry>,
     required: HashSet<ChunkPos>,
+    required_center: Option<ChunkPos>,
     generation_in_flight: HashSet<ChunkPos>,
     lighting_in_flight: HashSet<ChunkPos>,
     meshing_in_flight: HashSet<ChunkPos>,
@@ -613,6 +666,7 @@ impl ChunkStreamer {
             config,
             slots: HashMap::new(),
             required: HashSet::new(),
+            required_center: None,
             generation_in_flight: HashSet::new(),
             lighting_in_flight: HashSet::new(),
             meshing_in_flight: HashSet::new(),
@@ -649,15 +703,43 @@ impl ChunkStreamer {
     }
 
     pub fn tick(&mut self, center_chunk: ChunkPos) {
-        self.refresh_required_set(center_chunk);
-        self.poll_generation_results();
-        self.poll_lighting_results();
-        self.poll_meshing_results();
-        self.dispatch_lighting(center_chunk);
-        self.dispatch_meshing(center_chunk);
-        self.dispatch_generation(center_chunk);
-        self.flush_render_uploads();
-        self.cleanup_evicted();
+        let _tick_span = tracing::info_span!("streaming.tick").entered();
+        {
+            let _span = tracing::info_span!("streaming.refresh_required_set").entered();
+            self.refresh_required_set(center_chunk);
+        }
+        {
+            let _span = tracing::info_span!("streaming.poll_generation_results").entered();
+            self.poll_generation_results();
+        }
+        {
+            let _span = tracing::info_span!("streaming.poll_lighting_results").entered();
+            self.poll_lighting_results();
+        }
+        {
+            let _span = tracing::info_span!("streaming.poll_meshing_results").entered();
+            self.poll_meshing_results();
+        }
+        {
+            let _span = tracing::info_span!("streaming.dispatch_lighting").entered();
+            self.dispatch_lighting(center_chunk);
+        }
+        {
+            let _span = tracing::info_span!("streaming.dispatch_meshing").entered();
+            self.dispatch_meshing(center_chunk);
+        }
+        {
+            let _span = tracing::info_span!("streaming.dispatch_generation").entered();
+            self.dispatch_generation(center_chunk);
+        }
+        {
+            let _span = tracing::info_span!("streaming.flush_render_uploads").entered();
+            self.flush_render_uploads();
+        }
+        {
+            let _span = tracing::info_span!("streaming.cleanup_evicted").entered();
+            self.cleanup_evicted();
+        }
     }
 
     pub fn drain_render_updates(&mut self) -> Vec<RenderMeshUpdate> {
@@ -1148,48 +1230,142 @@ impl ChunkStreamer {
     }
 
     fn refresh_required_set(&mut self, center_chunk: ChunkPos) {
-        let mut required = HashSet::new();
-        for dz in -self.config.view_radius..=self.config.view_radius {
-            for dx in -self.config.view_radius..=self.config.view_radius {
-                let pos = ChunkPos {
-                    x: center_chunk.x + dx,
-                    z: center_chunk.z + dz,
-                };
-                required.insert(pos);
-                self.slots.entry(pos).or_insert(ChunkResidencyEntry {
-                    state: ChunkResidencyState::Requested,
-                    dirty: ChunkDirtyFlags::default(),
-                    lighting_revision: 0,
-                    chunk: None,
+        if self.required_center == Some(center_chunk) {
+            return;
+        }
 
-                    section_meshes: std::array::from_fn(|_| None),
-                    transparent_section_meshes: std::array::from_fn(|_| None),
-                    meshed_section_mask: 0,
-                });
+        let r = self.config.view_radius;
+        let Some(prev_center) = self.required_center else {
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    self.add_required_pos(ChunkPos {
+                        x: center_chunk.x + dx,
+                        z: center_chunk.z + dz,
+                    });
+                }
+            }
+            self.required_center = Some(center_chunk);
+            return;
+        };
+
+        let old_min_x = prev_center.x - r;
+        let old_max_x = prev_center.x + r;
+        let old_min_z = prev_center.z - r;
+        let old_max_z = prev_center.z + r;
+        let new_min_x = center_chunk.x - r;
+        let new_max_x = center_chunk.x + r;
+        let new_min_z = center_chunk.z - r;
+        let new_max_z = center_chunk.z + r;
+
+        // Remove columns that moved out of view.
+        if old_min_x < new_min_x {
+            for x in old_min_x..new_min_x {
+                for z in old_min_z..=old_max_z {
+                    self.remove_required_pos(ChunkPos { x, z });
+                }
+            }
+        }
+        if old_max_x > new_max_x {
+            for x in (new_max_x + 1)..=old_max_x {
+                for z in old_min_z..=old_max_z {
+                    self.remove_required_pos(ChunkPos { x, z });
+                }
             }
         }
 
-        let mut evicted = Vec::new();
-        for (pos, slot) in &mut self.slots {
-            if !required.contains(pos) && slot.state != ChunkResidencyState::Evicting {
+        let overlap_min_x = old_min_x.max(new_min_x);
+        let overlap_max_x = old_max_x.min(new_max_x);
+        if overlap_min_x <= overlap_max_x {
+            if old_min_z < new_min_z {
+                for z in old_min_z..new_min_z {
+                    for x in overlap_min_x..=overlap_max_x {
+                        self.remove_required_pos(ChunkPos { x, z });
+                    }
+                }
+            }
+            if old_max_z > new_max_z {
+                for z in (new_max_z + 1)..=old_max_z {
+                    for x in overlap_min_x..=overlap_max_x {
+                        self.remove_required_pos(ChunkPos { x, z });
+                    }
+                }
+            }
+        }
+
+        // Add columns that entered view.
+        if new_min_x < old_min_x {
+            for x in new_min_x..old_min_x {
+                for z in new_min_z..=new_max_z {
+                    self.add_required_pos(ChunkPos { x, z });
+                }
+            }
+        }
+        if new_max_x > old_max_x {
+            for x in (old_max_x + 1)..=new_max_x {
+                for z in new_min_z..=new_max_z {
+                    self.add_required_pos(ChunkPos { x, z });
+                }
+            }
+        }
+
+        let overlap_new_min_x = new_min_x.max(old_min_x);
+        let overlap_new_max_x = new_max_x.min(old_max_x);
+        if overlap_new_min_x <= overlap_new_max_x {
+            if new_min_z < old_min_z {
+                for z in new_min_z..old_min_z {
+                    for x in overlap_new_min_x..=overlap_new_max_x {
+                        self.add_required_pos(ChunkPos { x, z });
+                    }
+                }
+            }
+            if new_max_z > old_max_z {
+                for z in (old_max_z + 1)..=new_max_z {
+                    for x in overlap_new_min_x..=overlap_new_max_x {
+                        self.add_required_pos(ChunkPos { x, z });
+                    }
+                }
+            }
+        }
+
+        self.required_center = Some(center_chunk);
+    }
+
+    fn add_required_pos(&mut self, pos: ChunkPos) {
+        if !self.required.insert(pos) {
+            return;
+        }
+        self.slots.entry(pos).or_insert(ChunkResidencyEntry {
+            state: ChunkResidencyState::Requested,
+            dirty: ChunkDirtyFlags::default(),
+            lighting_revision: 0,
+            chunk: None,
+            section_meshes: std::array::from_fn(|_| None),
+            transparent_section_meshes: std::array::from_fn(|_| None),
+            meshed_section_mask: 0,
+        });
+    }
+
+    fn remove_required_pos(&mut self, pos: ChunkPos) {
+        if !self.required.remove(&pos) {
+            return;
+        }
+        let mut evicted = false;
+        if let Some(slot) = self.slots.get_mut(&pos) {
+            if slot.state != ChunkResidencyState::Evicting {
                 slot.state = ChunkResidencyState::Evicting;
                 slot.dirty = ChunkDirtyFlags::default();
                 slot.chunk = None;
                 slot.section_meshes = std::array::from_fn(|_| None);
                 slot.transparent_section_meshes = std::array::from_fn(|_| None);
                 slot.meshed_section_mask = 0;
-                self.mesh_dirty = true;
-                self.render_updates
-                    .push(RenderMeshUpdate::RemoveChunk { pos: *pos });
-                evicted.push(*pos);
+                evicted = true;
             }
         }
-
-        for pos in evicted {
+        if evicted {
+            self.mesh_dirty = true;
+            self.render_updates.push(RenderMeshUpdate::RemoveChunk { pos });
             self.mark_neighbors_for_remesh(pos);
         }
-
-        self.required = required;
     }
 
     fn dispatch_generation(&mut self, center_chunk: ChunkPos) {
@@ -2904,6 +3080,19 @@ mod tests {
     }
 
     #[test]
+    fn default_worker_counts_scale_with_cores_and_reserve_headroom() {
+        let cases = [(2, 1, 1, 1), (4, 1, 1, 1), (8, 1, 2, 3), (16, 3, 4, 7)];
+        for (cores, min_gen, min_light, min_mesh) in cases {
+            let (gen, light, mesh) = default_worker_counts_from_cores(cores);
+            let budget = cores.saturating_sub(2).clamp(3, 24);
+            assert_eq!(gen + light + mesh, budget);
+            assert!(gen >= min_gen);
+            assert!(light >= min_light);
+            assert!(mesh >= min_mesh);
+        }
+    }
+
+    #[test]
     fn effective_light_query_matches_alpha_rule_and_world_bounds() {
         let registry = BlockRegistry::alpha_1_2_6();
         let mut streamer = ChunkStreamer::new(42, registry, ResidencyConfig::default());
@@ -4302,3 +4491,7 @@ mod tests {
         );
     }
 }
+
+
+
+
