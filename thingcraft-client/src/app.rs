@@ -77,6 +77,7 @@ const COBBLESTONE_BLOCK_ID: u8 = 4;
 const GLASS_BLOCK_ID: u8 = 20;
 const BOOKSHELF_BLOCK_ID: u8 = 47;
 const MOB_SPAWNER_BLOCK_ID: u8 = 52;
+const SAND_BLOCK_ID: u8 = 12;
 const DIRT_BLOCK_ID: u8 = 3;
 const SAPLING_BLOCK_ID: u8 = 6;
 const OAK_LEAVES_BLOCK_ID: u8 = 18;
@@ -96,6 +97,7 @@ const YELLOW_FLOWER_BLOCK_ID: u8 = 37;
 const RED_FLOWER_BLOCK_ID: u8 = 38;
 const BROWN_MUSHROOM_BLOCK_ID: u8 = 39;
 const RED_MUSHROOM_BLOCK_ID: u8 = 40;
+const CACTUS_BLOCK_ID: u8 = 81;
 const SUGAR_CANE_BLOCK_ID: u8 = 83;
 const OAK_LOG_BLOCK_ID: u8 = 17;
 const ICE_BLOCK_ID: u8 = 79;
@@ -1876,6 +1878,8 @@ enum PlacementRule {
     PlantSoil,
     SolidSupport,
     SugarCane,
+    Cactus,
+    SnowLayer,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1884,6 +1888,9 @@ enum SurvivalRule {
     Flower,
     Mushroom,
     SugarCane,
+    Cactus,
+    SnowLayer,
+    Sapling,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1990,6 +1997,18 @@ fn block_behavior(block_id: u8) -> BlockBehavior {
                 min_count: 1,
                 max_count: 1,
             },
+            placement_rule: PlacementRule::SnowLayer,
+            survival_rule: SurvivalRule::SnowLayer,
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        SAPLING_BLOCK_ID => BlockBehavior {
+            placement_rule: PlacementRule::PlantSoil,
+            survival_rule: SurvivalRule::Sapling,
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        CACTUS_BLOCK_ID => BlockBehavior {
+            placement_rule: PlacementRule::Cactus,
+            survival_rule: SurvivalRule::Cactus,
             ..DEFAULT_BLOCK_BEHAVIOR
         },
         SUGAR_CANE_BLOCK_ID => BlockBehavior {
@@ -2061,6 +2080,61 @@ fn alpha_material_is_opaque(material: MaterialKind) -> bool {
             | MaterialKind::SnowLayer
             | MaterialKind::Fire
     )
+}
+
+fn alpha_material_is_solid(material: MaterialKind) -> bool {
+    !matches!(
+        material,
+        MaterialKind::Air
+            | MaterialKind::Plant
+            | MaterialKind::Decoration
+            | MaterialKind::SnowLayer
+            | MaterialKind::Liquid
+            | MaterialKind::Fire
+    )
+}
+
+fn can_snow_layer_survive(
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    if y <= 0 {
+        return false;
+    }
+    let Some(below) = chunk_streamer.block_at_world(x, y - 1, z) else {
+        return false;
+    };
+    below != AIR_BLOCK_ID && registry.is_collidable(below) && registry.blocks_movement(below)
+}
+
+fn can_cactus_survive(
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    if y <= 0 {
+        return false;
+    }
+    let Some(below) = chunk_streamer.block_at_world(x, y - 1, z) else {
+        return false;
+    };
+    if below != CACTUS_BLOCK_ID && below != SAND_BLOCK_ID {
+        return false;
+    }
+    for (nx, ny, nz) in [(x - 1, y, z), (x + 1, y, z), (x, y, z - 1), (x, y, z + 1)] {
+        let Some(side_block) = chunk_streamer.block_at_world(nx, ny, nz) else {
+            continue;
+        };
+        if alpha_material_is_solid(registry.material_of(side_block)) {
+            return false;
+        }
+    }
+    true
 }
 
 fn block_drop_stack(
@@ -2153,6 +2227,7 @@ fn break_block_with_drop(
     if !chunk_streamer.set_block_at_world(x, y, z, replacement_block) {
         return false;
     }
+    refresh_nearby_leaf_decay_metadata(chunk_streamer, registry, x, y, z);
     edit_latency_tracker.record_block_edit(x, z);
     if let Some(drop) = block_drop_stack(block_id, true, registry, rng) {
         crate::entity::spawn_dropped_item_stack(
@@ -2164,51 +2239,175 @@ fn break_block_with_drop(
     true
 }
 
-fn leaf_has_log_within_decay_distance(
-    chunk_streamer: &ChunkStreamer,
+fn update_neighbor_log_proximity_if_matches(
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
+    neighbor_x: i32,
+    neighbor_y: i32,
+    neighbor_z: i32,
+    proximity: u8,
+    updates_this_tick: &mut usize,
+) {
+    if chunk_streamer.block_at_world(neighbor_x, neighbor_y, neighbor_z) != Some(OAK_LEAVES_BLOCK_ID) {
+        return;
+    }
+    let meta = chunk_streamer
+        .block_metadata_at_world(neighbor_x, neighbor_y, neighbor_z)
+        .unwrap_or(0);
+    if meta == 0 || meta != proximity.saturating_sub(1) {
+        return;
+    }
+    let _ = update_leaves_log_proximity(
+        chunk_streamer,
+        registry,
+        neighbor_x,
+        neighbor_y,
+        neighbor_z,
+        updates_this_tick,
+    );
+}
+
+fn update_leaves_log_proximity(
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
     x: i32,
     y: i32,
     z: i32,
+    updates_this_tick: &mut usize,
 ) -> bool {
-    const MAX_DISTANCE: u8 = 4;
-    let mut pending = VecDeque::new();
-    let mut visited = HashSet::new();
-    pending.push_back((x, y, z, 0_u8));
-    visited.insert((x, y, z));
+    if *updates_this_tick >= 100 {
+        return false;
+    }
+    *updates_this_tick += 1;
 
-    while let Some((cx, cy, cz, distance)) = pending.pop_front() {
-        if distance >= MAX_DISTANCE {
-            continue;
+    let mut proximity = if y > 0
+        && chunk_streamer
+            .block_at_world(x, y - 1, z)
+            .is_some_and(|id| alpha_material_is_solid(registry.material_of(id)))
+    {
+        16
+    } else {
+        0
+    };
+    let mut current_meta = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+    if current_meta == 0 {
+        current_meta = 1;
+        let _ = chunk_streamer.set_block_with_metadata_at_world(x, y, z, OAK_LEAVES_BLOCK_ID, 1);
+    }
+    let sample_neighbor = |nx: i32, ny: i32, nz: i32, cur: u8, streamer: &ChunkStreamer| -> u8 {
+        let Some(block_id) = streamer.block_at_world(nx, ny, nz) else {
+            return cur;
+        };
+        if block_id == OAK_LOG_BLOCK_ID {
+            return 16;
         }
-        for (nx, ny, nz) in [
-            (cx + 1, cy, cz),
-            (cx - 1, cy, cz),
-            (cx, cy + 1, cz),
-            (cx, cy - 1, cz),
-            (cx, cy, cz + 1),
-            (cx, cy, cz - 1),
-        ] {
-            if (nx - x).abs() > i32::from(MAX_DISTANCE)
-                || (ny - y).abs() > i32::from(MAX_DISTANCE)
-                || (nz - z).abs() > i32::from(MAX_DISTANCE)
-                || !visited.insert((nx, ny, nz))
-            {
-                continue;
-            }
+        if block_id != OAK_LEAVES_BLOCK_ID {
+            return cur;
+        }
+        let meta = streamer.block_metadata_at_world(nx, ny, nz).unwrap_or(0);
+        if meta != 0 && meta > cur { meta } else { cur }
+    };
+    proximity = sample_neighbor(x, y - 1, z, proximity, chunk_streamer);
+    proximity = sample_neighbor(x, y, z - 1, proximity, chunk_streamer);
+    proximity = sample_neighbor(x, y, z + 1, proximity, chunk_streamer);
+    proximity = sample_neighbor(x - 1, y, z, proximity, chunk_streamer);
+    proximity = sample_neighbor(x + 1, y, z, proximity, chunk_streamer);
 
-            let Some(block_id) = chunk_streamer.block_at_world(nx, ny, nz) else {
-                continue;
-            };
-            if block_id == OAK_LOG_BLOCK_ID {
-                return true;
-            }
-            if block_id == OAK_LEAVES_BLOCK_ID {
-                pending.push_back((nx, ny, nz, distance + 1));
+    let mut new_meta = proximity.saturating_sub(1);
+    if new_meta < 10 {
+        new_meta = 1;
+    }
+    if new_meta == current_meta {
+        return false;
+    }
+    if !chunk_streamer.set_block_with_metadata_at_world(x, y, z, OAK_LEAVES_BLOCK_ID, new_meta) {
+        return false;
+    }
+
+    update_neighbor_log_proximity_if_matches(
+        chunk_streamer,
+        registry,
+        x,
+        y - 1,
+        z,
+        current_meta,
+        updates_this_tick,
+    );
+    update_neighbor_log_proximity_if_matches(
+        chunk_streamer,
+        registry,
+        x,
+        y + 1,
+        z,
+        current_meta,
+        updates_this_tick,
+    );
+    update_neighbor_log_proximity_if_matches(
+        chunk_streamer,
+        registry,
+        x,
+        y,
+        z - 1,
+        current_meta,
+        updates_this_tick,
+    );
+    update_neighbor_log_proximity_if_matches(
+        chunk_streamer,
+        registry,
+        x,
+        y,
+        z + 1,
+        current_meta,
+        updates_this_tick,
+    );
+    update_neighbor_log_proximity_if_matches(
+        chunk_streamer,
+        registry,
+        x - 1,
+        y,
+        z,
+        current_meta,
+        updates_this_tick,
+    );
+    update_neighbor_log_proximity_if_matches(
+        chunk_streamer,
+        registry,
+        x + 1,
+        y,
+        z,
+        current_meta,
+        updates_this_tick,
+    );
+    true
+}
+
+fn refresh_nearby_leaf_decay_metadata(
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
+    origin_x: i32,
+    origin_y: i32,
+    origin_z: i32,
+) {
+    let mut updates_this_tick = 0_usize;
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let x = origin_x + dx;
+                let y = origin_y + dy;
+                let z = origin_z + dz;
+                if chunk_streamer.block_at_world(x, y, z) == Some(OAK_LEAVES_BLOCK_ID) {
+                    let _ = update_leaves_log_proximity(
+                        chunk_streamer,
+                        registry,
+                        x,
+                        y,
+                        z,
+                        &mut updates_this_tick,
+                    );
+                }
             }
         }
     }
-
-    false
 }
 
 fn can_survive_random_tick(
@@ -2245,6 +2444,19 @@ fn can_survive_random_tick(
                     .is_some_and(|below| registry.blocks_movement(below))
         }
         SurvivalRule::SugarCane => can_sugar_cane_survive(chunk_streamer, x, y, z),
+        SurvivalRule::Cactus => can_cactus_survive(chunk_streamer, registry, x, y, z),
+        SurvivalRule::SnowLayer => can_snow_layer_survive(chunk_streamer, registry, x, y, z),
+        SurvivalRule::Sapling => {
+            if y <= 0 {
+                return false;
+            }
+            let bright = chunk_streamer.raw_brightness_at_world(x, y, z).unwrap_or(0) >= 8;
+            let sky_access = chunk_streamer.sky_light_at_world(x, y, z).unwrap_or(0) == 15;
+            (bright || sky_access)
+                && chunk_streamer
+                    .block_at_world(x, y - 1, z)
+                    .is_some_and(can_place_plant_on)
+        }
     }
 }
 
@@ -2331,9 +2543,11 @@ fn tick_random_block_at(
             false
         }
         OAK_LEAVES_BLOCK_ID => {
-            if leaf_has_log_within_decay_distance(chunk_streamer, x, y, z) {
-                false
-            } else {
+            let metadata = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+            if metadata == 0 {
+                let mut updates_this_tick = 0_usize;
+                update_leaves_log_proximity(chunk_streamer, registry, x, y, z, &mut updates_this_tick)
+            } else if metadata == 1 {
                 break_block_with_drop(
                     ecs_runtime,
                     chunk_streamer,
@@ -2344,6 +2558,62 @@ fn tick_random_block_at(
                     z,
                     block_id,
                     rng,
+                )
+            } else if rng.gen_range(0..10) == 0 {
+                let mut updates_this_tick = 0_usize;
+                update_leaves_log_proximity(chunk_streamer, registry, x, y, z, &mut updates_this_tick)
+            } else {
+                false
+            }
+        }
+        SAPLING_BLOCK_ID => {
+            if chunk_streamer.raw_brightness_at_world(x, y + 1, z).unwrap_or(0) < 9 {
+                return false;
+            }
+            if rng.gen_range(0..5) != 0 {
+                return false;
+            }
+            let meta = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+            if meta < 15 {
+                chunk_streamer.set_block_with_metadata_at_world(x, y, z, SAPLING_BLOCK_ID, meta + 1)
+            } else {
+                // TODO(sapling-growth): Hook full Alpha tree feature selection/placement.
+                false
+            }
+        }
+        CACTUS_BLOCK_ID => {
+            if chunk_streamer.block_at_world(x, y + 1, z) != Some(AIR_BLOCK_ID) {
+                return false;
+            }
+            let mut height = 1_i32;
+            while chunk_streamer.block_at_world(x, y - height, z) == Some(CACTUS_BLOCK_ID) {
+                height += 1;
+            }
+            if height >= 3 {
+                return false;
+            }
+            let meta = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+            if meta >= 15 {
+                if chunk_streamer.set_block_at_world(x, y + 1, z, CACTUS_BLOCK_ID) {
+                    let _ = chunk_streamer.set_block_with_metadata_at_world(
+                        x,
+                        y,
+                        z,
+                        CACTUS_BLOCK_ID,
+                        0,
+                    );
+                    edit_latency_tracker.record_block_edit(x, z);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                chunk_streamer.set_block_with_metadata_at_world(
+                    x,
+                    y,
+                    z,
+                    CACTUS_BLOCK_ID,
+                    meta + 1,
                 )
             }
         }
@@ -2396,6 +2666,19 @@ fn tick_random_block_at(
                     block_id,
                     rng,
                 )
+            } else {
+                false
+            }
+        }
+        ICE_BLOCK_ID => {
+            let threshold = 11_i32 - i32::from(registry.opacity_of(ICE_BLOCK_ID));
+            if i32::from(chunk_streamer.block_light_at_world(x, y, z).unwrap_or(0)) > threshold {
+                if chunk_streamer.set_block_at_world(x, y, z, WATER_BLOCK_ID) {
+                    edit_latency_tracker.record_block_edit(x, z);
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -2494,6 +2777,16 @@ fn apply_post_edit_support_rules(
                         .is_some_and(|below| registry.blocks_movement(below)))
             }
             SurvivalRule::SugarCane => !can_sugar_cane_survive(chunk_streamer, x, y, z),
+            SurvivalRule::Cactus => !can_cactus_survive(chunk_streamer, registry, x, y, z),
+            SurvivalRule::SnowLayer => !can_snow_layer_survive(chunk_streamer, registry, x, y, z),
+            SurvivalRule::Sapling => {
+                !(y > 0
+                    && (chunk_streamer.raw_brightness_at_world(x, y, z).unwrap_or(0) >= 8
+                        || chunk_streamer.sky_light_at_world(x, y, z).unwrap_or(0) == 15)
+                    && chunk_streamer
+                        .block_at_world(x, y - 1, z)
+                        .is_some_and(can_place_plant_on))
+            }
         };
         if !should_break {
             continue;
@@ -2606,6 +2899,7 @@ fn break_block_and_collect_drop(
     if !chunk_streamer.set_block_at_world(block_x, block_y, block_z, replacement_block) {
         return None;
     }
+    refresh_nearby_leaf_decay_metadata(chunk_streamer, registry, block_x, block_y, block_z);
     edit_latency_tracker.record_block_edit(block_x, block_z);
     apply_post_edit_support_rules(
         ecs_runtime,
@@ -3041,6 +3335,8 @@ fn alpha_can_place_block_at(
         PlacementRule::SugarCane => {
             can_sugar_cane_survive(chunk_streamer, place_x, place_y, place_z)
         }
+        PlacementRule::Cactus => can_cactus_survive(chunk_streamer, registry, place_x, place_y, place_z),
+        PlacementRule::SnowLayer => can_snow_layer_survive(chunk_streamer, registry, place_x, place_y, place_z),
     }
 }
 
@@ -5155,7 +5451,8 @@ mod tests {
         SurvivalRule, AIR_BLOCK_ID, CHEST_BLOCK_ID, FLOWING_WATER_BLOCK_ID, FURNACE_BLOCK_ID, LIT_FURNACE_BLOCK_ID,
         LIT_PUMPKIN_BLOCK_ID, OAK_LEAVES_BLOCK_ID, OAK_LOG_BLOCK_ID, PUMPKIN_BLOCK_ID,
         RANDOM_TICKS_PER_CHUNK, RANDOM_TICK_CHUNK_RADIUS, SUGAR_CANE_BLOCK_ID,
-        WATER_BLOCK_ID, DIRT_BLOCK_ID, GRASS_BLOCK_ID, ICE_BLOCK_ID,
+        WATER_BLOCK_ID, DIRT_BLOCK_ID, GRASS_BLOCK_ID, ICE_BLOCK_ID, CACTUS_BLOCK_ID,
+        SAPLING_BLOCK_ID, SNOW_LAYER_BLOCK_ID, SAND_BLOCK_ID, STONE_BLOCK_ID,
     };
     use crate::crafting::CraftingRegistry;
     use crate::ecs::EcsRuntime;
@@ -5548,6 +5845,18 @@ mod tests {
                 fallback_block_id: Some(13)
             }
         );
+
+        let cactus = block_behavior(CACTUS_BLOCK_ID);
+        assert_eq!(cactus.placement_rule, PlacementRule::Cactus);
+        assert_eq!(cactus.survival_rule, SurvivalRule::Cactus);
+
+        let sapling = block_behavior(SAPLING_BLOCK_ID);
+        assert_eq!(sapling.placement_rule, PlacementRule::PlantSoil);
+        assert_eq!(sapling.survival_rule, SurvivalRule::Sapling);
+
+        let snow_layer = block_behavior(SNOW_LAYER_BLOCK_ID);
+        assert_eq!(snow_layer.placement_rule, PlacementRule::SnowLayer);
+        assert_eq!(snow_layer.survival_rule, SurvivalRule::SnowLayer);
     }
 
     #[test]
@@ -5578,7 +5887,7 @@ mod tests {
         let _ = streamer.set_block_at_world(8, 69, 8, OAK_LOG_BLOCK_ID);
         assert!(streamer.set_block_with_metadata_at_world(8, 70, 8, OAK_LEAVES_BLOCK_ID, 0));
 
-        assert!(!tick_random_block_at(
+        let _ = tick_random_block_at(
             &mut ecs,
             &mut streamer,
             &registry,
@@ -5588,21 +5897,29 @@ mod tests {
             8,
             18,
             &mut rng,
-        ));
+        );
         assert_eq!(streamer.block_at_world(8, 70, 8), Some(OAK_LEAVES_BLOCK_ID));
 
         let _ = streamer.set_block_at_world(8, 69, 8, AIR_BLOCK_ID);
-        assert!(tick_random_block_at(
-            &mut ecs,
-            &mut streamer,
-            &registry,
-            &mut latency,
-            8,
-            70,
-            8,
-            18,
-            &mut rng,
-        ));
+        let mut decayed = false;
+        for _ in 0..128 {
+            let _ = tick_random_block_at(
+                &mut ecs,
+                &mut streamer,
+                &registry,
+                &mut latency,
+                8,
+                70,
+                8,
+                18,
+                &mut rng,
+            );
+            if streamer.block_at_world(8, 70, 8) == Some(AIR_BLOCK_ID) {
+                decayed = true;
+                break;
+            }
+        }
+        assert!(decayed, "leaf should decay after nearby log support is removed");
         assert_eq!(streamer.block_at_world(8, 70, 8), Some(AIR_BLOCK_ID));
     }
 
@@ -5675,6 +5992,186 @@ mod tests {
         assert_eq!(streamer.block_at_world(8, 40, 8), Some(AIR_BLOCK_ID));
         assert_eq!(streamer.block_at_world(8, 41, 8), Some(AIR_BLOCK_ID));
         assert_eq!(streamer.block_at_world(8, 42, 8), Some(AIR_BLOCK_ID));
+    }
+
+    #[test]
+    fn random_tick_unsupported_cactus_breaks() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(851, registry.clone(), ResidencyConfig::default());
+        wait_until_streamer_has_block(&mut streamer, ChunkPos { x: 0, z: 0 }, 8, 40, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(5);
+
+        let _ = streamer.set_block_at_world(8, 39, 8, SAND_BLOCK_ID);
+        let _ = streamer.set_block_at_world(8, 40, 8, CACTUS_BLOCK_ID);
+        let _ = streamer.set_block_at_world(9, 40, 8, STONE_BLOCK_ID);
+
+        assert!(tick_random_block_at(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            40,
+            8,
+            CACTUS_BLOCK_ID,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 40, 8), Some(AIR_BLOCK_ID));
+    }
+
+    #[test]
+    fn random_tick_cactus_grows_when_metadata_reaches_max() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(852, registry.clone(), ResidencyConfig::default());
+        wait_until_streamer_has_block(&mut streamer, ChunkPos { x: 0, z: 0 }, 8, 40, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(6);
+
+        for dz in -1..=1 {
+            for dy in 0..=2 {
+                for dx in -1..=1 {
+                    let _ = streamer.set_block_at_world(8 + dx, 39 + dy, 8 + dz, AIR_BLOCK_ID);
+                }
+            }
+        }
+        let _ = streamer.set_block_at_world(8, 39, 8, SAND_BLOCK_ID);
+        let _ = streamer.set_block_with_metadata_at_world(8, 40, 8, CACTUS_BLOCK_ID, 15);
+        let _ = streamer.set_block_at_world(8, 41, 8, AIR_BLOCK_ID);
+
+        assert!(tick_random_block_at(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            40,
+            8,
+            CACTUS_BLOCK_ID,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 41, 8), Some(CACTUS_BLOCK_ID));
+        assert_eq!(streamer.block_metadata_at_world(8, 40, 8), Some(0));
+    }
+
+    #[test]
+    fn random_tick_snow_layer_breaks_without_support() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(853, registry.clone(), ResidencyConfig::default());
+        wait_until_streamer_has_block(&mut streamer, ChunkPos { x: 0, z: 0 }, 8, 40, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(7);
+
+        let _ = streamer.set_block_at_world(8, 39, 8, AIR_BLOCK_ID);
+        let _ = streamer.set_block_at_world(8, 40, 8, SNOW_LAYER_BLOCK_ID);
+
+        assert!(tick_random_block_at(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            40,
+            8,
+            SNOW_LAYER_BLOCK_ID,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 40, 8), Some(AIR_BLOCK_ID));
+    }
+
+    #[test]
+    fn random_tick_sapling_advances_growth_metadata() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(854, registry.clone(), ResidencyConfig::default());
+        let target = ChunkPos { x: 0, z: 0 };
+        wait_until_streamer_has_block(&mut streamer, target, 8, 70, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(8);
+
+        for dz in -1..=1 {
+            for dy in 0..=3 {
+                for dx in -1..=1 {
+                    let _ = streamer.set_block_at_world(8 + dx, 69 + dy, 8 + dz, AIR_BLOCK_ID);
+                }
+            }
+        }
+        for y in 71..=127 {
+            let _ = streamer.set_block_at_world(8, y, 8, AIR_BLOCK_ID);
+        }
+        let _ = streamer.set_block_at_world(8, 69, 8, DIRT_BLOCK_ID);
+        let _ = streamer.set_block_with_metadata_at_world(8, 70, 8, SAPLING_BLOCK_ID, 0);
+        for _ in 0..10 {
+            streamer.tick(target);
+        }
+        assert!(
+            streamer.sky_light_at_world(8, 70, 8).unwrap_or(0) == 15
+                || streamer.raw_brightness_at_world(8, 70, 8).unwrap_or(0) >= 8,
+            "expected sapling location to satisfy PlantBlock survival light"
+        );
+
+        let mut advanced = false;
+        for _ in 0..64 {
+            let _ = tick_random_block_at(
+                &mut ecs,
+                &mut streamer,
+                &registry,
+                &mut latency,
+                8,
+                70,
+                8,
+                SAPLING_BLOCK_ID,
+                &mut rng,
+            );
+            if streamer.block_metadata_at_world(8, 70, 8).unwrap_or(0) > 0 {
+                advanced = true;
+                break;
+            }
+        }
+        assert!(advanced, "sapling metadata should advance under bright conditions");
+    }
+
+    #[test]
+    fn random_tick_ice_melts_under_block_light() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(855, registry.clone(), ResidencyConfig::default());
+        let target = ChunkPos { x: 0, z: 0 };
+        wait_until_streamer_has_block(&mut streamer, target, 8, 40, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(9);
+
+        let _ = streamer.set_block_at_world(8, 39, 8, STONE_BLOCK_ID);
+        let _ = streamer.set_block_at_world(8, 40, 8, ICE_BLOCK_ID);
+        for (tx, tz) in [(9, 8), (7, 8), (8, 9), (8, 7)] {
+            let _ = streamer.set_block_at_world(tx, 40, tz, 50);
+        }
+        let mut lit = false;
+        for _ in 0..240 {
+            streamer.tick(target);
+            if streamer.block_light_at_world(8, 40, 8).unwrap_or(0) > 8 {
+                lit = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(lit, "expected torch light to reach ice block");
+
+        assert!(tick_random_block_at(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            40,
+            8,
+            ICE_BLOCK_ID,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 40, 8), Some(WATER_BLOCK_ID));
     }
 
     #[test]
