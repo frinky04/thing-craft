@@ -3,6 +3,9 @@
 .idea/
 .vscode/
 *.log
+docs/reports/benchmarks/*.csv
+docs/reports/benchmarks/*.png
+docs/reports/benchmarks/*_screens/
 
 # Decompiled Java source is our canonical code reference; ignore raw class blobs.
 resources/minecraft-a1.2.6-client/**/*.class

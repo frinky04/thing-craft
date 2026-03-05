@@ -1381,17 +1381,18 @@ impl ChunkStreamer {
         }
 
         let mut candidates: Vec<_> = self
-            .slots
+            .required
             .iter()
-            .filter_map(|(pos, entry)| {
-                if entry.state == ChunkResidencyState::Requested
-                    && !self.generation_in_flight.contains(pos)
-                    && self.required.contains(pos)
-                {
-                    Some(*pos)
-                } else {
-                    None
-                }
+            .filter_map(|pos| {
+                self.slots.get(pos).and_then(|entry| {
+                    if entry.state == ChunkResidencyState::Requested
+                        && !self.generation_in_flight.contains(pos)
+                    {
+                        Some(*pos)
+                    } else {
+                        None
+                    }
+                })
             })
             .collect();
 
@@ -1432,17 +1433,20 @@ impl ChunkStreamer {
 
         let mut urgent_candidates = Vec::new();
         let mut regular_candidates = Vec::new();
-        for (pos, entry) in &self.slots {
-            if entry.chunk.is_some()
+        for pos in &self.required {
+            let Some(entry) = self.slots.get(pos) else {
+                continue;
+            };
+            if !(entry.chunk.is_some()
                 && entry.dirty.lighting
-                && !self.lighting_in_flight.contains(pos)
-                && self.required.contains(pos)
+                && !self.lighting_in_flight.contains(pos))
             {
-                if self.urgent_lighting.contains(pos) {
-                    urgent_candidates.push(*pos);
-                } else {
-                    regular_candidates.push(*pos);
-                }
+                continue;
+            }
+            if self.urgent_lighting.contains(pos) {
+                urgent_candidates.push(*pos);
+            } else {
+                regular_candidates.push(*pos);
             }
         }
 
@@ -1564,21 +1568,24 @@ impl ChunkStreamer {
 
         let mut urgent_candidates = Vec::new();
         let mut regular_candidates = Vec::new();
-        for (pos, entry) in &self.slots {
-            if entry.state == ChunkResidencyState::Meshing
+        for pos in &self.required {
+            let Some(entry) = self.slots.get(pos) else {
+                continue;
+            };
+            if !(entry.state == ChunkResidencyState::Meshing
                 && entry.chunk.is_some()
                 && (entry.dirty.geometry || entry.dirty.geometry_sections != 0)
                 && !entry.dirty.lighting
                 && !self.lighting_in_flight.contains(pos)
                 && !self.meshing_in_flight.contains(pos)
-                && self.required.contains(pos)
-                && self.neighbor_lighting_ready(*pos)
+                && self.neighbor_lighting_ready(*pos))
             {
-                if self.urgent_meshing.contains(pos) {
-                    urgent_candidates.push(*pos);
-                } else {
-                    regular_candidates.push(*pos);
-                }
+                continue;
+            }
+            if self.urgent_meshing.contains(pos) {
+                urgent_candidates.push(*pos);
+            } else {
+                regular_candidates.push(*pos);
             }
         }
 
