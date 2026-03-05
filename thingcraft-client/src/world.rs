@@ -1346,39 +1346,15 @@ impl OverworldChunkGenerator {
             z: min_z - 1,
         };
         let source_max = ChunkPos { x: max_x, z: max_z };
-        let ore_source_min = ChunkPos {
-            x: min_x - 1,
-            z: min_z - 1,
-        };
-        let ore_source_max = ChunkPos {
-            x: max_x + 1,
-            z: max_z + 1,
-        };
-        place_lakes(&mut chunks, self.seed, source_min, source_max, registry);
-        place_dungeons(&mut chunks, self.seed, source_min, source_max);
-        place_clay_patches_world_space(&mut chunks, self.seed, source_min, source_max);
-        place_ores_world_space(&mut chunks, self.seed, ore_source_min, ore_source_max);
-        place_trees(
+        populate_source_chunks_world_space(
             &mut chunks,
             self.seed,
+            source_min,
+            source_max,
             &self.biome_source,
             &self.forest_noise,
-            source_min,
-            source_max,
-        );
-        place_flowers_world_space(&mut chunks, self.seed, source_min, source_max, registry);
-        place_mushrooms_world_space(&mut chunks, self.seed, source_min, source_max, registry);
-        place_sugar_cane_world_space(&mut chunks, self.seed, source_min, source_max);
-        place_pumpkins_world_space(&mut chunks, self.seed, source_min, source_max, registry);
-        place_cacti_world_space(
-            &mut chunks,
-            self.seed,
-            &self.biome_source,
-            source_min,
-            source_max,
             registry,
         );
-        place_springs_world_space(&mut chunks, self.seed, ore_source_min, ore_source_max);
         settle_falling_blocks_world_space(&mut chunks, registry);
 
         let mut output = Vec::new();
@@ -2177,6 +2153,7 @@ const ORE_TABLE: &[OreConfig] = &[
     },
 ];
 
+#[allow(dead_code)]
 fn place_ores_world_space(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2269,6 +2246,7 @@ fn is_solid_for_dungeon(block_id: u8) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn place_dungeons(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2484,6 +2462,306 @@ fn pick_dungeon_spawner_type(rng: &mut i64) -> &'static str {
 // Decoration features  (translated from OverworldChunkGenerator.populate())
 // ---------------------------------------------------------------------------
 
+fn populate_source_chunks_world_space(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    world_seed: u64,
+    source_min: ChunkPos,
+    source_max: ChunkPos,
+    biome_source: &BiomeSource,
+    forest_noise: &PerlinNoise,
+    registry: &BlockRegistry,
+) {
+    for source_z in source_min.z..=source_max.z {
+        for source_x in source_min.x..=source_max.x {
+            populate_source_chunk_world_space(
+                chunks,
+                world_seed,
+                source_x,
+                source_z,
+                biome_source,
+                forest_noise,
+                registry,
+            );
+        }
+    }
+}
+
+fn populate_source_chunk_world_space(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    world_seed: u64,
+    source_x: i32,
+    source_z: i32,
+    biome_source: &BiomeSource,
+    forest_noise: &PerlinNoise,
+    registry: &BlockRegistry,
+) {
+    let mut rng = java_random_seed(alpha_chunk_seed(world_seed, source_x, source_z));
+    let i = source_x * 16;
+    let j = source_z * 16;
+
+    // Lakes
+    if java_next_int(&mut rng, 4) == 0 {
+        let x = i + java_next_int(&mut rng, 16) + 8;
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = j + java_next_int(&mut rng, 16) + 8;
+        try_place_lake(chunks, registry, &mut rng, x, y, z, WATER_ID);
+    }
+    if java_next_int(&mut rng, 8) == 0 {
+        let x = i + java_next_int(&mut rng, 16) + 8;
+        let lava_inner = java_next_int(&mut rng, 120) + 8;
+        let y = java_next_int(&mut rng, lava_inner.max(1));
+        let z = j + java_next_int(&mut rng, 16) + 8;
+        if y < 64 || java_next_int(&mut rng, 10) == 0 {
+            try_place_lake(chunks, registry, &mut rng, x, y, z, LAVA_ID);
+        }
+    }
+
+    // Dungeons
+    let dungeon_base_x = i + 8;
+    let dungeon_base_z = j + 8;
+    for _ in 0..8 {
+        let x = dungeon_base_x + java_next_int(&mut rng, 16);
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = dungeon_base_z + java_next_int(&mut rng, 16);
+        try_place_dungeon(chunks, &mut rng, x, y, z);
+    }
+
+    // Clay
+    for _ in 0..10 {
+        let x = i + java_next_int(&mut rng, 16);
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = j + java_next_int(&mut rng, 16);
+        try_place_clay_patch(chunks, &mut rng, x, y, z);
+    }
+
+    // Ores
+    for ore in ORE_TABLE {
+        for _ in 0..ore.attempts {
+            let x = i + java_next_int(&mut rng, 16);
+            let y = java_next_int(&mut rng, ore.max_y);
+            let z = j + java_next_int(&mut rng, 16);
+            place_world_vein(chunks, &mut rng, ore.block_id, ore.vein_size, x, y, z);
+        }
+    }
+
+    // Trees
+    let center_x = source_x * CHUNK_WIDTH as i32 + 8;
+    let center_z = source_z * CHUNK_DEPTH as i32 + 8;
+    let biome_sample = biome_source.sample(center_x, center_z);
+    let chunk_origin_x = source_x * CHUNK_WIDTH as i32;
+    let chunk_origin_z = source_z * CHUNK_DEPTH as i32;
+    let forest_noise_value =
+        alpha_forest_tree_noise_value(forest_noise, chunk_origin_x, chunk_origin_z);
+    let attempt_count = alpha_tree_attempt_count(biome_sample.biome, forest_noise_value, &mut rng);
+    let tree_kind = alpha_tree_feature_kind_for_chunk(biome_sample.biome, &mut rng);
+    let mut large_oak_state = LargeOakState::default();
+    for _ in 0..attempt_count.max(0) {
+        let world_x = source_x * CHUNK_WIDTH as i32 + java_next_int(&mut rng, 16) + 8;
+        let world_z = source_z * CHUNK_DEPTH as i32 + java_next_int(&mut rng, 16) + 8;
+        if let Some(surface_y) = find_surface_y_world(chunks, world_x, world_z) {
+            match tree_kind {
+                TreeKind::Oak => {
+                    let trunk_height = java_next_int(&mut rng, 3) + 4;
+                    try_place_tree(chunks, &mut rng, world_x, surface_y, world_z, trunk_height);
+                }
+                TreeKind::LargeOak => {
+                    let _ = try_place_large_oak(
+                        chunks,
+                        &mut rng,
+                        world_x,
+                        surface_y,
+                        world_z,
+                        &mut large_oak_state,
+                    );
+                }
+            }
+        }
+    }
+
+    // Flowers
+    for _ in 0..2 {
+        let x = i + java_next_int(&mut rng, 16) + 8;
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = j + java_next_int(&mut rng, 16) + 8;
+        for _ in 0..64 {
+            let px = x + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            let py = y + java_next_int(&mut rng, 4) - java_next_int(&mut rng, 4);
+            let pz = z + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            if !(1..CHUNK_HEIGHT as i32).contains(&py) {
+                continue;
+            }
+            if can_place_flower_world(chunks, registry, px, py, pz) {
+                set_world_block(chunks, px, py, pz, YELLOW_FLOWER_ID);
+            }
+        }
+    }
+    if java_next_int(&mut rng, 2) == 0 {
+        let x = i + java_next_int(&mut rng, 16) + 8;
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = j + java_next_int(&mut rng, 16) + 8;
+        for _ in 0..64 {
+            let px = x + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            let py = y + java_next_int(&mut rng, 4) - java_next_int(&mut rng, 4);
+            let pz = z + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            if !(1..CHUNK_HEIGHT as i32).contains(&py) {
+                continue;
+            }
+            if can_place_flower_world(chunks, registry, px, py, pz) {
+                set_world_block(chunks, px, py, pz, RED_FLOWER_ID);
+            }
+        }
+    }
+
+    // Mushrooms
+    if java_next_int(&mut rng, 4) == 0 {
+        let x = i + java_next_int(&mut rng, 16) + 8;
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = j + java_next_int(&mut rng, 16) + 8;
+        for _ in 0..64 {
+            let px = x + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            let py = y + java_next_int(&mut rng, 4) - java_next_int(&mut rng, 4);
+            let pz = z + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            if !(1..CHUNK_HEIGHT as i32).contains(&py) {
+                continue;
+            }
+            if can_place_mushroom_world(chunks, registry, px, py, pz) {
+                set_world_block(chunks, px, py, pz, BROWN_MUSHROOM_ID);
+            }
+        }
+    }
+    if java_next_int(&mut rng, 8) == 0 {
+        let x = i + java_next_int(&mut rng, 16) + 8;
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = j + java_next_int(&mut rng, 16) + 8;
+        for _ in 0..64 {
+            let px = x + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            let py = y + java_next_int(&mut rng, 4) - java_next_int(&mut rng, 4);
+            let pz = z + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            if !(1..CHUNK_HEIGHT as i32).contains(&py) {
+                continue;
+            }
+            if can_place_mushroom_world(chunks, registry, px, py, pz) {
+                set_world_block(chunks, px, py, pz, RED_MUSHROOM_ID);
+            }
+        }
+    }
+
+    // Sugar cane
+    for _ in 0..10 {
+        let x = i + java_next_int(&mut rng, 16) + 8;
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = j + java_next_int(&mut rng, 16) + 8;
+        for _ in 0..20 {
+            let px = x + java_next_int(&mut rng, 4) - java_next_int(&mut rng, 4);
+            let pz = z + java_next_int(&mut rng, 4) - java_next_int(&mut rng, 4);
+            if world_block(chunks, px, y, pz) != AIR_ID {
+                continue;
+            }
+            let below = world_block(chunks, px, y - 1, pz);
+            if below != GRASS_ID && below != DIRT_ID && below != SUGAR_CANE_ID {
+                continue;
+            }
+            if !check_water_adjacent_world(chunks, px, y - 1, pz) {
+                continue;
+            }
+            let cane_inner = java_next_int(&mut rng, 3) + 1;
+            let height = 2 + java_next_int(&mut rng, cane_inner);
+            for n in 0..height {
+                let py = y + n;
+                if py >= CHUNK_HEIGHT as i32 || world_block(chunks, px, py, pz) != AIR_ID {
+                    break;
+                }
+                set_world_block(chunks, px, py, pz, SUGAR_CANE_ID);
+            }
+        }
+    }
+
+    // Pumpkins
+    if java_next_int(&mut rng, 32) == 0 {
+        let x = i + java_next_int(&mut rng, 16) + 8;
+        let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+        let z = j + java_next_int(&mut rng, 16) + 8;
+        for _ in 0..64 {
+            let px = x + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            let py = y + java_next_int(&mut rng, 4) - java_next_int(&mut rng, 4);
+            let pz = z + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+            if !(1..CHUNK_HEIGHT as i32).contains(&py) {
+                continue;
+            }
+            if world_block(chunks, px, py, pz) != AIR_ID {
+                continue;
+            }
+            if world_block(chunks, px, py - 1, pz) != GRASS_ID {
+                continue;
+            }
+            if !can_place_pumpkin_world(chunks, registry, px, py, pz) {
+                continue;
+            }
+            let facing_meta = java_next_int(&mut rng, 4) as u8;
+            set_world_block_with_metadata(chunks, px, py, pz, PUMPKIN_ID, facing_meta);
+        }
+    }
+
+    // Cacti (desert-only)
+    if biome_sample.biome == BiomeKind::Desert {
+        for _ in 0..10 {
+            let x = i + java_next_int(&mut rng, 16) + 8;
+            let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+            let z = j + java_next_int(&mut rng, 16) + 8;
+            for _ in 0..10 {
+                let px = x + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+                let py = y + java_next_int(&mut rng, 4) - java_next_int(&mut rng, 4);
+                let pz = z + java_next_int(&mut rng, 8) - java_next_int(&mut rng, 8);
+                if world_block(chunks, px, py, pz) != AIR_ID {
+                    continue;
+                }
+                let cactus_inner = java_next_int(&mut rng, 3) + 1;
+                let height = 1 + java_next_int(&mut rng, cactus_inner);
+                for n in 0..height {
+                    let ay = py + n;
+                    if !(1..CHUNK_HEIGHT as i32).contains(&ay) {
+                        break;
+                    }
+                    let below = world_block(chunks, px, ay - 1, pz);
+                    if below != SAND_ID && below != CACTUS_ID {
+                        break;
+                    }
+                    if !can_place_cactus_world(chunks, px, ay, pz, registry) {
+                        break;
+                    }
+                    if world_block(chunks, px, ay, pz) != AIR_ID {
+                        break;
+                    }
+                    set_world_block(chunks, px, ay, pz, CACTUS_ID);
+                }
+            }
+        }
+    }
+
+    // Springs
+    let spring_base_x = i + 8;
+    let spring_base_z = j + 8;
+    for _ in 0..50 {
+        let x = spring_base_x + java_next_int(&mut rng, 16);
+        let z = spring_base_z + java_next_int(&mut rng, 16);
+        let inner = java_next_int(&mut rng, 120) + 8;
+        let y = java_next_int(&mut rng, inner.max(1));
+        if y >= 1 && y < CHUNK_HEIGHT as i32 {
+            try_place_spring_world(chunks, x, y, z, FLOWING_WATER_ID);
+        }
+    }
+    for _ in 0..20 {
+        let x = spring_base_x + java_next_int(&mut rng, 16);
+        let z = spring_base_z + java_next_int(&mut rng, 16);
+        let inner_a = java_next_int(&mut rng, 112) + 8;
+        let inner_b = java_next_int(&mut rng, inner_a.max(1)) + 8;
+        let y = java_next_int(&mut rng, inner_b.max(1));
+        if y >= 1 && y < CHUNK_HEIGHT as i32 {
+            try_place_spring_world(chunks, x, y, z, FLOWING_LAVA_ID);
+        }
+    }
+}
+
 /// Find the highest non-air block at a local column, scanning downward.
 /// Check if any of the 4 cardinal neighbors at (local_x, y, local_z) is water.
 /// Check if a stone block has exactly 1 air + 3 stone cardinal neighbors,
@@ -2522,11 +2800,43 @@ fn try_place_spring_world(
     }
     if air_count == 1 && stone_count == 3 {
         set_world_block(chunks, x, y, z, liquid_id);
-        // TODO(M7): Mirror Alpha's immediate liquid tick on spring placement.
-        // Runtime fluid scheduler will pick this up after chunk load.
+        immediate_spring_liquid_tick_world(chunks, x, y, z, liquid_id);
     }
 }
 
+/// Alpha LiquidFallFeature ticks the placed liquid immediately once.
+/// This worldgen approximation handles the dominant spring case:
+/// one lateral air outlet from a 3-stone cavity.
+fn immediate_spring_liquid_tick_world(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    x: i32,
+    y: i32,
+    z: i32,
+    liquid_id: u8,
+) {
+    let mut outlet: Option<(i32, i32)> = None;
+    for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        if world_block(chunks, x + dx, y, z + dz) == AIR_ID {
+            outlet = Some((dx, dz));
+            break;
+        }
+    }
+    let Some((dx, dz)) = outlet else {
+        return;
+    };
+    let nx = x + dx;
+    let nz = z + dz;
+
+    if world_block(chunks, nx, y - 1, nz) == AIR_ID {
+        set_world_block(chunks, nx, y - 1, nz, liquid_id);
+        return;
+    }
+    if world_block(chunks, nx, y, nz) == AIR_ID {
+        set_world_block(chunks, nx, y, nz, liquid_id);
+    }
+}
+
+#[allow(dead_code)]
 fn place_springs_world_space(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2595,6 +2905,30 @@ fn can_place_cactus_world(
     true
 }
 
+fn sky_light_at_world(
+    chunks: &HashMap<ChunkPos, ChunkData>,
+    x: i32,
+    y: i32,
+    z: i32,
+    registry: &BlockRegistry,
+) -> u8 {
+    if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        return 0;
+    }
+    let mut level = 15_u8;
+    for ay in ((y + 1)..CHUNK_HEIGHT as i32).rev() {
+        let block_id = world_block(chunks, x, ay, z);
+        let opacity = registry.opacity_of(block_id);
+        if opacity > 0 {
+            level = level.saturating_sub(opacity.clamp(1, 15));
+            if level == 0 {
+                break;
+            }
+        }
+    }
+    level
+}
+
 fn has_sky_access_world(chunks: &HashMap<ChunkPos, ChunkData>, x: i32, y: i32, z: i32) -> bool {
     if !(0..CHUNK_HEIGHT as i32).contains(&y) {
         return false;
@@ -2609,7 +2943,7 @@ fn has_sky_access_world(chunks: &HashMap<ChunkPos, ChunkData>, x: i32, y: i32, z
 
 fn can_place_flower_world(
     chunks: &HashMap<ChunkPos, ChunkData>,
-    _registry: &BlockRegistry,
+    registry: &BlockRegistry,
     x: i32,
     y: i32,
     z: i32,
@@ -2621,9 +2955,7 @@ fn can_place_flower_world(
     if below != GRASS_ID && below != DIRT_ID {
         return false;
     }
-    // Alpha PlantBlock.canSurvive also accepts rawBrightness >= 8.
-    // Worldgen has no artificial lights, so sky access is the relevant path.
-    has_sky_access_world(chunks, x, y, z)
+    sky_light_at_world(chunks, x, y, z, registry) >= 8 || has_sky_access_world(chunks, x, y, z)
 }
 
 fn can_place_mushroom_world(
@@ -2640,9 +2972,7 @@ fn can_place_mushroom_world(
     if !registry.is_solid(below) {
         return false;
     }
-    // Approximation of MushroomPlantBlock.canSurvive (brightness <= 13):
-    // disallow direct sky access at generation time.
-    !has_sky_access_world(chunks, x, y, z)
+    sky_light_at_world(chunks, x, y, z, registry) <= 13
 }
 
 fn can_place_pumpkin_world(
@@ -2657,6 +2987,46 @@ fn can_place_pumpkin_world(
     replaceable && registry.is_solid(world_block(chunks, x, y - 1, z))
 }
 
+fn try_place_clay_patch(chunks: &mut HashMap<ChunkPos, ChunkData>, rng: &mut i64, x: i32, y: i32, z: i32) {
+    let origin_id = world_block(chunks, x, y, z);
+    if origin_id != WATER_ID && origin_id != FLOWING_WATER_ID {
+        return;
+    }
+    let size = 32_i32;
+    let f = java_next_float(rng) * PI as f32;
+    let d = (x + 8) as f64 + f.sin() as f64 * size as f64 / 8.0;
+    let e = (x + 8) as f64 - f.sin() as f64 * size as f64 / 8.0;
+    let g = (z + 8) as f64 + f.cos() as f64 * size as f64 / 8.0;
+    let h = (z + 8) as f64 - f.cos() as f64 * size as f64 / 8.0;
+    let i = (y + java_next_int(rng, 3) + 2) as f64;
+    let j = (y + java_next_int(rng, 3) + 2) as f64;
+    for k in 0..=size {
+        let t = k as f64 / size as f64;
+        let l = d + (e - d) * t;
+        let m = i + (j - i) * t;
+        let n = g + (h - g) * t;
+        let o = java_next_float(rng) as f64 * size as f64 / 16.0;
+        let p = (((k as f64 * PI) / size as f64).sin() + 1.0) * o + 1.0;
+        let q = (((k as f64 * PI) / size as f64).sin() + 1.0) * o + 1.0;
+        for rx in (l - p / 2.0) as i32..=(l + p / 2.0) as i32 {
+            for ry in (m - q / 2.0) as i32..=(m + q / 2.0) as i32 {
+                if !(0..CHUNK_HEIGHT as i32).contains(&ry) {
+                    continue;
+                }
+                for rz in (n - p / 2.0) as i32..=(n + p / 2.0) as i32 {
+                    let u = (rx as f64 + 0.5 - l) / (p / 2.0);
+                    let v = (ry as f64 + 0.5 - m) / (q / 2.0);
+                    let w = (rz as f64 + 0.5 - n) / (p / 2.0);
+                    if u * u + v * v + w * w < 1.0 && world_block(chunks, rx, ry, rz) == SAND_ID {
+                        set_world_block(chunks, rx, ry, rz, CLAY_ID);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn place_clay_patches_world_space(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2672,49 +3042,13 @@ fn place_clay_patches_world_space(
                 let x = base_x + java_next_int(&mut rng, 16);
                 let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
                 let z = base_z + java_next_int(&mut rng, 16);
-                let origin_id = world_block(chunks, x, y, z);
-                if origin_id != WATER_ID && origin_id != FLOWING_WATER_ID {
-                    continue;
-                }
-                let size = 32_i32;
-                let f = java_next_float(&mut rng) * PI as f32;
-                let d = (x + 8) as f64 + f.sin() as f64 * size as f64 / 8.0;
-                let e = (x + 8) as f64 - f.sin() as f64 * size as f64 / 8.0;
-                let g = (z + 8) as f64 + f.cos() as f64 * size as f64 / 8.0;
-                let h = (z + 8) as f64 - f.cos() as f64 * size as f64 / 8.0;
-                let i = (y + java_next_int(&mut rng, 3) + 2) as f64;
-                let j = (y + java_next_int(&mut rng, 3) + 2) as f64;
-                for k in 0..=size {
-                    let t = k as f64 / size as f64;
-                    let l = d + (e - d) * t;
-                    let m = i + (j - i) * t;
-                    let n = g + (h - g) * t;
-                    let o = java_next_float(&mut rng) as f64 * size as f64 / 16.0;
-                    let p = (((k as f64 * PI) / size as f64).sin() + 1.0) * o + 1.0;
-                    let q = (((k as f64 * PI) / size as f64).sin() + 1.0) * o + 1.0;
-                    for rx in (l - p / 2.0) as i32..=(l + p / 2.0) as i32 {
-                        for ry in (m - q / 2.0) as i32..=(m + q / 2.0) as i32 {
-                            if !(0..CHUNK_HEIGHT as i32).contains(&ry) {
-                                continue;
-                            }
-                            for rz in (n - p / 2.0) as i32..=(n + p / 2.0) as i32 {
-                                let u = (rx as f64 + 0.5 - l) / (p / 2.0);
-                                let v = (ry as f64 + 0.5 - m) / (q / 2.0);
-                                let w = (rz as f64 + 0.5 - n) / (p / 2.0);
-                                if u * u + v * v + w * w < 1.0
-                                    && world_block(chunks, rx, ry, rz) == SAND_ID
-                                {
-                                    set_world_block(chunks, rx, ry, rz, CLAY_ID);
-                                }
-                            }
-                        }
-                    }
-                }
+                try_place_clay_patch(chunks, &mut rng, x, y, z);
             }
         }
     }
 }
 
+#[allow(dead_code)]
 fn place_flowers_world_space(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2763,6 +3097,7 @@ fn place_flowers_world_space(
     }
 }
 
+#[allow(dead_code)]
 fn place_mushrooms_world_space(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2801,6 +3136,7 @@ fn place_mushrooms_world_space(
     }
 }
 
+#[allow(dead_code)]
 fn place_sugar_cane_world_space(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2844,6 +3180,7 @@ fn place_sugar_cane_world_space(
     }
 }
 
+#[allow(dead_code)]
 fn place_pumpkins_world_space(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2885,6 +3222,7 @@ fn place_pumpkins_world_space(
     }
 }
 
+#[allow(dead_code)]
 fn place_cacti_world_space(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -2997,6 +3335,11 @@ enum TreeKind {
 }
 
 const LARGE_OAK_MINOR_AXES: [usize; 6] = [2, 0, 0, 1, 2, 1];
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LargeOakState {
+    height: i32,
+}
 
 fn alpha_tree_feature_kind_for_chunk(biome: BiomeKind, rng: &mut i64) -> TreeKind {
     // Alpha chooses a single feature for the whole chunk:
@@ -3231,13 +3574,19 @@ fn large_oak_should_place_branch(height: i32, total_height: i32) -> bool {
 
 fn try_place_large_oak(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
-    rng: &mut i64,
+    parent_rng: &mut i64,
     world_x: i32,
     surface_y: i32,
     world_z: i32,
+    state: &mut LargeOakState,
 ) -> bool {
+    // Alpha LargeOakTreeFeature seeds an internal RNG from `random.nextLong()`.
+    let mut rng = java_random_seed(java_next_long(parent_rng));
     let config = LargeOakConfig::alpha_populate_defaults();
-    let mut height = 5 + java_next_int(rng, config.max_trunk_height.max(1));
+    if state.height == 0 {
+        state.height = 5 + java_next_int(&mut rng, config.max_trunk_height.max(1));
+    }
+    let mut height = state.height;
     let origin = [world_x, surface_y + 1, world_z];
     let ground = world_block(chunks, origin[0], origin[1] - 1, origin[2]);
     if ground != GRASS_ID && ground != DIRT_ID {
@@ -3251,6 +3600,7 @@ fn try_place_large_oak(
             return false;
         }
         height = clearance;
+        state.height = height;
     }
 
     let mut trunk_height = (height as f64 * config.trunk_scale) as i32;
@@ -3275,8 +3625,8 @@ fn try_place_large_oak(
         if shape >= 0.0 {
             for _ in 0..branch_count {
                 let length = config.branch_length_scale
-                    * (shape as f64 * (java_next_float(rng) as f64 + 0.328));
-                let angle = java_next_float(rng) as f64 * 2.0 * PI;
+                    * (shape as f64 * (java_next_float(&mut rng) as f64 + 0.328));
+                let angle = java_next_float(&mut rng) as f64 * 2.0 * PI;
                 let branch_x = (length * angle.sin() + origin[0] as f64 + 0.5) as i32;
                 let branch_z = (length * angle.cos() + origin[2] as f64 + 0.5) as i32;
                 let branch_base = [branch_x, cluster_y, branch_z];
@@ -3356,6 +3706,7 @@ fn try_place_large_oak(
 // Lake generation  (translated from LakeFeature.java / OverworldChunkGenerator.java)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn place_lakes(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -3490,7 +3841,7 @@ fn try_place_lake(
                 // Water lakes: convert exposed dirt under carved cavity to grass.
                 if is_water && by >= 4 {
                     let below = world_block(chunks, wx, wy - 1, wz);
-                    if below == DIRT_ID && has_sky_access_world(chunks, wx, wy, wz) {
+                    if below == DIRT_ID && sky_light_at_world(chunks, wx, wy, wz, registry) > 0 {
                         set_world_block(chunks, wx, wy - 1, wz, GRASS_ID);
                     }
                 }
@@ -3499,6 +3850,7 @@ fn try_place_lake(
     }
 }
 
+#[allow(dead_code)]
 fn place_trees(
     chunks: &mut HashMap<ChunkPos, ChunkData>,
     world_seed: u64,
@@ -3525,6 +3877,7 @@ fn place_trees(
             }
 
             let tree_kind = alpha_tree_feature_kind_for_chunk(biome_sample.biome, &mut rng);
+            let mut large_oak_state = LargeOakState::default();
             for _ in 0..attempt_count {
                 // Vanilla feature roots are selected from [8..23] within source chunk.
                 let world_x = source_x * CHUNK_WIDTH as i32 + java_next_int(&mut rng, 16) + 8;
@@ -3544,8 +3897,14 @@ fn place_trees(
                             );
                         }
                         TreeKind::LargeOak => {
-                            let _ =
-                                try_place_large_oak(chunks, &mut rng, world_x, surface_y, world_z);
+                            let _ = try_place_large_oak(
+                                chunks,
+                                &mut rng,
+                                world_x,
+                                surface_y,
+                                world_z,
+                                &mut large_oak_state,
+                            );
                         }
                     }
                 }
@@ -4787,7 +5146,8 @@ mod tests {
             }
 
             let mut rng = java_random_seed(seed as i64);
-            if !try_place_large_oak(&mut chunks, &mut rng, 8, 60, 8) {
+            let mut state = LargeOakState::default();
+            if !try_place_large_oak(&mut chunks, &mut rng, 8, 60, 8, &mut state) {
                 continue;
             }
 
