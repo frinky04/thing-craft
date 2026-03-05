@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use glam::{DVec3, Mat4, Vec3};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use tracing::{debug, error, info, warn};
 #[cfg(feature = "tracy")]
 use tracing_subscriber::layer::SubscriberExt;
@@ -26,8 +28,8 @@ use crate::gameplay::{
 };
 use crate::hud;
 use crate::inventory::{
-    hit_test_slot_for_menu, inventory_layout, InventoryCommand, InventoryMenuKind, ItemKey,
-    PlayerInventoryState, INVENTORY_HEIGHT, INVENTORY_WIDTH,
+    hit_test_slot_for_menu, inventory_layout_for_menu, menu_panel_size, BlockPos,
+    ContainerRuntimeState, InventoryCommand, InventoryMenuKind, ItemKey, PlayerInventoryState,
 };
 use crate::mesh::{build_region_mesh, ChunkMesh, MeshVertex};
 use crate::renderer::{RenderError, Renderer};
@@ -547,6 +549,9 @@ pub fn run() -> Result<()> {
         .insert_resource(PlayerInventoryState::alpha_defaults());
     ecs_runtime
         .world_mut()
+        .insert_resource(ContainerRuntimeState::default());
+    ecs_runtime
+        .world_mut()
         .insert_resource(CraftingRegistry::alpha_1_2_6());
     ecs_runtime
         .world_mut()
@@ -734,7 +739,8 @@ pub fn run() -> Result<()> {
                             .snapshot();
 
                         // Inventory command fixed-step system: commands -> state change + drop events.
-                        let inventory_events = run_inventory_command_system(&mut ecs_runtime);
+                        let inventory_events =
+                            run_inventory_command_system(&mut ecs_runtime, open_menu);
                         if inventory_events.changed {
                             hud_dirty = true;
                         }
@@ -763,6 +769,13 @@ pub fn run() -> Result<()> {
                                         drop_pitch,
                                     );
                                 }
+                        }
+                        if tick_container_furnaces(
+                            &mut ecs_runtime,
+                            &mut chunk_streamer,
+                            &mut edit_latency_tracker,
+                        ) {
+                            hud_dirty = true;
                         }
 
                         // Item pickup (player walks over dropped items).
@@ -820,12 +833,8 @@ pub fn run() -> Result<()> {
                         );
                         if let Some(menu) = interaction_events.open_menu {
                             match menu {
-                                InventoryMenuKind::ChestStub => {
-                                    info!("opened chest menu stub (TODO: container inventory wiring)")
-                                }
-                                InventoryMenuKind::FurnaceStub => {
-                                    info!("opened furnace menu stub (TODO: smelting/menu wiring)")
-                                }
+                                InventoryMenuKind::Chest { .. } => info!("opened chest menu"),
+                                InventoryMenuKind::Furnace { .. } => info!("opened furnace menu"),
                                 InventoryMenuKind::CraftingTable | InventoryMenuKind::Player => {}
                             }
                             open_menu = Some(menu);
@@ -1176,10 +1185,12 @@ pub fn run() -> Result<()> {
                         let mut hud_verts =
                             hud::build_hud_vertices(sw, sh, &hud_state, &bootstrap_world.registry);
                         if let Some(menu) = open_menu {
+                            let containers = ecs_runtime.world().resource::<ContainerRuntimeState>();
                             let mut inventory_verts = hud::build_inventory_vertices(
                                 sw,
                                 sh,
                                 &inventory_state,
+                                &containers,
                                 menu,
                                 mouse_screen_pos,
                                 &bootstrap_world.registry,
@@ -1481,6 +1492,7 @@ pub fn run() -> Result<()> {
                             mouse_screen_pos[1],
                             sw,
                             sh,
+                            menu,
                         ) {
                             ecs_runtime
                                 .world_mut()
@@ -1545,6 +1557,7 @@ pub fn run() -> Result<()> {
                             mouse_screen_pos[1],
                             sw,
                             sh,
+                            menu,
                         ) {
                             ecs_runtime
                                 .world_mut()
@@ -1778,6 +1791,7 @@ fn raycast_current_mining_target(
 }
 
 fn alpha_break_block_and_collect_drop(
+    ecs_runtime: &mut EcsRuntime,
     chunk_streamer: &mut ChunkStreamer,
     block_x: i32,
     block_y: i32,
@@ -1791,6 +1805,54 @@ fn alpha_break_block_and_collect_drop(
     if broken_block_id == AIR_BLOCK_ID {
         return None;
     }
+    let pos = BlockPos {
+        x: block_x,
+        y: block_y,
+        z: block_z,
+    };
+    let mut chest_drops = Vec::new();
+    {
+        let mut containers = ecs_runtime
+            .world_mut()
+            .resource_mut::<ContainerRuntimeState>();
+        if broken_block_id == CHEST_BLOCK_ID {
+            if let Some(chest) = containers.remove_chest(pos) {
+                for stack in chest.slots().iter().flatten() {
+                    chest_drops.push(*stack);
+                }
+            }
+        } else if broken_block_id == FURNACE_BLOCK_ID || broken_block_id == LIT_FURNACE_BLOCK_ID {
+            // Alpha parity: furnace inventory is not spilled on remove; block-entity is dropped.
+            let _ = containers.remove_furnace(pos);
+        }
+    }
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u64, |d| d.as_nanos() as u64)
+        ^ (u64::from(block_x as u32) << 32)
+        ^ (u64::from(block_y as u32) << 16)
+        ^ u64::from(block_z as u32);
+    let mut rng = SmallRng::seed_from_u64(seed);
+    for mut stack in chest_drops {
+        while stack.count > 0 {
+            let split = rng.gen_range(10..=30).min(stack.count);
+            stack.count -= split;
+            let mut drop = stack;
+            drop.count = split;
+            let ox = rng.gen_range(0.1..0.9);
+            let oy = rng.gen_range(0.1..0.9);
+            let oz = rng.gen_range(0.1..0.9);
+            crate::entity::spawn_dropped_item_stack(
+                ecs_runtime.world_mut(),
+                drop,
+                DVec3::new(
+                    block_x as f64 + ox,
+                    block_y as f64 + oy,
+                    block_z as f64 + oz,
+                ),
+            );
+        }
+    }
     if !chunk_streamer.set_block_at_world(block_x, block_y, block_z, AIR_BLOCK_ID) {
         return None;
     }
@@ -1798,7 +1860,12 @@ fn alpha_break_block_and_collect_drop(
     if !can_harvest {
         return Some(None);
     }
-    let drop_block_id = chunk_streamer.dropped_item_block_id(broken_block_id)?;
+    let drop_source_id = if broken_block_id == LIT_FURNACE_BLOCK_ID {
+        FURNACE_BLOCK_ID
+    } else {
+        broken_block_id
+    };
+    let drop_block_id = chunk_streamer.dropped_item_block_id(drop_source_id)?;
     let spawn_pos = DVec3::new(
         block_x as f64 + 0.5,
         block_y as f64 + 0.5,
@@ -1928,6 +1995,7 @@ fn try_start_block_mining(
     };
     if calc.progress_per_tick >= 1.0 {
         if let Some(drop) = alpha_break_block_and_collect_drop(
+            ecs_runtime,
             chunk_streamer,
             target.x,
             target.y,
@@ -2008,6 +2076,7 @@ fn tick_block_mining(
     }
 
     if let Some(drop) = alpha_break_block_and_collect_drop(
+        ecs_runtime,
         chunk_streamer,
         target.x,
         target.y,
@@ -2025,6 +2094,55 @@ fn tick_block_mining(
 
     *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
     false
+}
+
+fn tick_container_furnaces(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &mut ChunkStreamer,
+    edit_latency_tracker: &mut EditLatencyTracker,
+) -> bool {
+    let updates = ecs_runtime
+        .world_mut()
+        .resource_mut::<ContainerRuntimeState>()
+        .tick_furnaces();
+    let mut changed = false;
+    for (pos, tick) in updates {
+        changed |= tick.changed;
+        if !tick.lit_state_changed {
+            continue;
+        }
+        let Some(current) = chunk_streamer.block_at_world(pos.x, pos.y, pos.z) else {
+            continue;
+        };
+        let target_block = if tick.now_lit {
+            if current == FURNACE_BLOCK_ID {
+                Some(LIT_FURNACE_BLOCK_ID)
+            } else {
+                None
+            }
+        } else if current == LIT_FURNACE_BLOCK_ID {
+            Some(FURNACE_BLOCK_ID)
+        } else {
+            None
+        };
+        let Some(target_block) = target_block else {
+            continue;
+        };
+        let metadata = chunk_streamer
+            .block_metadata_at_world(pos.x, pos.y, pos.z)
+            .unwrap_or(0);
+        if chunk_streamer.set_block_with_metadata_at_world(
+            pos.x,
+            pos.y,
+            pos.z,
+            target_block,
+            metadata,
+        ) {
+            edit_latency_tracker.record_block_edit(pos.x, pos.z);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn enqueue_block_interaction_request(
@@ -2259,6 +2377,112 @@ fn alpha_chest_placement_metadata_from_neighbors(
     alpha_chest_facing_from_solid_neighbors(north, south, west, east)
 }
 
+fn alpha_is_solid_block_at(
+    registry: &BlockRegistry,
+    chunk_streamer: &ChunkStreamer,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    chunk_streamer
+        .block_at_world(x, y, z)
+        .is_some_and(|id| registry.is_solid(id))
+}
+
+fn alpha_resolve_chest_menu_target(
+    registry: &BlockRegistry,
+    chunk_streamer: &ChunkStreamer,
+    chest_pos: BlockPos,
+) -> Option<InventoryMenuKind> {
+    if alpha_is_solid_block_at(
+        registry,
+        chunk_streamer,
+        chest_pos.x,
+        chest_pos.y + 1,
+        chest_pos.z,
+    ) {
+        return None;
+    }
+
+    let west = BlockPos {
+        x: chest_pos.x - 1,
+        y: chest_pos.y,
+        z: chest_pos.z,
+    };
+    let east = BlockPos {
+        x: chest_pos.x + 1,
+        y: chest_pos.y,
+        z: chest_pos.z,
+    };
+    let north = BlockPos {
+        x: chest_pos.x,
+        y: chest_pos.y,
+        z: chest_pos.z - 1,
+    };
+    let south = BlockPos {
+        x: chest_pos.x,
+        y: chest_pos.y,
+        z: chest_pos.z + 1,
+    };
+
+    for adjacent in [west, east, north, south] {
+        if chunk_streamer
+            .block_at_world(adjacent.x, adjacent.y, adjacent.z)
+            .is_some_and(alpha_is_chest_block)
+            && alpha_is_solid_block_at(
+                registry,
+                chunk_streamer,
+                adjacent.x,
+                adjacent.y + 1,
+                adjacent.z,
+            )
+        {
+            return None;
+        }
+    }
+
+    if chunk_streamer
+        .block_at_world(west.x, west.y, west.z)
+        .is_some_and(alpha_is_chest_block)
+    {
+        return Some(InventoryMenuKind::Chest {
+            primary: west,
+            secondary: Some(chest_pos),
+        });
+    }
+    if chunk_streamer
+        .block_at_world(east.x, east.y, east.z)
+        .is_some_and(alpha_is_chest_block)
+    {
+        return Some(InventoryMenuKind::Chest {
+            primary: chest_pos,
+            secondary: Some(east),
+        });
+    }
+    if chunk_streamer
+        .block_at_world(north.x, north.y, north.z)
+        .is_some_and(alpha_is_chest_block)
+    {
+        return Some(InventoryMenuKind::Chest {
+            primary: north,
+            secondary: Some(chest_pos),
+        });
+    }
+    if chunk_streamer
+        .block_at_world(south.x, south.y, south.z)
+        .is_some_and(alpha_is_chest_block)
+    {
+        return Some(InventoryMenuKind::Chest {
+            primary: chest_pos,
+            secondary: Some(south),
+        });
+    }
+    Some(InventoryMenuKind::Chest {
+        primary: chest_pos,
+        secondary: None,
+    })
+}
+
 fn alpha_placement_metadata_from_look(block_id: u8, look_direction: DVec3) -> u8 {
     match block_id {
         FURNACE_BLOCK_ID | LIT_FURNACE_BLOCK_ID => {
@@ -2368,12 +2592,37 @@ fn process_single_block_interaction_request(
     match target_block_id {
         58 => Some(InventoryMenuKind::CraftingTable), // crafting table
         54 => {
-            // TODO(alpha-chest): Replace stub with chest container inventory + menu.
-            Some(InventoryMenuKind::ChestStub)
+            let chest_pos = BlockPos {
+                x: hit.block[0],
+                y: hit.block[1],
+                z: hit.block[2],
+            };
+            let Some(menu) = alpha_resolve_chest_menu_target(registry, chunk_streamer, chest_pos)
+            else {
+                return None;
+            };
+            if let InventoryMenuKind::Chest { primary, secondary } = menu {
+                let mut containers = ecs_runtime
+                    .world_mut()
+                    .resource_mut::<ContainerRuntimeState>();
+                containers.ensure_chest(primary);
+                if let Some(secondary) = secondary {
+                    containers.ensure_chest(secondary);
+                }
+            }
+            Some(menu)
         }
         61 | 62 => {
-            // TODO(alpha-furnace): Replace stub with furnace smelting state + menu.
-            Some(InventoryMenuKind::FurnaceStub)
+            let pos = BlockPos {
+                x: hit.block[0],
+                y: hit.block[1],
+                z: hit.block[2],
+            };
+            ecs_runtime
+                .world_mut()
+                .resource_mut::<ContainerRuntimeState>()
+                .ensure_furnace(pos);
+            Some(InventoryMenuKind::Furnace { pos })
         }
         _ => None,
     }
@@ -2440,6 +2689,25 @@ fn try_place_selected_block(
             placement_metadata,
         )
     {
+        if block_id == CHEST_BLOCK_ID {
+            ecs_runtime
+                .world_mut()
+                .resource_mut::<ContainerRuntimeState>()
+                .ensure_chest(BlockPos {
+                    x: place_x,
+                    y: place_y,
+                    z: place_z,
+                });
+        } else if block_id == FURNACE_BLOCK_ID || block_id == LIT_FURNACE_BLOCK_ID {
+            ecs_runtime
+                .world_mut()
+                .resource_mut::<ContainerRuntimeState>()
+                .ensure_furnace(BlockPos {
+                    x: place_x,
+                    y: place_y,
+                    z: place_z,
+                });
+        }
         let _ = ecs_runtime
             .world_mut()
             .resource_mut::<PlayerInventoryState>()
@@ -2502,14 +2770,13 @@ fn is_point_inside_inventory_panel(
     mouse_y: f32,
     screen_w: f32,
     screen_h: f32,
+    menu: InventoryMenuKind,
 ) -> bool {
-    let layout = inventory_layout(screen_w, screen_h);
+    let layout = inventory_layout_for_menu(screen_w, screen_h, menu);
+    let (panel_w, panel_h) = menu_panel_size(menu);
     let mx = mouse_x / layout.scale;
     let my = mouse_y / layout.scale;
-    mx >= layout.left
-        && mx < layout.left + INVENTORY_WIDTH
-        && my >= layout.top
-        && my < layout.top + INVENTORY_HEIGHT
+    mx >= layout.left && mx < layout.left + panel_w && my >= layout.top && my < layout.top + panel_h
 }
 
 fn raycast_first_solid_block<F>(
@@ -3781,26 +4048,8 @@ fn resolve_player_physics(
     );
     let in_fluid_at_end = in_water_at_end || in_lava_at_end;
 
-    // Fall distance tracking.
-    let mut fall_distance = physics.fall_distance;
-    if delta.y < 0.0 {
-        fall_distance -= delta.y;
-    } else {
-        fall_distance = 0.0;
-    }
-    if in_fluid_at_end {
-        fall_distance = 0.0;
-    }
-    let mut damage_taken = 0;
-    if on_ground {
-        if fall_distance > 3.0 {
-            damage_taken = (fall_distance - 3.0).ceil() as i32;
-        }
-        fall_distance = 0.0;
-    }
-    if in_fluid_at_end {
-        damage_taken = 0;
-    }
+    let (fall_distance, damage_taken) =
+        alpha_fall_distance_and_damage(physics.fall_distance, delta.y, on_ground, in_fluid_at_end);
 
     // Velocity: zero out any component that was collision-clamped.
     let mut velocity = physics.velocity;
@@ -3835,6 +4084,7 @@ fn resolve_player_physics(
                 ),
                 chunk_streamer,
                 registry,
+                true,
             )
     } else {
         false
@@ -3899,6 +4149,18 @@ fn player_body_touches_material(
     chunk_streamer: &ChunkStreamer,
     is_material: impl Fn(u8) -> bool,
 ) -> bool {
+    aabb_touches_material(position, width, height, is_material, |x, y, z| {
+        chunk_streamer.block_at_world(x, y, z)
+    })
+}
+
+fn aabb_touches_material(
+    position: DVec3,
+    width: f64,
+    height: f64,
+    is_material: impl Fn(u8) -> bool,
+    mut block_at_world: impl FnMut(i32, i32, i32) -> Option<u8>,
+) -> bool {
     let half_w = width / 2.0;
     let min_x = (position.x - half_w).floor() as i32;
     let max_x = (position.x + half_w).floor() as i32;
@@ -3913,7 +4175,7 @@ fn player_body_touches_material(
                 continue;
             }
             for z in min_z..=max_z {
-                let Some(block_id) = chunk_streamer.block_at_world(x, y, z) else {
+                let Some(block_id) = block_at_world(x, y, z) else {
                     continue;
                 };
                 if is_material(block_id) {
@@ -3942,6 +4204,7 @@ fn clamp_sneak_edge_delta(
             DVec3::new(delta.x, -1.0, 0.0),
             chunk_streamer,
             registry,
+            false,
         )
     {
         if delta.x.abs() < step {
@@ -3960,6 +4223,7 @@ fn clamp_sneak_edge_delta(
             DVec3::new(0.0, -1.0, delta.z),
             chunk_streamer,
             registry,
+            false,
         )
     {
         if delta.z.abs() < step {
@@ -3980,6 +4244,7 @@ fn can_move_player(
     offset: DVec3,
     chunk_streamer: &ChunkStreamer,
     registry: &BlockRegistry,
+    reject_liquids: bool,
 ) -> bool {
     let half_w = width / 2.0;
     let moved_pos = position + offset;
@@ -4006,7 +4271,41 @@ fn can_move_player(
             return false;
         }
     }
+    if reject_liquids
+        && player_body_touches_material(moved_pos, width, height, chunk_streamer, |block_id| {
+            registry.is_water(block_id) || registry.is_lava(block_id)
+        })
+    {
+        return false;
+    }
     true
+}
+
+fn alpha_fall_distance_and_damage(
+    prev_fall_distance: f64,
+    resolved_dy: f64,
+    on_ground: bool,
+    in_fluid: bool,
+) -> (f64, i32) {
+    let mut fall_distance = prev_fall_distance;
+    // Track net vertical drop over an airtime segment so jump ascent
+    // offsets descent from small ledges (matches observed Alpha behavior).
+    fall_distance -= resolved_dy;
+    if in_fluid {
+        fall_distance = 0.0;
+    }
+
+    let mut damage_taken = 0;
+    if on_ground {
+        if fall_distance > 3.0 {
+            damage_taken = (fall_distance - 3.0).ceil() as i32;
+        }
+        fall_distance = 0.0;
+    }
+    if in_fluid {
+        damage_taken = 0;
+    }
+    (fall_distance, damage_taken)
 }
 
 /// Resolve movement along a single axis against block AABBs. Returns clamped delta.
@@ -4065,13 +4364,13 @@ mod tests {
     use winit::keyboard::KeyCode;
 
     use super::{
-        affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
+        aabb_touches_material, affected_chunks_for_block_edit, alpha_ambient_darkness,
+        alpha_apply_fog_brightness, alpha_block_mining_calc, alpha_brightness_from_light_level,
         alpha_can_place_chest_at, alpha_chest_facing_from_solid_neighbors,
-        alpha_block_mining_calc, alpha_brightness_from_light_level,
-        alpha_fog_brightness_target, alpha_horizontal_face_from_look,
-        alpha_opposite_face, alpha_placement_metadata_from_look, alpha_star_brightness,
-        alpha_sunrise_color, alpha_time_of_day, can_replace_block_for_placement,
-        has_target_directive, hotbar_slot_for_key,
+        alpha_fall_distance_and_damage, alpha_fog_brightness_target,
+        alpha_horizontal_face_from_look, alpha_opposite_face, alpha_placement_metadata_from_look,
+        alpha_star_brightness, alpha_sunrise_color, alpha_time_of_day,
+        can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
         is_point_inside_inventory_panel, is_raycast_targetable_block, parse_env_bool,
         parse_env_u32, placement_intersects_player, raycast_first_solid_block, resolve_axis,
         AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, CHEST_BLOCK_ID, FURNACE_BLOCK_ID,
@@ -4157,18 +4456,21 @@ mod tests {
             top_px + 1.0,
             1920.0,
             1080.0,
+            InventoryMenuKind::Player,
         ));
         assert!(!is_point_inside_inventory_panel(
             left_px - 1.0,
             top_px + 1.0,
             1920.0,
             1080.0,
+            InventoryMenuKind::Player,
         ));
         assert!(!is_point_inside_inventory_panel(
             left_px + (176.0 * scale),
             top_px + (166.0 * scale),
             1920.0,
             1080.0,
+            InventoryMenuKind::Player,
         ));
     }
 
@@ -4216,7 +4518,7 @@ mod tests {
                 menu: InventoryMenuKind::Player,
             });
 
-        let events = run_inventory_command_system(&mut ecs);
+        let events = run_inventory_command_system(&mut ecs, Some(InventoryMenuKind::Player));
 
         assert!(events.changed);
         assert_eq!(events.dropped_to_world, vec![ItemStack::tool(270)]);
@@ -4339,10 +4641,22 @@ mod tests {
 
     #[test]
     fn alpha_face_mapping_from_look_direction_matches_cardinals() {
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, 1.0)), 3);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, -1.0)), 2);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(1.0, 0.0, 0.0)), 5);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(-1.0, 0.0, 0.0)), 4);
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, 1.0)),
+            3
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, -1.0)),
+            2
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(1.0, 0.0, 0.0)),
+            5
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(-1.0, 0.0, 0.0)),
+            4
+        );
         assert_eq!(alpha_opposite_face(2), 3);
         assert_eq!(alpha_opposite_face(5), 4);
     }
@@ -4395,10 +4709,7 @@ mod tests {
 
     #[test]
     fn chest_placement_rejects_triple_chest_layout() {
-        let blocks = vec![
-            ((-1, 0, 0), CHEST_BLOCK_ID),
-            ((1, 0, 0), CHEST_BLOCK_ID),
-        ];
+        let blocks = vec![((-1, 0, 0), CHEST_BLOCK_ID), ((1, 0, 0), CHEST_BLOCK_ID)];
         let lookup = |x: i32, y: i32, z: i32| {
             blocks
                 .iter()
@@ -4410,10 +4721,7 @@ mod tests {
 
     #[test]
     fn chest_placement_rejects_attaching_to_existing_double_chest() {
-        let blocks = vec![
-            ((0, 0, 0), CHEST_BLOCK_ID),
-            ((1, 0, 0), CHEST_BLOCK_ID),
-        ];
+        let blocks = vec![((0, 0, 0), CHEST_BLOCK_ID), ((1, 0, 0), CHEST_BLOCK_ID)];
         let lookup = |x: i32, y: i32, z: i32| {
             blocks
                 .iter()
@@ -4571,5 +4879,50 @@ mod tests {
         let slice = budget.urgent_slice_for_tick(20);
         assert!(slice >= 16);
         assert!(slice <= 20);
+    }
+
+    #[test]
+    fn alpha_fall_damage_keeps_distance_while_rising() {
+        let (fall_distance, damage_taken) = alpha_fall_distance_and_damage(4.0, 0.2, false, false);
+        assert!((fall_distance - 3.8).abs() < 1e-10);
+        assert_eq!(damage_taken, 0);
+    }
+
+    #[test]
+    fn alpha_fall_damage_uses_ceil_distance_minus_three() {
+        let (fall_distance, damage_taken) = alpha_fall_distance_and_damage(0.0, -4.2, true, false);
+        assert!((fall_distance - 0.0).abs() < 1e-10);
+        assert_eq!(damage_taken, 2);
+    }
+
+    #[test]
+    fn jump_off_two_block_pillar_does_not_apply_fall_damage() {
+        let (mid_fall_distance, mid_damage) =
+            alpha_fall_distance_and_damage(0.0, 1.25, false, false);
+        assert!((mid_fall_distance - (-1.25)).abs() < 1e-10);
+        assert_eq!(mid_damage, 0);
+
+        let (landed_fall_distance, landed_damage) =
+            alpha_fall_distance_and_damage(mid_fall_distance, -3.25, true, false);
+        assert!((landed_fall_distance - 0.0).abs() < 1e-10);
+        assert_eq!(landed_damage, 0);
+    }
+
+    #[test]
+    fn aabb_material_scan_detects_underwater_block_volume() {
+        let touches = aabb_touches_material(
+            DVec3::new(0.5, 10.0, 0.5),
+            0.6,
+            1.8,
+            |block_id| block_id == 9,
+            |x, y, z| {
+                if (x, y, z) == (0, 10, 0) {
+                    Some(9)
+                } else {
+                    Some(0)
+                }
+            },
+        );
+        assert!(touches);
     }
 }

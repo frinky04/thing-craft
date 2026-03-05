@@ -41,6 +41,10 @@ This project follows the rule from `WHAT.md`: steal numbers, not structure.
   - horizontal flow search depth cap `4`
   - lava+water conversion: source lava (`meta=0`) -> obsidian, shallow lava (`meta<=4`) -> cobblestone
   - Source: `resources/decomp/src/net/minecraft/block/LiquidBlock.java`, `resources/decomp/src/net/minecraft/block/FlowingLiquidBlock.java`
+- Chest/furnace container + GUI behavior:
+  - chest placement constraints (no triple / no attach to existing double chest), obstruction-open checks, double-chest inventory ordering
+  - furnace slots (`input/fuel/output`), smelt time `200` ticks, fuel burn times (`stick=100`, `coal=1600`, `lava_bucket=20000`, wood blocks `300`), smelt mappings (ore/food/clay/cobble)
+  - Source: `resources/decomp/src/net/minecraft/block/ChestBlock.java`, `resources/decomp/src/net/minecraft/inventory/DoubleInventory.java`, `resources/decomp/src/net/minecraft/block/entity/FurnaceBlockEntity.java`, `resources/decomp/src/net/minecraft/client/gui/screen/inventory/menu/ChestScreen.java`, `resources/decomp/src/net/minecraft/client/gui/screen/inventory/menu/FurnaceScreen.java`
 - Biome climate seed multipliers:
   - temperature `seed * 9871`
   - downfall `seed * 39811`

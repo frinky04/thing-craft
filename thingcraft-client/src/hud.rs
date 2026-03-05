@@ -1,7 +1,8 @@
 use crate::inventory::{
-    alpha_item_sprite_index, hit_test_slot_for_menu, inventory_layout, slot_gui_xy,
-    InventoryMenuKind, ItemKey, ItemStack, PlayerInventoryState, PlayerSlot, ARMOR_SLOT_COUNT,
-    MAIN_SLOT_COUNT, PLAYER_CRAFT_INPUT_SLOT_COUNT, TABLE_CRAFT_INPUT_SLOT_COUNT,
+    alpha_item_sprite_index, hit_test_slot_for_menu, inventory_layout_for_menu, menu_panel_size,
+    slot_gui_xy, ContainerRuntimeState, InventoryMenuKind, ItemKey, ItemStack,
+    PlayerInventoryState, PlayerSlot, ARMOR_SLOT_COUNT, MAIN_SLOT_COUNT,
+    PLAYER_CRAFT_INPUT_SLOT_COUNT, TABLE_CRAFT_INPUT_SLOT_COUNT,
 };
 use crate::tool::ToolRegistry;
 use crate::world::BlockRegistry;
@@ -50,6 +51,8 @@ pub const HUD_TEX_FONT: f32 = 4.0;
 pub const HUD_TEX_WATER_OVERLAY: f32 = 5.0;
 pub const HUD_TEX_ITEMS: f32 = 6.0;
 pub const HUD_TEX_CRAFTING: f32 = 7.0;
+pub const HUD_TEX_CONTAINER: f32 = 8.0;
+pub const HUD_TEX_FURNACE: f32 = 9.0;
 
 #[derive(Debug, Clone, Copy)]
 pub enum HudSlotItem {
@@ -464,13 +467,15 @@ pub fn build_inventory_vertices(
     screen_w: f32,
     screen_h: f32,
     inventory: &PlayerInventoryState,
+    containers: &ContainerRuntimeState,
     menu: InventoryMenuKind,
     mouse_screen_pos: [f32; 2],
     registry: &BlockRegistry,
     tool_registry: &ToolRegistry,
 ) -> Vec<HudVertex> {
     let mut verts = Vec::with_capacity(1024);
-    let layout = inventory_layout(screen_w, screen_h);
+    let layout = inventory_layout_for_menu(screen_w, screen_h, menu);
+    let (panel_w, panel_h) = menu_panel_size(menu);
 
     // Dim world behind inventory.
     push_colored_quad_gui(
@@ -485,26 +490,59 @@ pub fn build_inventory_vertices(
 
     let panel_texture = match menu {
         InventoryMenuKind::CraftingTable => HUD_TEX_CRAFTING,
-        InventoryMenuKind::Player
-        | InventoryMenuKind::ChestStub
-        | InventoryMenuKind::FurnaceStub => HUD_TEX_INVENTORY,
+        InventoryMenuKind::Player => HUD_TEX_INVENTORY,
+        InventoryMenuKind::Chest { .. } => HUD_TEX_CONTAINER,
+        InventoryMenuKind::Furnace { .. } => HUD_TEX_FURNACE,
     };
 
-    // Menu panel background (inventory.png / crafting.png).
-    push_textured_quad_gui(
-        &mut verts,
-        layout.left,
-        layout.top,
-        176.0,
-        166.0,
-        0.0,
-        0.0,
-        176.0,
-        166.0,
-        panel_texture,
-        layout.scale,
-        WHITE,
-    );
+    // Menu panel background. Chest uses Alpha's split container draw path.
+    if let InventoryMenuKind::Chest { secondary, .. } = menu {
+        let rows = if secondary.is_some() { 6.0 } else { 3.0 };
+        let top_h = rows * 18.0 + 17.0;
+        push_textured_quad_gui(
+            &mut verts,
+            layout.left,
+            layout.top,
+            176.0,
+            top_h,
+            0.0,
+            0.0,
+            176.0,
+            top_h,
+            panel_texture,
+            layout.scale,
+            WHITE,
+        );
+        push_textured_quad_gui(
+            &mut verts,
+            layout.left,
+            layout.top + top_h,
+            176.0,
+            96.0,
+            0.0,
+            126.0,
+            176.0,
+            96.0,
+            panel_texture,
+            layout.scale,
+            WHITE,
+        );
+    } else {
+        push_textured_quad_gui(
+            &mut verts,
+            layout.left,
+            layout.top,
+            panel_w,
+            panel_h,
+            0.0,
+            0.0,
+            panel_w,
+            panel_h,
+            panel_texture,
+            layout.scale,
+            WHITE,
+        );
+    }
     push_menu_labels(&mut verts, layout.left, layout.top, layout.scale, menu);
 
     let hovered = hit_test_slot_for_menu(
@@ -525,6 +563,7 @@ pub fn build_inventory_vertices(
                     layout.top,
                     layout.scale,
                     inventory,
+                    containers,
                     menu,
                     slot,
                     registry,
@@ -539,6 +578,7 @@ pub fn build_inventory_vertices(
                     layout.top,
                     layout.scale,
                     inventory,
+                    containers,
                     menu,
                     slot,
                     registry,
@@ -551,6 +591,7 @@ pub fn build_inventory_vertices(
                 layout.top,
                 layout.scale,
                 inventory,
+                containers,
                 menu,
                 PlayerSlot::PlayerCraftResult,
                 registry,
@@ -566,6 +607,7 @@ pub fn build_inventory_vertices(
                     layout.top,
                     layout.scale,
                     inventory,
+                    containers,
                     menu,
                     slot,
                     registry,
@@ -578,13 +620,85 @@ pub fn build_inventory_vertices(
                 layout.top,
                 layout.scale,
                 inventory,
+                containers,
                 menu,
                 PlayerSlot::CraftingTableResult,
                 registry,
                 tool_registry,
             );
         }
-        InventoryMenuKind::ChestStub | InventoryMenuKind::FurnaceStub => {}
+        InventoryMenuKind::Chest { secondary, .. } => {
+            let chest_rows = if secondary.is_some() { 6 } else { 3 };
+            for i in 0..(chest_rows * 9) {
+                let slot = PlayerSlot::Chest(i as u8);
+                render_inventory_slot_item(
+                    &mut verts,
+                    layout.left,
+                    layout.top,
+                    layout.scale,
+                    inventory,
+                    containers,
+                    menu,
+                    slot,
+                    registry,
+                    tool_registry,
+                );
+            }
+        }
+        InventoryMenuKind::Furnace { pos } => {
+            for slot in [
+                PlayerSlot::FurnaceInput,
+                PlayerSlot::FurnaceFuel,
+                PlayerSlot::FurnaceResult,
+            ] {
+                render_inventory_slot_item(
+                    &mut verts,
+                    layout.left,
+                    layout.top,
+                    layout.scale,
+                    inventory,
+                    containers,
+                    menu,
+                    slot,
+                    registry,
+                    tool_registry,
+                );
+            }
+            if let Some(furnace) = containers.furnace(pos) {
+                if furnace.has_fuel() {
+                    let lit = furnace.get_lit_progress(12) as f32;
+                    push_textured_quad_gui(
+                        &mut verts,
+                        layout.left + 56.0,
+                        layout.top + 36.0 + 12.0 - lit,
+                        14.0,
+                        lit + 2.0,
+                        176.0,
+                        12.0 - lit,
+                        14.0,
+                        lit + 2.0,
+                        HUD_TEX_FURNACE,
+                        layout.scale,
+                        WHITE,
+                    );
+                }
+                let cook = furnace.get_cook_progress(24) as f32;
+                push_textured_quad_gui(
+                    &mut verts,
+                    layout.left + 79.0,
+                    layout.top + 34.0,
+                    cook + 1.0,
+                    16.0,
+                    176.0,
+                    14.0,
+                    cook + 1.0,
+                    16.0,
+                    HUD_TEX_FURNACE,
+                    layout.scale,
+                    WHITE,
+                );
+            }
+        }
     }
     for i in 0..MAIN_SLOT_COUNT {
         let slot = PlayerSlot::Main(i as u8);
@@ -594,6 +708,7 @@ pub fn build_inventory_vertices(
             layout.top,
             layout.scale,
             inventory,
+            containers,
             menu,
             slot,
             registry,
@@ -608,6 +723,7 @@ pub fn build_inventory_vertices(
             layout.top,
             layout.scale,
             inventory,
+            containers,
             menu,
             slot,
             registry,
@@ -673,9 +789,49 @@ fn push_menu_labels(
                 label_color,
             );
         }
-        InventoryMenuKind::Player
-        | InventoryMenuKind::ChestStub
-        | InventoryMenuKind::FurnaceStub => {}
+        InventoryMenuKind::Chest { secondary, .. } => {
+            let rows = if secondary.is_some() { 6.0 } else { 3.0 };
+            let panel_h = 114.0 + rows * 18.0;
+            push_ascii_text(
+                verts,
+                if secondary.is_some() {
+                    "Large chest"
+                } else {
+                    "Chest"
+                },
+                panel_left + 8.0,
+                panel_top + 6.0,
+                scale,
+                label_color,
+            );
+            push_ascii_text(
+                verts,
+                "Inventory",
+                panel_left + 8.0,
+                panel_top + panel_h - 96.0 + 2.0,
+                scale,
+                label_color,
+            );
+        }
+        InventoryMenuKind::Furnace { .. } => {
+            push_ascii_text(
+                verts,
+                "Furnace",
+                panel_left + 60.0,
+                panel_top + 6.0,
+                scale,
+                label_color,
+            );
+            push_ascii_text(
+                verts,
+                "Inventory",
+                panel_left + 8.0,
+                panel_top + 72.0,
+                scale,
+                label_color,
+            );
+        }
+        InventoryMenuKind::Player => {}
     }
 }
 
@@ -685,6 +841,7 @@ fn render_inventory_slot_item(
     panel_top: f32,
     scale: f32,
     inventory: &PlayerInventoryState,
+    containers: &ContainerRuntimeState,
     menu: InventoryMenuKind,
     slot: PlayerSlot,
     registry: &BlockRegistry,
@@ -714,6 +871,44 @@ fn render_inventory_slot_item(
             .copied()
             .flatten(),
         PlayerSlot::CraftingTableResult => inventory.table_craft_result(),
+        PlayerSlot::Chest(i) => {
+            if let InventoryMenuKind::Chest { primary, secondary } = menu {
+                if i < 27 {
+                    containers
+                        .chest(primary)
+                        .and_then(|chest| chest.slot(usize::from(i)))
+                } else {
+                    secondary.and_then(|pos| {
+                        containers
+                            .chest(pos)
+                            .and_then(|chest| chest.slot(usize::from(i.saturating_sub(27))))
+                    })
+                }
+            } else {
+                None
+            }
+        }
+        PlayerSlot::FurnaceInput => {
+            if let InventoryMenuKind::Furnace { pos } = menu {
+                containers.furnace(pos).and_then(|furnace| furnace.slot(0))
+            } else {
+                None
+            }
+        }
+        PlayerSlot::FurnaceFuel => {
+            if let InventoryMenuKind::Furnace { pos } = menu {
+                containers.furnace(pos).and_then(|furnace| furnace.slot(1))
+            } else {
+                None
+            }
+        }
+        PlayerSlot::FurnaceResult => {
+            if let InventoryMenuKind::Furnace { pos } = menu {
+                containers.furnace(pos).and_then(|furnace| furnace.slot(2))
+            } else {
+                None
+            }
+        }
     };
     let Some(stack) = stack else {
         return;

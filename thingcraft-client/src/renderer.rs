@@ -2235,6 +2235,26 @@ impl<'w> Renderer<'w> {
                     wgpu::BindGroupLayoutEntry {
                         binding: 8,
                         visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -2385,6 +2405,78 @@ impl<'w> Renderer<'w> {
                 depth_or_array_layers: 1,
             },
         );
+        let (container_w, container_h, container_rgba) = load_png_rgba(Path::new(
+            "resources/minecraft-a1.2.6-client/gui/container.png",
+        ));
+        let container_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thingcraft-hud-container-texture"),
+            size: wgpu::Extent3d {
+                width: container_w,
+                height: container_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &container_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &container_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * container_w),
+                rows_per_image: Some(container_h),
+            },
+            wgpu::Extent3d {
+                width: container_w,
+                height: container_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let (furnace_w, furnace_h, furnace_rgba) = load_png_rgba(Path::new(
+            "resources/minecraft-a1.2.6-client/gui/furnace.png",
+        ));
+        let furnace_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thingcraft-hud-furnace-texture"),
+            size: wgpu::Extent3d {
+                width: furnace_w,
+                height: furnace_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &furnace_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &furnace_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * furnace_w),
+                rows_per_image: Some(furnace_h),
+            },
+            wgpu::Extent3d {
+                width: furnace_w,
+                height: furnace_h,
+                depth_or_array_layers: 1,
+            },
+        );
         let (font_w, font_h, font_rgba) = load_png_rgba(Path::new(
             "resources/minecraft-a1.2.6-client/font/default.png",
         ));
@@ -2472,6 +2564,8 @@ impl<'w> Renderer<'w> {
         let icons_view = icons_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let inventory_view = inventory_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let crafting_view = crafting_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let container_view = container_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let furnace_view = furnace_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let font_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let water_overlay_view =
             water_overlay_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2517,6 +2611,14 @@ impl<'w> Renderer<'w> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&container_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&furnace_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
                     resource: wgpu::BindingResource::Sampler(&hud_sampler),
                 },
             ],
@@ -6154,7 +6256,9 @@ var<uniform> screen: HudScreen;
 @group(1) @binding(5) var hud_water_overlay_tex: texture_2d<f32>;
 @group(1) @binding(6) var hud_items_tex: texture_2d<f32>;
 @group(1) @binding(7) var hud_crafting_tex: texture_2d<f32>;
-@group(1) @binding(8) var hud_sampler: sampler;
+@group(1) @binding(8) var hud_container_tex: texture_2d<f32>;
+@group(1) @binding(9) var hud_furnace_tex: texture_2d<f32>;
+@group(1) @binding(10) var hud_sampler: sampler;
 
 struct VertexIn {
     @location(0) position: vec2<f32>,
@@ -6205,6 +6309,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         texel = textureSample(hud_items_tex, hud_sampler, input.uv);
     } else if (input.texture_kind >= 6.5 && input.texture_kind < 7.5) {
         texel = textureSample(hud_crafting_tex, hud_sampler, input.uv);
+    } else if (input.texture_kind >= 7.5 && input.texture_kind < 8.5) {
+        texel = textureSample(hud_container_tex, hud_sampler, input.uv);
+    } else if (input.texture_kind >= 8.5 && input.texture_kind < 9.5) {
+        texel = textureSample(hud_furnace_tex, hud_sampler, input.uv);
     }
     if (texel.a <= 0.01) {
         discard;
