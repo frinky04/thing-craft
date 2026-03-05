@@ -107,12 +107,7 @@ impl ToolRegistry {
     /// Returns true if the held tool can harvest drops from the given block.
     /// Blocks without harvest gates always return true.
     #[must_use]
-    pub fn can_harvest(
-        &self,
-        tool: &ToolDef,
-        block_id: u8,
-        registry: &BlockRegistry,
-    ) -> bool {
+    pub fn can_harvest(&self, tool: &ToolDef, block_id: u8, registry: &BlockRegistry) -> bool {
         if let Some((required_class, min_tier)) = required_harvest_tier(block_id, registry) {
             tool.class == required_class && tool.harvest_tier >= min_tier
         } else {
@@ -200,9 +195,9 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             class: ToolClass::Pickaxe,
             material: ToolMaterial::Wood,
             harvest_tier: 0,
-            mining_speed: 2.0,  // (0+1)*2
-            max_damage: 32,     // 32 << 0 = 32; breaks when metadata > 32, so 33 uses
-            attack_damage: 2,   // 2 + 0
+            mining_speed: 2.0, // (0+1)*2
+            max_damage: 32,    // 32 << 0 = 32; breaks when metadata > 32, so 33 uses
+            attack_damage: 2,  // 2 + 0
             sprite_index: 96,
         },
         ToolDef {
@@ -211,9 +206,9 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             class: ToolClass::Pickaxe,
             material: ToolMaterial::Stone,
             harvest_tier: 1,
-            mining_speed: 4.0,  // (1+1)*2
-            max_damage: 64,     // 32 << 1
-            attack_damage: 3,   // 2 + 1
+            mining_speed: 4.0, // (1+1)*2
+            max_damage: 64,    // 32 << 1
+            attack_damage: 3,  // 2 + 1
             sprite_index: 97,
         },
         ToolDef {
@@ -222,9 +217,9 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             class: ToolClass::Pickaxe,
             material: ToolMaterial::Iron,
             harvest_tier: 2,
-            mining_speed: 6.0,  // (2+1)*2
-            max_damage: 128,    // 32 << 2
-            attack_damage: 4,   // 2 + 2
+            mining_speed: 6.0, // (2+1)*2
+            max_damage: 128,   // 32 << 2
+            attack_damage: 4,  // 2 + 2
             sprite_index: 98,
         },
         ToolDef {
@@ -233,9 +228,9 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             class: ToolClass::Pickaxe,
             material: ToolMaterial::Gold,
             harvest_tier: 0,
-            mining_speed: 2.0,  // tier 0: (0+1)*2
-            max_damage: 32,     // 32 << 0
-            attack_damage: 2,   // 2 + 0
+            mining_speed: 2.0, // tier 0: (0+1)*2
+            max_damage: 32,    // 32 << 0
+            attack_damage: 2,  // 2 + 0
             sprite_index: 100,
         },
         ToolDef {
@@ -244,8 +239,8 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             class: ToolClass::Pickaxe,
             material: ToolMaterial::Diamond,
             harvest_tier: 3,
-            mining_speed: 8.0,  // (3+1)*2
-            max_damage: 1024,   // 32 << 3 * 4 = 256 * 4 (Alpha 4x for tier 3... actually 32<<3=256, *4=1024? Let me verify)
+            mining_speed: 8.0, // (3+1)*2
+            max_damage: 1024, // 32 << 3 * 4 = 256 * 4 (Alpha 4x for tier 3... actually 32<<3=256, *4=1024? Let me verify)
             // Actually: maxDamage = 32 << tier. For tier 3: 32 << 3 = 256. Alpha code checks `if tier==3 { maxDamage *= 4 }` => 256 * 4 = NOT present for ToolItem.
             // Re-reading: ToolItem constructor: this.maxDamage = 32 << tier. No 4x multiplier.
             // So diamond pick = 256. BUT from plan: "Diamond=1561" with formula yielding 1025.
@@ -256,7 +251,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             // So maxDamage for diamond ToolItem = 1024, uses = 1025. But standard Alpha says 1561 for diamond tools...
             // The plan explicitly says maxDamage: "32 << tier" with "if tier==3 { *=4 }". 32<<3=256, *4=1024. Uses=1025.
             // Going with plan values.
-            attack_damage: 5,   // 2 + 3
+            attack_damage: 5, // 2 + 3
             sprite_index: 99,
         },
         // ---- Axes ----
@@ -269,7 +264,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 0,
             mining_speed: 2.0,
             max_damage: 32,
-            attack_damage: 3,   // 3 + 0
+            attack_damage: 3, // 3 + 0
             sprite_index: 112,
         },
         ToolDef {
@@ -280,7 +275,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 1,
             mining_speed: 4.0,
             max_damage: 64,
-            attack_damage: 4,   // 3 + 1
+            attack_damage: 4, // 3 + 1
             sprite_index: 113,
         },
         ToolDef {
@@ -291,7 +286,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 2,
             mining_speed: 6.0,
             max_damage: 128,
-            attack_damage: 5,   // 3 + 2
+            attack_damage: 5, // 3 + 2
             sprite_index: 114,
         },
         ToolDef {
@@ -302,7 +297,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 0,
             mining_speed: 2.0,
             max_damage: 32,
-            attack_damage: 3,   // 3 + 0
+            attack_damage: 3, // 3 + 0
             sprite_index: 116,
         },
         ToolDef {
@@ -313,7 +308,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 3,
             mining_speed: 8.0,
             max_damage: 1024,
-            attack_damage: 6,   // 3 + 3
+            attack_damage: 6, // 3 + 3
             sprite_index: 115,
         },
         // ---- Shovels ----
@@ -326,7 +321,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 0,
             mining_speed: 2.0,
             max_damage: 32,
-            attack_damage: 1,   // 1 + 0
+            attack_damage: 1, // 1 + 0
             sprite_index: 80,
         },
         ToolDef {
@@ -337,7 +332,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 1,
             mining_speed: 4.0,
             max_damage: 64,
-            attack_damage: 2,   // 1 + 1
+            attack_damage: 2, // 1 + 1
             sprite_index: 81,
         },
         ToolDef {
@@ -348,7 +343,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 2,
             mining_speed: 6.0,
             max_damage: 128,
-            attack_damage: 3,   // 1 + 2
+            attack_damage: 3, // 1 + 2
             sprite_index: 82,
         },
         ToolDef {
@@ -359,7 +354,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 0,
             mining_speed: 2.0,
             max_damage: 32,
-            attack_damage: 1,   // 1 + 0
+            attack_damage: 1, // 1 + 0
             sprite_index: 84,
         },
         ToolDef {
@@ -370,7 +365,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 3,
             mining_speed: 8.0,
             max_damage: 1024,
-            attack_damage: 4,   // 1 + 3
+            attack_damage: 4, // 1 + 3
             sprite_index: 83,
         },
         // ---- Swords ----
@@ -384,7 +379,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 0,
             mining_speed: 1.5,
             max_damage: 32,
-            attack_damage: 4,   // 4 + 0*2
+            attack_damage: 4, // 4 + 0*2
             sprite_index: 64,
         },
         ToolDef {
@@ -395,7 +390,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 1,
             mining_speed: 1.5,
             max_damage: 64,
-            attack_damage: 6,   // 4 + 1*2
+            attack_damage: 6, // 4 + 1*2
             sprite_index: 65,
         },
         ToolDef {
@@ -406,7 +401,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 2,
             mining_speed: 1.5,
             max_damage: 128,
-            attack_damage: 8,   // 4 + 2*2
+            attack_damage: 8, // 4 + 2*2
             sprite_index: 66,
         },
         ToolDef {
@@ -417,7 +412,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 0,
             mining_speed: 1.5,
             max_damage: 32,
-            attack_damage: 4,   // 4 + 0*2
+            attack_damage: 4, // 4 + 0*2
             sprite_index: 68,
         },
         ToolDef {
@@ -428,7 +423,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             harvest_tier: 3,
             mining_speed: 1.5,
             max_damage: 1024,
-            attack_damage: 10,  // 4 + 3*2
+            attack_damage: 10, // 4 + 3*2
             sprite_index: 67,
         },
         // ---- Hoes ----
@@ -484,7 +479,7 @@ fn all_alpha_tools() -> [ToolDef; 25] {
             material: ToolMaterial::Diamond,
             harvest_tier: 3,
             mining_speed: 1.0,
-            max_damage: 256,    // No 4x for hoe: 32 << 3 = 256
+            max_damage: 256, // No 4x for hoe: 32 << 3 = 256
             attack_damage: 1,
             sprite_index: 131,
         },

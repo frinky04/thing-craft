@@ -1,9 +1,11 @@
-use winit::event::MouseButton;
 use bevy_ecs::prelude::Resource;
+use winit::event::MouseButton;
 
 pub const HOTBAR_SLOT_COUNT: usize = 9;
 pub const MAIN_SLOT_COUNT: usize = 27;
 pub const ARMOR_SLOT_COUNT: usize = 4;
+pub const PLAYER_CRAFT_INPUT_SLOT_COUNT: usize = 4;
+pub const TABLE_CRAFT_INPUT_SLOT_COUNT: usize = 9;
 pub const INVENTORY_WIDTH: f32 = 176.0;
 pub const INVENTORY_HEIGHT: f32 = 166.0;
 pub const AIR_BLOCK_ID: u8 = 0;
@@ -14,6 +16,7 @@ pub const HOTBAR_DEFAULT_BLOCK_IDS: [u8; HOTBAR_SLOT_COUNT] =
 pub enum ItemKey {
     Block(u8),
     Tool(u16),
+    Item(u16),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -43,10 +46,28 @@ impl ItemStack {
     }
 
     #[must_use]
+    pub fn item(item_id: u16, count: u8) -> Self {
+        Self {
+            item: ItemKey::Item(item_id),
+            count,
+            metadata: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn alpha_item_id(self) -> u16 {
+        match self.item {
+            ItemKey::Block(block_id) => u16::from(block_id),
+            ItemKey::Tool(item_id) | ItemKey::Item(item_id) => item_id,
+        }
+    }
+
+    #[must_use]
     pub fn max_stack_size(self) -> u8 {
         match self.item {
             ItemKey::Block(_) => 64,
             ItemKey::Tool(_) => 1,
+            ItemKey::Item(item_id) => alpha_item_max_stack_size(item_id),
         }
     }
 }
@@ -56,6 +77,18 @@ pub enum PlayerSlot {
     Hotbar(u8),
     Main(u8),
     Armor(u8),
+    PlayerCraftInput(u8),
+    PlayerCraftResult,
+    CraftingTableInput(u8),
+    CraftingTableResult,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InventoryMenuKind {
+    Player,
+    CraftingTable,
+    ChestStub,
+    FurnaceStub,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -76,7 +109,9 @@ pub enum InventoryCommand {
     ConsumeSelected {
         amount: u8,
     },
-    CloseInventory,
+    CloseMenu {
+        menu: InventoryMenuKind,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +125,10 @@ pub struct PlayerInventoryState {
     hotbar: [Option<ItemStack>; HOTBAR_SLOT_COUNT],
     main: [Option<ItemStack>; MAIN_SLOT_COUNT],
     armor: [Option<ItemStack>; ARMOR_SLOT_COUNT],
+    player_craft_input: [Option<ItemStack>; PLAYER_CRAFT_INPUT_SLOT_COUNT],
+    player_craft_result: Option<ItemStack>,
+    table_craft_input: [Option<ItemStack>; TABLE_CRAFT_INPUT_SLOT_COUNT],
+    table_craft_result: Option<ItemStack>,
     pub selected_hotbar: u8,
     pub cursor: Option<ItemStack>,
 }
@@ -118,6 +157,10 @@ impl PlayerInventoryState {
             hotbar,
             main,
             armor: [None; ARMOR_SLOT_COUNT],
+            player_craft_input: [None; PLAYER_CRAFT_INPUT_SLOT_COUNT],
+            player_craft_result: None,
+            table_craft_input: [None; TABLE_CRAFT_INPUT_SLOT_COUNT],
+            table_craft_result: None,
             selected_hotbar: 0,
             cursor: None,
         }
@@ -136,6 +179,26 @@ impl PlayerInventoryState {
     #[must_use]
     pub fn armor_stacks(&self) -> &[Option<ItemStack>; ARMOR_SLOT_COUNT] {
         &self.armor
+    }
+
+    #[must_use]
+    pub fn player_craft_input_stacks(&self) -> &[Option<ItemStack>; PLAYER_CRAFT_INPUT_SLOT_COUNT] {
+        &self.player_craft_input
+    }
+
+    #[must_use]
+    pub fn player_craft_result(&self) -> Option<ItemStack> {
+        self.player_craft_result
+    }
+
+    #[must_use]
+    pub fn table_craft_input_stacks(&self) -> &[Option<ItemStack>; TABLE_CRAFT_INPUT_SLOT_COUNT] {
+        &self.table_craft_input
+    }
+
+    #[must_use]
+    pub fn table_craft_result(&self) -> Option<ItemStack> {
+        self.table_craft_result
     }
 
     #[must_use]
@@ -164,19 +227,19 @@ impl PlayerInventoryState {
 
     /// Apply durability damage to the selected hotbar tool. Returns true if state changed.
     /// Looks up `max_damage` from the `ToolRegistry` to determine breakage.
-    pub fn damage_selected_tool(&mut self, amount: u16, tool_registry: &crate::tool::ToolRegistry) -> bool {
+    pub fn damage_selected_tool(
+        &mut self,
+        amount: u16,
+        tool_registry: &crate::tool::ToolRegistry,
+    ) -> bool {
         if amount == 0 {
             return false;
         }
-        let slot_idx = usize::from(
-            self.selected_hotbar.min((HOTBAR_SLOT_COUNT - 1) as u8),
-        );
+        let slot_idx = usize::from(self.selected_hotbar.min((HOTBAR_SLOT_COUNT - 1) as u8));
         if let Some(stack) = &mut self.hotbar[slot_idx] {
             if let ItemKey::Tool(tool_id) = stack.item {
                 stack.metadata = stack.metadata.saturating_add(amount);
-                let max_damage = tool_registry
-                    .get(tool_id)
-                    .map_or(0, |def| def.max_damage);
+                let max_damage = tool_registry.get(tool_id).map_or(0, |def| def.max_damage);
                 if stack.metadata > max_damage {
                     self.hotbar[slot_idx] = None;
                 }
@@ -220,7 +283,18 @@ impl PlayerInventoryState {
 
     #[must_use]
     pub fn apply(&mut self, cmd: InventoryCommand) -> InventoryApplyResult {
+        self.apply_with_crafting(cmd, None)
+    }
+
+    #[must_use]
+    pub fn apply_with_crafting(
+        &mut self,
+        cmd: InventoryCommand,
+        crafting: Option<&crate::crafting::CraftingRegistry>,
+    ) -> InventoryApplyResult {
         let mut result = InventoryApplyResult::default();
+        let prev_player_crafting = self.player_craft_input;
+        let prev_table_crafting = self.table_craft_input;
         match cmd {
             InventoryCommand::SelectHotbar { index } => {
                 let clamped = index.min((HOTBAR_SLOT_COUNT - 1) as u8);
@@ -276,20 +350,65 @@ impl PlayerInventoryState {
                     }
                 }
             }
-            InventoryCommand::CloseInventory => {
+            InventoryCommand::CloseMenu { menu } => {
                 if let Some(cursor) = self.cursor.take() {
                     result.dropped_to_world.push(cursor);
                     result.changed = true;
                 }
+                match menu {
+                    InventoryMenuKind::Player => {
+                        for slot in &mut self.player_craft_input {
+                            if let Some(stack) = slot.take() {
+                                result.dropped_to_world.push(stack);
+                                result.changed = true;
+                            }
+                        }
+                        self.player_craft_result = None;
+                    }
+                    InventoryMenuKind::CraftingTable => {
+                        for slot in &mut self.table_craft_input {
+                            if let Some(stack) = slot.take() {
+                                result.dropped_to_world.push(stack);
+                                result.changed = true;
+                            }
+                        }
+                        self.table_craft_result = None;
+                    }
+                    InventoryMenuKind::ChestStub | InventoryMenuKind::FurnaceStub => {}
+                }
             }
-            InventoryCommand::ClickSlot { slot, button } => match button {
-                MouseButton::Left | MouseButton::Right => {
+            InventoryCommand::ClickSlot { slot, button } => match (slot, button) {
+                (PlayerSlot::PlayerCraftResult, MouseButton::Left)
+                | (PlayerSlot::PlayerCraftResult, MouseButton::Right) => {
+                    if take_player_crafting_result(self) {
+                        result.changed = true;
+                    }
+                }
+                (PlayerSlot::CraftingTableResult, MouseButton::Left)
+                | (PlayerSlot::CraftingTableResult, MouseButton::Right) => {
+                    if take_table_crafting_result(self) {
+                        result.changed = true;
+                    }
+                }
+                (_, MouseButton::Left) | (_, MouseButton::Right) => {
                     if apply_slot_click(self, slot, button) {
                         result.changed = true;
                     }
                 }
                 _ => {}
             },
+        }
+
+        if let Some(crafting) = crafting {
+            if self.player_craft_input != prev_player_crafting {
+                self.player_craft_result = crafting.player_result(self.player_craft_input);
+                result.changed = true;
+            }
+            if self.table_craft_input != prev_table_crafting {
+                self.table_craft_result =
+                    crafting.result_for_grid(table_crafting_grid(self.table_craft_input));
+                result.changed = true;
+            }
         }
         result
     }
@@ -300,6 +419,10 @@ impl PlayerInventoryState {
             hotbar: self.hotbar,
             main: self.main,
             armor: self.armor,
+            player_craft_input: self.player_craft_input,
+            player_craft_result: self.player_craft_result,
+            table_craft_input: self.table_craft_input,
+            table_craft_result: self.table_craft_result,
             selected_hotbar: self.selected_hotbar,
             cursor: self.cursor,
         }
@@ -307,6 +430,12 @@ impl PlayerInventoryState {
 }
 
 fn apply_slot_click(inv: &mut PlayerInventoryState, slot: PlayerSlot, button: MouseButton) -> bool {
+    if matches!(
+        slot,
+        PlayerSlot::PlayerCraftResult | PlayerSlot::CraftingTableResult
+    ) {
+        return false;
+    }
     let slot_max = slot_max_stack_size(slot);
     let slot_allows = |stack: ItemStack| slot_accepts_item(slot, stack);
     let current_slot_item = get_slot(inv, slot);
@@ -431,6 +560,16 @@ fn get_slot(inv: &PlayerInventoryState, slot: PlayerSlot) -> Option<ItemStack> {
         PlayerSlot::Hotbar(i) => inv.hotbar.get(usize::from(i)).copied().flatten(),
         PlayerSlot::Main(i) => inv.main.get(usize::from(i)).copied().flatten(),
         PlayerSlot::Armor(i) => inv.armor.get(usize::from(i)).copied().flatten(),
+        PlayerSlot::PlayerCraftInput(i) => inv
+            .player_craft_input
+            .get(usize::from(i))
+            .copied()
+            .flatten(),
+        PlayerSlot::PlayerCraftResult => inv.player_craft_result,
+        PlayerSlot::CraftingTableInput(i) => {
+            inv.table_craft_input.get(usize::from(i)).copied().flatten()
+        }
+        PlayerSlot::CraftingTableResult => inv.table_craft_result,
     }
 }
 
@@ -451,21 +590,98 @@ fn set_slot(inv: &mut PlayerInventoryState, slot: PlayerSlot, stack: Option<Item
                 *dst = stack;
             }
         }
+        PlayerSlot::PlayerCraftInput(i) => {
+            if let Some(dst) = inv.player_craft_input.get_mut(usize::from(i)) {
+                *dst = stack;
+            }
+        }
+        PlayerSlot::PlayerCraftResult => {}
+        PlayerSlot::CraftingTableInput(i) => {
+            if let Some(dst) = inv.table_craft_input.get_mut(usize::from(i)) {
+                *dst = stack;
+            }
+        }
+        PlayerSlot::CraftingTableResult => {}
     }
 }
 
 fn slot_max_stack_size(slot: PlayerSlot) -> u8 {
     match slot {
         PlayerSlot::Armor(_) => 1,
-        PlayerSlot::Hotbar(_) | PlayerSlot::Main(_) => 64,
+        PlayerSlot::PlayerCraftResult | PlayerSlot::CraftingTableResult => 0,
+        PlayerSlot::Hotbar(_)
+        | PlayerSlot::Main(_)
+        | PlayerSlot::PlayerCraftInput(_)
+        | PlayerSlot::CraftingTableInput(_) => 64,
     }
 }
 
 fn slot_accepts_item(slot: PlayerSlot, stack: ItemStack) -> bool {
     match slot {
         PlayerSlot::Armor(_) => stack.count >= 1,
-        PlayerSlot::Hotbar(_) | PlayerSlot::Main(_) => stack.count >= 1,
+        PlayerSlot::PlayerCraftResult | PlayerSlot::CraftingTableResult => false,
+        PlayerSlot::Hotbar(_)
+        | PlayerSlot::Main(_)
+        | PlayerSlot::PlayerCraftInput(_)
+        | PlayerSlot::CraftingTableInput(_) => stack.count >= 1,
     }
+}
+
+fn take_player_crafting_result(inv: &mut PlayerInventoryState) -> bool {
+    let Some(result_stack) = inv.player_craft_result else {
+        return false;
+    };
+    if !can_take_craft_result(inv.cursor, result_stack) {
+        return false;
+    }
+
+    if let Some(cursor) = inv.cursor.as_mut() {
+        cursor.count = cursor.count.saturating_add(result_stack.count);
+    } else {
+        inv.cursor = Some(result_stack);
+    }
+
+    for slot in &mut inv.player_craft_input {
+        let Some(mut stack) = *slot else {
+            continue;
+        };
+        stack.count = stack.count.saturating_sub(1);
+        *slot = if stack.count == 0 { None } else { Some(stack) };
+    }
+    true
+}
+
+fn take_table_crafting_result(inv: &mut PlayerInventoryState) -> bool {
+    let Some(result_stack) = inv.table_craft_result else {
+        return false;
+    };
+    if !can_take_craft_result(inv.cursor, result_stack) {
+        return false;
+    }
+
+    if let Some(cursor) = inv.cursor.as_mut() {
+        cursor.count = cursor.count.saturating_add(result_stack.count);
+    } else {
+        inv.cursor = Some(result_stack);
+    }
+
+    for slot in &mut inv.table_craft_input {
+        let Some(mut stack) = *slot else {
+            continue;
+        };
+        stack.count = stack.count.saturating_sub(1);
+        *slot = if stack.count == 0 { None } else { Some(stack) };
+    }
+    true
+}
+
+fn can_take_craft_result(cursor: Option<ItemStack>, result: ItemStack) -> bool {
+    let Some(cursor) = cursor else {
+        return true;
+    };
+    cursor.item == result.item
+        && cursor.metadata == result.metadata
+        && u16::from(cursor.count) + u16::from(result.count) <= u16::from(cursor.max_stack_size())
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -473,6 +689,10 @@ pub struct InventorySnapshot {
     hotbar: [Option<ItemStack>; HOTBAR_SLOT_COUNT],
     main: [Option<ItemStack>; MAIN_SLOT_COUNT],
     armor: [Option<ItemStack>; ARMOR_SLOT_COUNT],
+    player_craft_input: [Option<ItemStack>; PLAYER_CRAFT_INPUT_SLOT_COUNT],
+    player_craft_result: Option<ItemStack>,
+    table_craft_input: [Option<ItemStack>; TABLE_CRAFT_INPUT_SLOT_COUNT],
+    table_craft_result: Option<ItemStack>,
     selected_hotbar: u8,
     cursor: Option<ItemStack>,
 }
@@ -507,8 +727,22 @@ pub fn inventory_layout(screen_w: f32, screen_h: f32) -> InventoryScreenLayout {
 }
 
 #[must_use]
-pub fn slot_gui_xy(slot: PlayerSlot) -> (f32, f32) {
+pub fn slot_gui_xy(_menu: InventoryMenuKind, slot: PlayerSlot) -> (f32, f32) {
     match slot {
+        PlayerSlot::PlayerCraftResult => (144.0, 36.0),
+        PlayerSlot::PlayerCraftInput(i) => {
+            let idx = usize::from(i).min(PLAYER_CRAFT_INPUT_SLOT_COUNT - 1);
+            let row = idx / 2;
+            let col = idx % 2;
+            (88.0 + col as f32 * 18.0, 26.0 + row as f32 * 18.0)
+        }
+        PlayerSlot::CraftingTableResult => (124.0, 35.0),
+        PlayerSlot::CraftingTableInput(i) => {
+            let idx = usize::from(i).min(TABLE_CRAFT_INPUT_SLOT_COUNT - 1);
+            let row = idx / 3;
+            let col = idx % 3;
+            (30.0 + col as f32 * 18.0, 17.0 + row as f32 * 18.0)
+        }
         PlayerSlot::Armor(i) => (8.0, 8.0 + f32::from(i) * 18.0),
         PlayerSlot::Main(i) => {
             let idx = usize::from(i).min(MAIN_SLOT_COUNT - 1);
@@ -521,44 +755,194 @@ pub fn slot_gui_xy(slot: PlayerSlot) -> (f32, f32) {
 }
 
 #[must_use]
-pub fn hit_test_slot(
+pub fn hit_test_slot_for_menu(
     mouse_x: f32,
     mouse_y: f32,
     screen_w: f32,
     screen_h: f32,
+    menu: InventoryMenuKind,
 ) -> Option<PlayerSlot> {
     let layout = inventory_layout(screen_w, screen_h);
     let mx = mouse_x / layout.scale - layout.left;
     let my = mouse_y / layout.scale - layout.top;
-    for i in 0..ARMOR_SLOT_COUNT {
-        let slot = PlayerSlot::Armor(i as u8);
-        if slot_contains(slot, mx, my) {
-            return Some(slot);
+    match menu {
+        InventoryMenuKind::Player => {
+            let result_slot = PlayerSlot::PlayerCraftResult;
+            if slot_contains(menu, result_slot, mx, my) {
+                return Some(result_slot);
+            }
+            for i in 0..PLAYER_CRAFT_INPUT_SLOT_COUNT {
+                let slot = PlayerSlot::PlayerCraftInput(i as u8);
+                if slot_contains(menu, slot, mx, my) {
+                    return Some(slot);
+                }
+            }
+            for i in 0..ARMOR_SLOT_COUNT {
+                let slot = PlayerSlot::Armor(i as u8);
+                if slot_contains(menu, slot, mx, my) {
+                    return Some(slot);
+                }
+            }
         }
+        InventoryMenuKind::CraftingTable => {
+            let result_slot = PlayerSlot::CraftingTableResult;
+            if slot_contains(menu, result_slot, mx, my) {
+                return Some(result_slot);
+            }
+            for i in 0..TABLE_CRAFT_INPUT_SLOT_COUNT {
+                let slot = PlayerSlot::CraftingTableInput(i as u8);
+                if slot_contains(menu, slot, mx, my) {
+                    return Some(slot);
+                }
+            }
+        }
+        InventoryMenuKind::ChestStub | InventoryMenuKind::FurnaceStub => {}
     }
     for i in 0..MAIN_SLOT_COUNT {
         let slot = PlayerSlot::Main(i as u8);
-        if slot_contains(slot, mx, my) {
+        if slot_contains(menu, slot, mx, my) {
             return Some(slot);
         }
     }
     for i in 0..HOTBAR_SLOT_COUNT {
         let slot = PlayerSlot::Hotbar(i as u8);
-        if slot_contains(slot, mx, my) {
+        if slot_contains(menu, slot, mx, my) {
             return Some(slot);
         }
     }
     None
 }
 
-fn slot_contains(slot: PlayerSlot, mx: f32, my: f32) -> bool {
-    let (sx, sy) = slot_gui_xy(slot);
+fn slot_contains(menu: InventoryMenuKind, slot: PlayerSlot, mx: f32, my: f32) -> bool {
+    let (sx, sy) = slot_gui_xy(menu, slot);
     mx >= sx - 1.0 && mx < sx + 17.0 && my >= sy - 1.0 && my < sy + 17.0
+}
+
+fn table_crafting_grid(slots: [Option<ItemStack>; TABLE_CRAFT_INPUT_SLOT_COUNT]) -> [i32; 9] {
+    let mut grid = [-1; 9];
+    for y in 0..3 {
+        for x in 0..3 {
+            let slot_index = x + y * 3;
+            let alpha_id = slots[slot_index].map_or(-1, |stack| stack.alpha_item_id() as i32);
+            grid[x + y * 3] = alpha_id;
+        }
+    }
+    grid
+}
+
+#[must_use]
+pub fn alpha_item_max_stack_size(item_id: u16) -> u8 {
+    match item_id {
+        // Armor
+        298..=317 => 1,
+        // Core non-stackables in alpha crafting outputs.
+        261 | 262 | 267 | 268 | 269 | 270 | 271 | 272 | 273 | 274 | 275 | 276 | 277 | 278 | 279
+        | 283 | 284 | 285 | 286 | 290 | 291 | 292 | 293 | 294 | 321 | 323 | 324 | 325 | 328
+        | 330 | 333 | 342 | 343 | 359 => 1,
+        _ => 64,
+    }
+}
+
+#[must_use]
+pub fn alpha_item_sprite_index(item_id: u16) -> Option<u16> {
+    let sprite = match item_id {
+        256 => 82,
+        257 => 98,
+        258 => 114,
+        259 => 5,
+        260 => 10,
+        261 => 21,
+        262 => 37,
+        263 => 7,
+        264 => 55,
+        265 => 23,
+        266 => 39,
+        267 => 66,
+        268 => 64,
+        269 => 80,
+        270 => 96,
+        271 => 112,
+        272 => 65,
+        273 => 81,
+        274 => 97,
+        275 => 113,
+        276 => 67,
+        277 => 83,
+        278 => 99,
+        279 => 115,
+        280 => 53,
+        281 => 71,
+        282 => 72,
+        283 => 68,
+        284 => 84,
+        285 => 100,
+        286 => 116,
+        287 => 8,
+        288 => 24,
+        289 => 40,
+        290 => 128,
+        291 => 129,
+        292 => 130,
+        293 => 131,
+        294 => 132,
+        296 => 25,
+        297 => 41,
+        298 => 0,
+        299 => 16,
+        300 => 32,
+        301 => 48,
+        302 => 1,
+        303 => 17,
+        304 => 33,
+        305 => 49,
+        306 => 2,
+        307 => 18,
+        308 => 34,
+        309 => 50,
+        310 => 3,
+        311 => 19,
+        312 => 35,
+        313 => 51,
+        314 => 4,
+        315 => 20,
+        316 => 36,
+        317 => 52,
+        318 => 6,
+        320 => 87,
+        321 => 26,
+        322 => 11,
+        323 => 42,
+        324 => 43,
+        325 => 74,
+        328 => 135,
+        330 => 44,
+        331 => 56,
+        332 => 14,
+        333 => 136,
+        334 => 103,
+        336 => 22,
+        337 => 57,
+        338 => 27,
+        339 => 58,
+        340 => 59,
+        341 => 30,
+        342 => 151,
+        343 => 167,
+        345 => 54,
+        346 => 69,
+        347 => 70,
+        348 => 73,
+        _ => return None,
+    };
+    Some(sprite)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InventoryCommand, ItemStack, MouseButton, PlayerInventoryState, PlayerSlot};
+    use super::{
+        InventoryCommand, InventoryMenuKind, ItemStack, MouseButton, PlayerInventoryState,
+        PlayerSlot,
+    };
 
     #[test]
     fn left_click_pick_and_place_roundtrips_stack() {
@@ -598,7 +982,9 @@ mod tests {
     fn close_inventory_drops_cursor() {
         let mut inv = PlayerInventoryState::alpha_defaults();
         inv.cursor = Some(ItemStack::block(1, 3));
-        let result = inv.apply(InventoryCommand::CloseInventory);
+        let result = inv.apply(InventoryCommand::CloseMenu {
+            menu: InventoryMenuKind::Player,
+        });
         assert!(result.changed);
         assert_eq!(result.dropped_to_world, vec![ItemStack::block(1, 3)]);
         assert_eq!(inv.cursor, None);

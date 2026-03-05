@@ -1094,8 +1094,7 @@ fn append_greedy_top_faces(
                             cell.neighbor_sky_light,
                             cell.neighbor_block_light,
                             face_scale,
-                            (u8::from(cell.is_leaves) * LEAF_MARKER_BIT)
-                                | GREEDY_TOP_TILE_BIT,
+                            (u8::from(cell.is_leaves) * LEAF_MARKER_BIT) | GREEDY_TOP_TILE_BIT,
                         ],
                     });
                 }
@@ -2056,7 +2055,9 @@ mod tests {
         let expected_levels = [5_u8, 15, 8, 12, 4, 10];
         for level in expected_levels {
             assert!(
-                mesh.vertices.iter().any(|vertex| vertex.light_data[0] == level),
+                mesh.vertices
+                    .iter()
+                    .any(|vertex| vertex.light_data[0] == level),
                 "expected sky light level {level} not present in face vertices"
             );
         }
@@ -2064,7 +2065,9 @@ mod tests {
         let expected_scales = [255_u8, 128, 204, 153];
         for scale in expected_scales {
             assert!(
-                mesh.vertices.iter().any(|vertex| vertex.light_data[2] == scale),
+                mesh.vertices
+                    .iter()
+                    .any(|vertex| vertex.light_data[2] == scale),
                 "expected face shading scale {scale} not present"
             );
         }
@@ -2090,11 +2093,10 @@ mod tests {
 
         let mesh = build_chunk_mesh(&chunk, &registry);
         assert!(!mesh.vertices.is_empty());
-        assert!(
-            mesh.vertices
-                .iter()
-                .all(|vertex| (vertex.light_data[3] & 1) == 1)
-        );
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|vertex| (vertex.light_data[3] & 1) == 1));
     }
 
     #[test]

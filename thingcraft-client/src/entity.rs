@@ -123,7 +123,11 @@ pub struct EntityPickupFx {
 
 /// Spawn a dropped block item entity at `position` with Alpha-faithful initial velocity.
 pub fn spawn_dropped_item(world: &mut World, block_id: u8, position: DVec3) {
-    spawn_dropped_item_stack(world, crate::inventory::ItemStack::block(block_id, 1), position);
+    spawn_dropped_item_stack(
+        world,
+        crate::inventory::ItemStack::block(block_id, 1),
+        position,
+    );
 }
 
 /// Spawn a dropped item entity (full ItemStack) with Alpha-faithful initial velocity.
@@ -158,6 +162,7 @@ pub fn spawn_player_dropped_item(
     let stack = match item {
         crate::inventory::ItemKey::Block(id) => crate::inventory::ItemStack::block(id, 1),
         crate::inventory::ItemKey::Tool(id) => crate::inventory::ItemStack::tool(id),
+        crate::inventory::ItemKey::Item(id) => crate::inventory::ItemStack::item(id, 1),
     };
     spawn_player_dropped_item_stack(world, stack, position, yaw_radians, pitch_radians);
 }
@@ -486,10 +491,12 @@ pub fn tick_entity_physics(
 pub fn check_item_pickup(world: &mut World) -> bool {
     world.resource_scope(|world, mut inventory: Mut<'_, PlayerInventoryState>| {
         // Read player position + physics.
-        let mut player_query =
-            world.query_filtered::<(&Transform64, &PhysicsBody, Option<&PlayerVitals>), With<Player>>();
-        let Some((player_t, player_p, player_vitals)) =
-            player_query.iter(world).next().map(|(t, p, v)| (*t, *p, v.copied()))
+        let mut player_query = world
+            .query_filtered::<(&Transform64, &PhysicsBody, Option<&PlayerVitals>), With<Player>>();
+        let Some((player_t, player_p, player_vitals)) = player_query
+            .iter(world)
+            .next()
+            .map(|(t, p, v)| (*t, *p, v.copied()))
         else {
             return false;
         };
@@ -531,7 +538,15 @@ pub fn check_item_pickup(world: &mut World) -> bool {
             &PickupDelay,
             &EntityPhysics,
         )>();
-        let candidates: Vec<(Entity, crate::inventory::ItemStack, DVec3, f64, f64, u32, f32)> = item_query
+        let candidates: Vec<(
+            Entity,
+            crate::inventory::ItemStack,
+            DVec3,
+            f64,
+            f64,
+            u32,
+            f32,
+        )> = item_query
             .iter(world)
             .filter(|(_, _, _, delay, _)| delay.ticks_remaining == 0)
             .filter_map(|(e, item, t, _, phys)| {
@@ -766,14 +781,13 @@ pub fn build_entity_sprite_mesh(
         // Determine block_id for rendering (tools render as billboard placeholder).
         let block_id_opt = match item.stack.item {
             crate::inventory::ItemKey::Block(id) => Some(id),
-            crate::inventory::ItemKey::Tool(_) => None,
+            crate::inventory::ItemKey::Tool(_) | crate::inventory::ItemKey::Item(_) => None,
         };
 
         if let Some(block_id) = block_id_opt {
             if registry.is_solid(block_id) {
                 // 3D mini-block: Alpha rotates by (age + partial) / 20 * 57.2958 degrees.
-                let spin_rad =
-                    (age_f / 20.0 + bob.0) * (std::f32::consts::PI / 180.0) * 57.295_78;
+                let spin_rad = (age_f / 20.0 + bob.0) * (std::f32::consts::PI / 180.0) * 57.295_78;
                 let cos_r = spin_rad.cos();
                 let sin_r = spin_rad.sin();
 
@@ -827,9 +841,11 @@ pub fn build_entity_sprite_mesh(
                     (registry.sprite_index_of(id), &mut vertices, &mut indices)
                 }
                 crate::inventory::ItemKey::Tool(tool_id) => {
-                    let si = tool_registry
-                        .get(tool_id)
-                        .map_or(0, |def| def.sprite_index);
+                    let si = tool_registry.get(tool_id).map_or(0, |def| def.sprite_index);
+                    (si, &mut items_vertices, &mut items_indices)
+                }
+                crate::inventory::ItemKey::Item(item_id) => {
+                    let si = crate::inventory::alpha_item_sprite_index(item_id).unwrap_or(0);
                     (si, &mut items_vertices, &mut items_indices)
                 }
             };
@@ -917,9 +933,23 @@ pub fn build_entity_sprite_mesh(
                 }
                 crate::inventory::ItemKey::Tool(tool_id) => {
                     // Render tool pickup FX as billboard into items-atlas mesh.
-                    let sprite_index = tool_registry
-                        .get(tool_id)
-                        .map_or(0, |def| def.sprite_index);
+                    let sprite_index = tool_registry.get(tool_id).map_or(0, |def| def.sprite_index);
+                    append_billboard_sprite(
+                        &mut items_vertices,
+                        &mut items_indices,
+                        &render_pos,
+                        &age,
+                        &bob,
+                        camera_yaw,
+                        sprite_index,
+                        chunk_streamer,
+                        ambient_darkness,
+                        render_alpha,
+                    );
+                }
+                crate::inventory::ItemKey::Item(item_id) => {
+                    let sprite_index =
+                        crate::inventory::alpha_item_sprite_index(item_id).unwrap_or(0);
                     append_billboard_sprite(
                         &mut items_vertices,
                         &mut items_indices,
@@ -1374,7 +1404,13 @@ mod tests {
     fn player_drop_uses_longer_pickup_delay() {
         let mut world = World::new();
         world.insert_resource(RenderAlpha(0.0));
-        spawn_player_dropped_item(&mut world, crate::inventory::ItemKey::Block(1), DVec3::ZERO, 0.0, 0.0);
+        spawn_player_dropped_item(
+            &mut world,
+            crate::inventory::ItemKey::Block(1),
+            DVec3::ZERO,
+            0.0,
+            0.0,
+        );
 
         let mut query = world.query::<&PickupDelay>();
         let delay = query.iter(&world).next().unwrap();
@@ -1460,7 +1496,8 @@ mod tests {
             crate::streaming::ResidencyConfig::default(),
         );
         let tool_reg = crate::tool::ToolRegistry::alpha_1_2_6();
-        let mesh = build_entity_sprite_mesh(&mut world, 0.0, &registry, &tool_reg, &streamer, 0, 0.0);
+        let mesh =
+            build_entity_sprite_mesh(&mut world, 0.0, &registry, &tool_reg, &streamer, 0, 0.0);
 
         // 6 faces * 4 verts = 24 per solid block, 6 faces * 6 indices = 36
         assert_eq!(mesh.terrain.vertices.len(), 3 * 24);
@@ -1484,7 +1521,8 @@ mod tests {
             crate::streaming::ResidencyConfig::default(),
         );
         let tool_reg = crate::tool::ToolRegistry::alpha_1_2_6();
-        let mesh = build_entity_sprite_mesh(&mut world, 0.0, &registry, &tool_reg, &streamer, 0, 0.0);
+        let mesh =
+            build_entity_sprite_mesh(&mut world, 0.0, &registry, &tool_reg, &streamer, 0, 0.0);
 
         // Billboard: 4 verts, 6 indices
         assert_eq!(mesh.terrain.vertices.len(), 4);

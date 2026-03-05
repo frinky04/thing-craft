@@ -18,13 +18,17 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
+use crate::crafting::CraftingRegistry;
 use crate::ecs::EcsRuntime;
 use crate::gameplay::{
     apply_post_block_break_effects, run_inventory_command_system, InventoryCommandQueue,
     MiningState, MiningTarget, MiningToolKind,
 };
 use crate::hud;
-use crate::inventory::{hit_test_slot, InventoryCommand, ItemKey, PlayerInventoryState};
+use crate::inventory::{
+    hit_test_slot_for_menu, inventory_layout, InventoryCommand, InventoryMenuKind, ItemKey,
+    PlayerInventoryState, INVENTORY_HEIGHT, INVENTORY_WIDTH,
+};
 use crate::mesh::{build_region_mesh, ChunkMesh, MeshVertex};
 use crate::renderer::{RenderError, Renderer};
 use crate::streaming::{
@@ -77,6 +81,11 @@ struct BlockInteractionRequest {
 struct BlockRayHit {
     block: [i32; 3],
     normal: [i32; 3],
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BlockInteractionEvents {
+    open_menu: Option<InventoryMenuKind>,
 }
 
 #[derive(Debug, Default)]
@@ -435,7 +444,8 @@ impl BenchRuntime {
     fn take_screenshot_request(&mut self) -> Option<Vec<PathBuf>> {
         let elapsed_s = self.elapsed().as_secs_f32();
         let still_trigger = bench_phase_capture_offset(self.config.still_secs);
-        let turn_trigger = self.config.still_secs as f32 + bench_phase_capture_offset(self.config.turn_secs);
+        let turn_trigger =
+            self.config.still_secs as f32 + bench_phase_capture_offset(self.config.turn_secs);
         let move_trigger = self.config.still_secs as f32
             + self.config.turn_secs as f32
             + bench_phase_capture_offset(self.config.move_secs);
@@ -458,7 +468,8 @@ impl BenchRuntime {
     fn screenshot_paths_for_label(&self, label: &str) -> Vec<PathBuf> {
         vec![
             self.screenshot_run_dir.join(format!("{label}.png")),
-            self.screenshot_latest_dir.join(format!("latest_{label}.png")),
+            self.screenshot_latest_dir
+                .join(format!("latest_{label}.png")),
         ]
     }
 }
@@ -536,6 +547,9 @@ pub fn run() -> Result<()> {
         .insert_resource(PlayerInventoryState::alpha_defaults());
     ecs_runtime
         .world_mut()
+        .insert_resource(CraftingRegistry::alpha_1_2_6());
+    ecs_runtime
+        .world_mut()
         .insert_resource(MiningState::default());
     ecs_runtime
         .world_mut()
@@ -581,7 +595,7 @@ pub fn run() -> Result<()> {
     let mut left_mouse_held = false;
     let mut mining_swing_hold_ticks: u8 = 0;
     let mut mining_start_requested = false;
-    let mut inventory_open = false;
+    let mut open_menu: Option<InventoryMenuKind> = None;
     let mut mouse_screen_pos = [0.0_f32, 0.0_f32];
     let mut block_interaction_requests = VecDeque::new();
     let mut edit_latency_tracker = EditLatencyTracker::default();
@@ -594,7 +608,10 @@ pub fn run() -> Result<()> {
     let mut fog_brightness = 1.0_f32;
     let base_fluid_tick_budget = resolve_fluid_tick_budget();
     let mut adaptive_fluid_budget = AdaptiveFluidBudget::new(base_fluid_tick_budget);
-    let selected_slot = ecs_runtime.world().resource::<PlayerInventoryState>().selected_stack();
+    let selected_slot = ecs_runtime
+        .world()
+        .resource::<PlayerInventoryState>()
+        .selected_stack();
     let selected_hotbar = ecs_runtime
         .world()
         .resource::<PlayerInventoryState>()
@@ -666,7 +683,7 @@ pub fn run() -> Result<()> {
                     last_frame_start = now;
 
                     // Inventory screen should not preserve prior movement/look intents.
-                    if inventory_open {
+                    if open_menu.is_some() {
                         ecs_runtime.clear_input_state();
                     }
                     if let Some(bench) = &mut bench_runtime {
@@ -753,7 +770,7 @@ pub fn run() -> Result<()> {
                             hud_dirty = true;
                         }
 
-                        if !mouse_captured || inventory_open || ecs_runtime.player_is_dead() {
+                        if !mouse_captured || open_menu.is_some() || ecs_runtime.player_is_dead() {
                             left_mouse_held = false;
                             mining_swing_hold_ticks = 0;
                             mining_start_requested = false;
@@ -793,14 +810,42 @@ pub fn run() -> Result<()> {
                             ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
                         }
 
-                        // Block interactions (place-only in this queue path).
-                        process_block_interaction_requests(
+                        // Block interactions (place-first, then block-use/menu fallback).
+                        let interaction_events = process_block_interaction_requests(
                             &mut ecs_runtime,
                             &bootstrap_world.registry,
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
                             &mut edit_latency_tracker,
                         );
+                        if let Some(menu) = interaction_events.open_menu {
+                            match menu {
+                                InventoryMenuKind::ChestStub => {
+                                    info!("opened chest menu stub (TODO: container inventory wiring)")
+                                }
+                                InventoryMenuKind::FurnaceStub => {
+                                    info!("opened furnace menu stub (TODO: smelting/menu wiring)")
+                                }
+                                InventoryMenuKind::CraftingTable | InventoryMenuKind::Player => {}
+                            }
+                            open_menu = Some(menu);
+                            mouse_captured = false;
+                            left_mouse_held = false;
+                            mining_swing_hold_ticks = 0;
+                            ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
+                            set_mouse_capture(window, false);
+                            ecs_runtime.clear_input_state();
+                            let size = window.inner_size();
+                            let center = PhysicalPosition::new(
+                                f64::from(size.width) * 0.5,
+                                f64::from(size.height) * 0.5,
+                            );
+                            if let Err(err) = window.set_cursor_position(center) {
+                                warn!(?err, "failed to center cursor on menu open");
+                            }
+                            mouse_screen_pos = [center.x as f32, center.y as f32];
+                            hud_dirty = true;
+                        }
 
                         if ecs_runtime
                             .world()
@@ -1130,11 +1175,12 @@ pub fn run() -> Result<()> {
                         };
                         let mut hud_verts =
                             hud::build_hud_vertices(sw, sh, &hud_state, &bootstrap_world.registry);
-                        if inventory_open {
+                        if let Some(menu) = open_menu {
                             let mut inventory_verts = hud::build_inventory_vertices(
                                 sw,
                                 sh,
                                 &inventory_state,
+                                menu,
                                 mouse_screen_pos,
                                 &bootstrap_world.registry,
                                 &tool_registry,
@@ -1277,7 +1323,7 @@ pub fn run() -> Result<()> {
                         let player_dead = ecs_runtime.player_is_dead();
                         let allow_input_passthrough =
                             !player_dead || matches!(code, KeyCode::Escape | KeyCode::KeyR);
-                        if allow_input_passthrough && !inventory_open {
+                        if allow_input_passthrough && open_menu.is_none() {
                             ecs_runtime.handle_key(code, is_pressed);
                         }
 
@@ -1338,13 +1384,13 @@ pub fn run() -> Result<()> {
                         }
 
                         if code == KeyCode::Escape && is_pressed {
-                            if inventory_open {
+                            if let Some(menu) = open_menu {
                                 ecs_runtime
                                     .world_mut()
                                     .resource_mut::<InventoryCommandQueue>()
                                     .pending
-                                    .push_back(InventoryCommand::CloseInventory);
-                                inventory_open = false;
+                                    .push_back(InventoryCommand::CloseMenu { menu });
+                                open_menu = None;
                                 left_mouse_held = false;
                                 mining_swing_hold_ticks = 0;
                                 ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
@@ -1363,8 +1409,22 @@ pub fn run() -> Result<()> {
                         }
 
                         if code == KeyCode::KeyE && is_pressed && !event.repeat {
-                            inventory_open = !inventory_open;
-                            if inventory_open {
+                            if let Some(menu) = open_menu {
+                                open_menu = None;
+                                ecs_runtime
+                                    .world_mut()
+                                    .resource_mut::<InventoryCommandQueue>()
+                                    .pending
+                                    .push_back(InventoryCommand::CloseMenu { menu });
+                                left_mouse_held = false;
+                                mining_swing_hold_ticks = 0;
+                                ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
+                                if !ecs_runtime.player_is_dead() {
+                                    mouse_captured = true;
+                                    set_mouse_capture(window, true);
+                                }
+                            } else {
+                                open_menu = Some(InventoryMenuKind::Player);
                                 mouse_captured = false;
                                 left_mouse_held = false;
                                 mining_swing_hold_ticks = 0;
@@ -1380,16 +1440,6 @@ pub fn run() -> Result<()> {
                                     warn!(?err, "failed to center cursor on inventory open");
                                 }
                                 mouse_screen_pos = [center.x as f32, center.y as f32];
-                            } else {
-                                ecs_runtime
-                                    .world_mut()
-                                    .resource_mut::<InventoryCommandQueue>()
-                                    .pending
-                                    .push_back(InventoryCommand::CloseInventory);
-                                if !ecs_runtime.player_is_dead() {
-                                    mouse_captured = true;
-                                    set_mouse_capture(window, true);
-                                }
                             }
                             hud_dirty = true;
                         }
@@ -1413,10 +1463,10 @@ pub fn run() -> Result<()> {
                     if ecs_runtime.player_is_dead() {
                         return;
                     }
-                    if inventory_open {
+                    if let Some(menu) = open_menu {
                         let (sw, sh) = renderer.screen_size();
                         if let Some(slot) =
-                            hit_test_slot(mouse_screen_pos[0], mouse_screen_pos[1], sw, sh)
+                            hit_test_slot_for_menu(mouse_screen_pos[0], mouse_screen_pos[1], sw, sh, menu)
                         {
                             ecs_runtime
                                 .world_mut()
@@ -1426,7 +1476,12 @@ pub fn run() -> Result<()> {
                                     slot,
                                     button: MouseButton::Left,
                                 });
-                        } else {
+                        } else if !is_point_inside_inventory_panel(
+                            mouse_screen_pos[0],
+                            mouse_screen_pos[1],
+                            sw,
+                            sh,
+                        ) {
                             ecs_runtime
                                 .world_mut()
                                 .resource_mut::<InventoryCommandQueue>()
@@ -1472,10 +1527,10 @@ pub fn run() -> Result<()> {
                     if ecs_runtime.player_is_dead() {
                         return;
                     }
-                    if inventory_open {
+                    if let Some(menu) = open_menu {
                         let (sw, sh) = renderer.screen_size();
                         if let Some(slot) =
-                            hit_test_slot(mouse_screen_pos[0], mouse_screen_pos[1], sw, sh)
+                            hit_test_slot_for_menu(mouse_screen_pos[0], mouse_screen_pos[1], sw, sh, menu)
                         {
                             ecs_runtime
                                 .world_mut()
@@ -1485,7 +1540,12 @@ pub fn run() -> Result<()> {
                                     slot,
                                     button: MouseButton::Right,
                                 });
-                        } else {
+                        } else if !is_point_inside_inventory_panel(
+                            mouse_screen_pos[0],
+                            mouse_screen_pos[1],
+                            sw,
+                            sh,
+                        ) {
                             ecs_runtime
                                 .world_mut()
                                 .resource_mut::<InventoryCommandQueue>()
@@ -1514,7 +1574,7 @@ pub fn run() -> Result<()> {
                     if bench_runtime.is_some() {
                         return;
                     }
-                    if inventory_open || ecs_runtime.player_is_dead() {
+                    if open_menu.is_some() || ecs_runtime.player_is_dead() {
                         return;
                     }
                     let amount = match delta {
@@ -1537,7 +1597,7 @@ pub fn run() -> Result<()> {
                         return;
                     }
                     mouse_screen_pos = [position.x as f32, position.y as f32];
-                    if inventory_open {
+                    if open_menu.is_some() {
                         hud_dirty = true;
                     }
                 }
@@ -1546,7 +1606,7 @@ pub fn run() -> Result<()> {
             Event::DeviceEvent {
                 event: DeviceEvent::MouseMotion { delta },
                 ..
-            } if mouse_captured && !inventory_open => {
+            } if mouse_captured && open_menu.is_none() => {
                 if bench_runtime.is_some() {
                     return;
                 }
@@ -1876,7 +1936,11 @@ fn try_start_block_mining(
             calc.can_harvest,
         ) {
             if let Some((drop_block_id, spawn_pos)) = drop {
-                crate::entity::spawn_dropped_item(ecs_runtime.world_mut(), drop_block_id, spawn_pos);
+                crate::entity::spawn_dropped_item(
+                    ecs_runtime.world_mut(),
+                    drop_block_id,
+                    spawn_pos,
+                );
             }
             apply_post_block_break_effects(ecs_runtime, tool_registry, calc.tool);
             return true;
@@ -2222,16 +2286,28 @@ fn process_block_interaction_requests(
     chunk_streamer: &mut ChunkStreamer,
     queue: &mut VecDeque<BlockInteractionRequest>,
     edit_latency_tracker: &mut EditLatencyTracker,
-) {
+) -> BlockInteractionEvents {
+    let mut events = BlockInteractionEvents::default();
     while let Some(request) = queue.pop_front() {
-        process_single_block_interaction_request(
-            ecs_runtime,
-            registry,
-            chunk_streamer,
-            request,
-            edit_latency_tracker,
-        );
+        if events.open_menu.is_none() {
+            events.open_menu = process_single_block_interaction_request(
+                ecs_runtime,
+                registry,
+                chunk_streamer,
+                request,
+                edit_latency_tracker,
+            );
+        } else {
+            let _ = process_single_block_interaction_request(
+                ecs_runtime,
+                registry,
+                chunk_streamer,
+                request,
+                edit_latency_tracker,
+            );
+        }
     }
+    events
 }
 
 fn process_single_block_interaction_request(
@@ -2240,7 +2316,7 @@ fn process_single_block_interaction_request(
     chunk_streamer: &mut ChunkStreamer,
     request: BlockInteractionRequest,
     edit_latency_tracker: &mut EditLatencyTracker,
-) {
+) -> Option<InventoryMenuKind> {
     let (allow_liquids, selected_block_id) = {
         let inventory = ecs_runtime.world().resource::<PlayerInventoryState>();
         (
@@ -2263,35 +2339,71 @@ fn process_single_block_interaction_request(
             }
         },
     ) else {
-        return;
+        return None;
     };
 
     if hit.normal == [0, 0, 0] {
-        return;
+        return None;
     }
-    let Some(block_id) = selected_block_id else {
-        return;
-    };
     let target_block_id = chunk_streamer
         .block_at_world(hit.block[0], hit.block[1], hit.block[2])
         .unwrap_or(AIR_BLOCK_ID);
+
+    // Keep place-first semantics for held block stacks; fall back to block-use behavior if place fails.
+    if let Some(block_id) = selected_block_id {
+        if try_place_selected_block(
+            ecs_runtime,
+            registry,
+            chunk_streamer,
+            hit,
+            target_block_id,
+            block_id,
+            edit_latency_tracker,
+        ) {
+            return None;
+        }
+    }
+
+    match target_block_id {
+        58 => Some(InventoryMenuKind::CraftingTable), // crafting table
+        54 => {
+            // TODO(alpha-chest): Replace stub with chest container inventory + menu.
+            Some(InventoryMenuKind::ChestStub)
+        }
+        61 | 62 => {
+            // TODO(alpha-furnace): Replace stub with furnace smelting state + menu.
+            Some(InventoryMenuKind::FurnaceStub)
+        }
+        _ => None,
+    }
+}
+
+fn try_place_selected_block(
+    ecs_runtime: &mut EcsRuntime,
+    registry: &BlockRegistry,
+    chunk_streamer: &mut ChunkStreamer,
+    hit: BlockRayHit,
+    target_block_id: u8,
+    block_id: u8,
+    edit_latency_tracker: &mut EditLatencyTracker,
+) -> bool {
     let [x, y, z] = hit.block;
     let (place_x, place_y, place_z) = if registry.is_snow_layer(target_block_id) {
         (x, y, z)
     } else {
         let Some(px) = x.checked_add(hit.normal[0]) else {
-            return;
+            return false;
         };
         let Some(py) = y.checked_add(hit.normal[1]) else {
-            return;
+            return false;
         };
         let Some(pz) = z.checked_add(hit.normal[2]) else {
-            return;
+            return false;
         };
         (px, py, pz)
     };
     if placement_intersects_player(ecs_runtime, registry, block_id, place_x, place_y, place_z) {
-        return;
+        return false;
     }
 
     if block_id == CHEST_BLOCK_ID
@@ -2331,7 +2443,9 @@ fn process_single_block_interaction_request(
             .resource_mut::<PlayerInventoryState>()
             .apply(InventoryCommand::ConsumeSelected { amount: 1 });
         edit_latency_tracker.record_block_edit(place_x, place_z);
+        return true;
     }
+    false
 }
 
 fn affected_chunks_for_block_edit(world_x: i32, world_z: i32) -> Vec<ChunkPos> {
@@ -2379,6 +2493,21 @@ fn hotbar_slot_for_key(code: KeyCode) -> Option<usize> {
         KeyCode::Digit9 => Some(8),
         _ => None,
     }
+}
+
+fn is_point_inside_inventory_panel(
+    mouse_x: f32,
+    mouse_y: f32,
+    screen_w: f32,
+    screen_h: f32,
+) -> bool {
+    let layout = inventory_layout(screen_w, screen_h);
+    let mx = mouse_x / layout.scale;
+    let my = mouse_y / layout.scale;
+    mx >= layout.left
+        && mx < layout.left + INVENTORY_WIDTH
+        && my >= layout.top
+        && my < layout.top + INVENTORY_HEIGHT
 }
 
 fn raycast_first_solid_block<F>(
@@ -2870,11 +2999,28 @@ fn build_first_person_item_mesh(
                 view_pitch,
             );
         }
+        ItemKey::Item(id) => {
+            if let Some(sprite_index) = crate::inventory::alpha_item_sprite_index(id) {
+                return build_first_person_sprite_mesh(
+                    sprite_index,
+                    equip_progress,
+                    attack_progress,
+                    view_yaw,
+                    view_pitch,
+                );
+            }
+            return ChunkMesh::default();
+        }
         ItemKey::Block(block_id) => {
             if !registry.is_defined_block(block_id) {
                 return ChunkMesh::default();
             }
-            return build_first_person_block_mesh(block_id, registry, equip_progress, attack_progress);
+            return build_first_person_block_mesh(
+                block_id,
+                registry,
+                equip_progress,
+                attack_progress,
+            );
         }
     }
 }
@@ -2893,6 +3039,22 @@ fn build_first_person_tool_mesh(
     let Some(def) = tool_registry.get(tool_id) else {
         return ChunkMesh::default();
     };
+    build_first_person_sprite_mesh(
+        def.sprite_index,
+        equip_progress,
+        attack_progress,
+        view_yaw,
+        view_pitch,
+    )
+}
+
+fn build_first_person_sprite_mesh(
+    sprite_index: u16,
+    equip_progress: f32,
+    attack_progress: f32,
+    view_yaw: f32,
+    view_pitch: f32,
+) -> ChunkMesh {
     let mut mesh = ChunkMesh::default();
 
     // Alpha ItemInHandRenderer.render() lines 58-66:
@@ -2914,12 +3076,12 @@ fn build_first_person_tool_mesh(
     // Alpha uses: f = left_u, g = right_u (reversed from usual naming).
     // In Alpha: g = (sprite%16*16 + 0) / 256;  f = (sprite%16*16 + 15.99) / 256
     //           h = (sprite/16*16 + 0) / 256;   i = (sprite/16*16 + 15.99) / 256
-    let col = def.sprite_index % 16;
-    let row = def.sprite_index / 16;
-    let u_left  = (col as f32 * 16.0) / 256.0;              // Alpha 'f' (actually left)
-    let u_right = (col as f32 * 16.0 + 15.99) / 256.0;      // Alpha 'g' (actually right)
-    let v_top   = (row as f32 * 16.0) / 256.0;              // Alpha 'h'
-    let v_bot   = (row as f32 * 16.0 + 15.99) / 256.0;      // Alpha 'i'
+    let col = sprite_index % 16;
+    let row = sprite_index / 16;
+    let u_left = (col as f32 * 16.0) / 256.0; // Alpha 'f' (actually left)
+    let u_right = (col as f32 * 16.0 + 15.99) / 256.0; // Alpha 'g' (actually right)
+    let v_top = (row as f32 * 16.0) / 256.0; // Alpha 'h'
+    let v_bot = (row as f32 * 16.0 + 15.99) / 256.0; // Alpha 'i'
 
     // Map to Alpha variable names exactly:
     //   f = left U,  g = right U,  h = top V,  i = bottom V
@@ -2928,15 +3090,14 @@ fn build_first_person_tool_mesh(
     let (f, g, h, i) = (u_left, u_right, v_top, v_bot);
 
     let n = 0.0625_f32; // thickness = 1/16 block
-    let j = 1.0_f32;    // width
+    let j = 1.0_f32; // width
     let light = [15_u8, 15, 255, 0];
 
     // Alpha ItemInHandRenderer.renderHand():
     //   glRotatef(playerPitch, 1,0,0); glRotatef(playerYaw, 0,1,0); Lighting.turnOn();
     // The light directions are transformed by those camera rotations, so held
     // item shading shifts as the player looks around.
-    let light_rotation =
-        Mat4::from_rotation_x(view_pitch) * Mat4::from_rotation_y(view_yaw);
+    let light_rotation = Mat4::from_rotation_x(view_pitch) * Mat4::from_rotation_y(view_yaw);
     // Alpha Lighting.turnOn() uses OpenGL fixed-function lighting with:
     // ambient = 0.4, two diffuse lights at 0.6 each.
     let light0 = light_rotation
@@ -2947,35 +3108,38 @@ fn build_first_person_tool_mesh(
         .normalize_or_zero();
     let alpha_lit_tint = |local_normal: Vec3| -> [u8; 4] {
         let n = model.transform_vector3(local_normal).normalize_or_zero();
-        let brightness = (0.4 + 0.6 * n.dot(light0).max(0.0) + 0.6 * n.dot(light1).max(0.0))
-            .clamp(0.0, 1.0);
+        let brightness =
+            (0.4 + 0.6 * n.dot(light0).max(0.0) + 0.6 * n.dot(light1).max(0.0)).clamp(0.0, 1.0);
         let c = (brightness * 255.0).round() as u8;
         [c, c, c, 255]
     };
 
     // Helper: push one quad (4 verts + 6 indices) through the model transform.
-    let push_quad = |mesh: &mut ChunkMesh,
-                         corners: [[f32; 3]; 4],
-                         uvs: [[f32; 2]; 4],
-                         tint_rgba: [u8; 4]| {
-        let base = mesh.vertices.len() as u32;
-        for idx in 0..4 {
-            let p = model.transform_point3(Vec3::from_array(corners[idx]));
-            mesh.vertices.push(MeshVertex {
-                position: [p.x, p.y, p.z],
-                uv: uvs[idx],
-                tint_rgba,
-                light_data: light,
-            });
-        }
-        mesh.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    };
+    let push_quad =
+        |mesh: &mut ChunkMesh, corners: [[f32; 3]; 4], uvs: [[f32; 2]; 4], tint_rgba: [u8; 4]| {
+            let base = mesh.vertices.len() as u32;
+            for idx in 0..4 {
+                let p = model.transform_point3(Vec3::from_array(corners[idx]));
+                mesh.vertices.push(MeshVertex {
+                    position: [p.x, p.y, p.z],
+                    uv: uvs[idx],
+                    tint_rgba,
+                    light_data: light,
+                });
+            }
+            mesh.indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        };
 
     // Front face (z=0), normal +Z.  Alpha lines 69-73.
     push_quad(
         &mut mesh,
-        [[0.0, 0.0, 0.0], [j, 0.0, 0.0], [j, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        [
+            [0.0, 0.0, 0.0],
+            [j, 0.0, 0.0],
+            [j, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
         [[g, i], [f, i], [f, h], [g, h]],
         alpha_lit_tint(Vec3::Z),
     );
@@ -3051,7 +3215,6 @@ fn build_first_person_block_mesh(
     equip_progress: f32,
     attack_progress: f32,
 ) -> ChunkMesh {
-
     let mut mesh = ChunkMesh::default();
     let model = alpha_first_person_item_transform(equip_progress, attack_progress);
     let cube_faces = [
@@ -3906,17 +4069,19 @@ mod tests {
         alpha_fog_brightness_target, alpha_horizontal_face_from_look,
         alpha_opposite_face, alpha_placement_metadata_from_look, alpha_star_brightness,
         alpha_sunrise_color, alpha_time_of_day, can_replace_block_for_placement,
-        has_target_directive, hotbar_slot_for_key, is_raycast_targetable_block, parse_env_bool,
-        parse_env_u32, placement_intersects_player, raycast_first_solid_block,
-        resolve_axis, AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, FURNACE_BLOCK_ID,
-        CHEST_BLOCK_ID, LIT_FURNACE_BLOCK_ID, LIT_PUMPKIN_BLOCK_ID, PUMPKIN_BLOCK_ID,
+        can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
+        is_point_inside_inventory_panel, is_raycast_targetable_block, parse_env_bool,
+        parse_env_u32, placement_intersects_player, raycast_first_solid_block, resolve_axis,
+        AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, CHEST_BLOCK_ID, FURNACE_BLOCK_ID,
+        LIT_FURNACE_BLOCK_ID, LIT_PUMPKIN_BLOCK_ID, PUMPKIN_BLOCK_ID,
     };
+    use crate::crafting::CraftingRegistry;
     use crate::ecs::EcsRuntime;
     use crate::gameplay::{
         apply_post_block_break_effects, run_inventory_command_system, InventoryCommandQueue,
         MiningState, MiningToolKind, ALPHA_MINING_COOLDOWN_TICKS,
     };
-    use crate::inventory::{InventoryCommand, ItemStack, PlayerInventoryState};
+    use crate::inventory::{InventoryCommand, InventoryMenuKind, ItemStack, PlayerInventoryState};
     use crate::streaming::{ChunkStreamer, ResidencyConfig};
     use crate::tool::ToolRegistry;
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
@@ -3979,6 +4144,33 @@ mod tests {
     }
 
     #[test]
+    fn inventory_panel_bounds_match_gui_layout() {
+        // 1920x1080 => GUI scale 4 => panel starts at ((480-176)/2, (270-166)/2) in GUI px.
+        // Convert to screen px for the helper input path.
+        let scale = 4.0;
+        let left_px = 152.0 * scale;
+        let top_px = 52.0 * scale;
+        assert!(is_point_inside_inventory_panel(
+            left_px + 1.0,
+            top_px + 1.0,
+            1920.0,
+            1080.0,
+        ));
+        assert!(!is_point_inside_inventory_panel(
+            left_px - 1.0,
+            top_px + 1.0,
+            1920.0,
+            1080.0,
+        ));
+        assert!(!is_point_inside_inventory_panel(
+            left_px + (176.0 * scale),
+            top_px + (166.0 * scale),
+            1920.0,
+            1080.0,
+        ));
+    }
+
+    #[test]
     fn alpha_mining_progress_matches_hand_stone_rate() {
         let inv = PlayerInventoryState::alpha_defaults();
         let registry = BlockRegistry::alpha_1_2_6();
@@ -3993,9 +4185,12 @@ mod tests {
         let inv = PlayerInventoryState::alpha_defaults();
         let registry = BlockRegistry::alpha_1_2_6();
         let tool_reg = ToolRegistry::alpha_1_2_6();
-        let grounded = alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, true, false).progress_per_tick;
-        let in_water = alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, true, true).progress_per_tick;
-        let airborne = alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, false, false).progress_per_tick;
+        let grounded =
+            alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, true, false).progress_per_tick;
+        let in_water =
+            alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, true, true).progress_per_tick;
+        let airborne =
+            alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, false, false).progress_per_tick;
         assert!((in_water - grounded / 5.0).abs() < 1e-6);
         assert!((airborne - grounded / 5.0).abs() < 1e-6);
     }
@@ -4003,15 +4198,21 @@ mod tests {
     #[test]
     fn inventory_command_system_drains_queue_and_emits_drop_events() {
         let mut ecs = EcsRuntime::new();
-        ecs.world_mut().insert_resource(PlayerInventoryState::alpha_defaults());
-        ecs.world_mut().insert_resource(InventoryCommandQueue::default());
+        ecs.world_mut()
+            .insert_resource(PlayerInventoryState::alpha_defaults());
+        ecs.world_mut()
+            .insert_resource(CraftingRegistry::alpha_1_2_6());
+        ecs.world_mut()
+            .insert_resource(InventoryCommandQueue::default());
         ecs.world_mut()
             .resource_mut::<PlayerInventoryState>()
             .cursor = Some(ItemStack::tool(270));
         ecs.world_mut()
             .resource_mut::<InventoryCommandQueue>()
             .pending
-            .push_back(InventoryCommand::CloseInventory);
+            .push_back(InventoryCommand::CloseMenu {
+                menu: InventoryMenuKind::Player,
+            });
 
         let events = run_inventory_command_system(&mut ecs);
 
@@ -4027,7 +4228,8 @@ mod tests {
     #[test]
     fn instant_break_consumes_tool_durability() {
         let mut ecs = EcsRuntime::new();
-        ecs.world_mut().insert_resource(PlayerInventoryState::alpha_defaults());
+        ecs.world_mut()
+            .insert_resource(PlayerInventoryState::alpha_defaults());
         ecs.world_mut().insert_resource(MiningState::default());
         let _ = ecs
             .world_mut()
@@ -4057,7 +4259,8 @@ mod tests {
     #[test]
     fn non_harvest_break_still_applies_mining_cooldown() {
         let mut ecs = EcsRuntime::new();
-        ecs.world_mut().insert_resource(PlayerInventoryState::alpha_defaults());
+        ecs.world_mut()
+            .insert_resource(PlayerInventoryState::alpha_defaults());
         ecs.world_mut().insert_resource(MiningState::default());
         let tool_reg = ToolRegistry::alpha_1_2_6();
 
