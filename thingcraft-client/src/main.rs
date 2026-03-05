@@ -1,6 +1,7 @@
 mod app;
 mod ecs;
 mod entity;
+mod gameplay;
 mod hud;
 mod inventory;
 mod lighting;
@@ -10,6 +11,7 @@ mod noise;
 mod renderer;
 mod streaming;
 mod time_step;
+mod tool;
 mod world;
 
 fn main() -> anyhow::Result<()> {

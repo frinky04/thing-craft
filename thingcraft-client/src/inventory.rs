@@ -1,4 +1,5 @@
 use winit::event::MouseButton;
+use bevy_ecs::prelude::Resource;
 
 pub const HOTBAR_SLOT_COUNT: usize = 9;
 pub const MAIN_SLOT_COUNT: usize = 27;
@@ -12,6 +13,7 @@ pub const HOTBAR_DEFAULT_BLOCK_IDS: [u8; HOTBAR_SLOT_COUNT] =
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ItemKey {
     Block(u8),
+    Tool(u16),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -32,9 +34,20 @@ impl ItemStack {
     }
 
     #[must_use]
+    pub fn tool(tool_id: u16) -> Self {
+        Self {
+            item: ItemKey::Tool(tool_id),
+            count: 1,
+            metadata: 0,
+        }
+    }
+
+    #[must_use]
     pub fn max_stack_size(self) -> u8 {
-        // Block-only for now; Alpha parity default.
-        64
+        match self.item {
+            ItemKey::Block(_) => 64,
+            ItemKey::Tool(_) => 1,
+        }
     }
 }
 
@@ -72,7 +85,7 @@ pub struct InventoryApplyResult {
     pub dropped_to_world: Vec<ItemStack>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Resource, Debug, Clone, Eq, PartialEq)]
 pub struct PlayerInventoryState {
     hotbar: [Option<ItemStack>; HOTBAR_SLOT_COUNT],
     main: [Option<ItemStack>; MAIN_SLOT_COUNT],
@@ -84,16 +97,26 @@ pub struct PlayerInventoryState {
 impl PlayerInventoryState {
     #[must_use]
     pub fn alpha_defaults() -> Self {
-        let hotbar = HOTBAR_DEFAULT_BLOCK_IDS.map(|block_id| {
-            if block_id == AIR_BLOCK_ID {
-                None
-            } else {
-                Some(ItemStack::block(block_id, 64))
+        let mut hotbar: [Option<ItemStack>; HOTBAR_SLOT_COUNT] = [None; HOTBAR_SLOT_COUNT];
+        for (i, &block_id) in HOTBAR_DEFAULT_BLOCK_IDS.iter().enumerate() {
+            if block_id != AIR_BLOCK_ID {
+                hotbar[i] = Some(ItemStack::block(block_id, 64));
             }
-        });
+        }
+        // Slot 4 (was AIR) gets a wooden pickaxe for testing.
+        hotbar[4] = Some(ItemStack::tool(270)); // Wooden Pickaxe
+
+        let mut main = [None; MAIN_SLOT_COUNT];
+        // Place a few representative tools in the main inventory for testing.
+        main[0] = Some(ItemStack::tool(275)); // Stone Axe
+        main[1] = Some(ItemStack::tool(256)); // Iron Shovel
+        main[2] = Some(ItemStack::tool(276)); // Diamond Sword
+        main[3] = Some(ItemStack::tool(274)); // Stone Pickaxe
+        main[4] = Some(ItemStack::tool(278)); // Diamond Pickaxe
+
         Self {
             hotbar,
-            main: [None; MAIN_SLOT_COUNT],
+            main,
             armor: [None; ARMOR_SLOT_COUNT],
             selected_hotbar: 0,
             cursor: None,
@@ -134,8 +157,33 @@ impl PlayerInventoryState {
         }
     }
 
-    pub fn try_add_block_pickup(&mut self, block_id: u8) -> bool {
-        self.try_add_stack(ItemStack::block(block_id, 1))
+    #[must_use]
+    pub fn selected_item_key(&self) -> Option<ItemKey> {
+        self.selected_stack().map(|s| s.item)
+    }
+
+    /// Apply durability damage to the selected hotbar tool. Returns true if state changed.
+    /// Looks up `max_damage` from the `ToolRegistry` to determine breakage.
+    pub fn damage_selected_tool(&mut self, amount: u16, tool_registry: &crate::tool::ToolRegistry) -> bool {
+        if amount == 0 {
+            return false;
+        }
+        let slot_idx = usize::from(
+            self.selected_hotbar.min((HOTBAR_SLOT_COUNT - 1) as u8),
+        );
+        if let Some(stack) = &mut self.hotbar[slot_idx] {
+            if let ItemKey::Tool(tool_id) = stack.item {
+                stack.metadata = stack.metadata.saturating_add(amount);
+                let max_damage = tool_registry
+                    .get(tool_id)
+                    .map_or(0, |def| def.max_damage);
+                if stack.metadata > max_damage {
+                    self.hotbar[slot_idx] = None;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     pub fn try_add_stack(&mut self, mut incoming: ItemStack) -> bool {

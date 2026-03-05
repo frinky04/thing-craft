@@ -19,6 +19,10 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
 use crate::ecs::EcsRuntime;
+use crate::gameplay::{
+    apply_post_block_break_effects, run_inventory_command_system, InventoryCommandQueue,
+    MiningState, MiningTarget, MiningToolKind,
+};
 use crate::hud;
 use crate::inventory::{hit_test_slot, InventoryCommand, ItemKey, PlayerInventoryState};
 use crate::mesh::{build_region_mesh, ChunkMesh, MeshVertex};
@@ -28,6 +32,7 @@ use crate::streaming::{
     ResidencyConfig,
 };
 use crate::time_step::FixedStepClock;
+use crate::tool::ToolRegistry;
 use crate::world::{
     BiomeSource, BlockRegistry, BootstrapWorld, ChunkPos, MaterialKind, CHUNK_DEPTH, CHUNK_HEIGHT,
     CHUNK_WIDTH,
@@ -54,7 +59,6 @@ const FLUID_URGENT_SLICE_MIN: usize = 16;
 const FLUID_URGENT_SLICE_DIVISOR: usize = 8;
 const DAY_TICKS: u64 = 24_000;
 const WORLD_SEED: u64 = 0xA126_0001;
-const ALPHA_MINING_COOLDOWN_TICKS: u8 = 5;
 const FIRE_BLOCK_ID: u8 = 51;
 const BENCH_MOVE_ASCEND_BLOCKS: f64 = 20.0;
 
@@ -68,55 +72,6 @@ struct BlockInteractionRequest {
 struct BlockRayHit {
     block: [i32; 3],
     normal: [i32; 3],
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct MiningTarget {
-    x: i32,
-    y: i32,
-    z: i32,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct MiningState {
-    target: Option<MiningTarget>,
-    progress: f32,
-    last_progress: f32,
-    ticks: f32,
-    cooldown_ticks: u8,
-}
-
-impl MiningState {
-    fn stop(&mut self) {
-        self.target = None;
-        self.progress = 0.0;
-        self.last_progress = 0.0;
-        self.ticks = 0.0;
-        self.cooldown_ticks = 0;
-    }
-
-    fn retarget(&mut self, target: MiningTarget) {
-        self.target = Some(target);
-        self.progress = 0.0;
-        self.last_progress = 0.0;
-        self.ticks = 0.0;
-    }
-
-    fn on_block_broken(&mut self) {
-        self.progress = 0.0;
-        self.last_progress = 0.0;
-        self.ticks = 0.0;
-        self.cooldown_ticks = ALPHA_MINING_COOLDOWN_TICKS;
-    }
-
-    fn render_progress(self, alpha: f32) -> f32 {
-        self.last_progress + (self.progress - self.last_progress) * alpha
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum MiningToolKind {
-    None,
 }
 
 #[derive(Debug, Default)]
@@ -192,7 +147,7 @@ struct AdaptiveFluidBudget {
 
 #[derive(Debug, Clone, Copy)]
 struct FirstPersonHandState {
-    shown_block_id: Option<u8>,
+    shown_item: Option<ItemKey>,
     hand_height: f32,
     last_hand_height: f32,
     attack_progress: f32,
@@ -204,7 +159,7 @@ struct FirstPersonHandState {
 impl Default for FirstPersonHandState {
     fn default() -> Self {
         Self {
-            shown_block_id: None,
+            shown_item: None,
             hand_height: 0.0,
             last_hand_height: 0.0,
             attack_progress: 0.0,
@@ -227,10 +182,10 @@ impl FirstPersonHandState {
         self.hand_height = 0.0;
     }
 
-    fn tick(&mut self, selected_block_id: Option<u8>) {
+    fn tick(&mut self, selected_item: Option<ItemKey>) {
         self.last_hand_height = self.hand_height;
         self.last_attack_progress = self.attack_progress;
-        let target = if selected_block_id == self.shown_block_id {
+        let target = if selected_item == self.shown_item {
             1.0
         } else {
             0.0
@@ -239,7 +194,7 @@ impl FirstPersonHandState {
         delta = delta.clamp(-0.4, 0.4);
         self.hand_height += delta;
         if self.hand_height < 0.1 {
-            self.shown_block_id = selected_block_id;
+            self.shown_item = selected_item;
         }
 
         if self.swing_active {
@@ -571,9 +526,19 @@ pub fn run() -> Result<()> {
     renderer.set_leaf_cutout_enabled(fancy_graphics);
 
     let mut ecs_runtime = EcsRuntime::new();
+    ecs_runtime
+        .world_mut()
+        .insert_resource(PlayerInventoryState::alpha_defaults());
+    ecs_runtime
+        .world_mut()
+        .insert_resource(MiningState::default());
+    ecs_runtime
+        .world_mut()
+        .insert_resource(InventoryCommandQueue::default());
     let fixed_config = ecs_runtime.fixed_tick_config();
     let mut fixed_clock = FixedStepClock::new(fixed_config.tick_hz, fixed_config.max_catchup_steps);
     let bootstrap_world = BootstrapWorld::alpha_bootstrap();
+    let tool_registry = ToolRegistry::alpha_1_2_6();
     let bootstrap_mesh =
         build_region_mesh(&bootstrap_world.spawn_region, &bootstrap_world.registry);
     renderer.set_scene_mesh(&bootstrap_mesh);
@@ -611,13 +576,10 @@ pub fn run() -> Result<()> {
     let mut left_mouse_held = false;
     let mut mining_swing_hold_ticks: u8 = 0;
     let mut mining_start_requested = false;
-    let mut mining_state = MiningState::default();
     let mut inventory_open = false;
     let mut mouse_screen_pos = [0.0_f32, 0.0_f32];
     let mut block_interaction_requests = VecDeque::new();
-    let mut inventory_commands: VecDeque<InventoryCommand> = VecDeque::new();
     let mut edit_latency_tracker = EditLatencyTracker::default();
-    let mut inventory_state = PlayerInventoryState::alpha_defaults();
     let mut first_person_hand = FirstPersonHandState::default();
     let mut hud_dirty = true;
     let mut sim_ticks: u64 = 0;
@@ -627,7 +589,11 @@ pub fn run() -> Result<()> {
     let mut fog_brightness = 1.0_f32;
     let base_fluid_tick_budget = resolve_fluid_tick_budget();
     let mut adaptive_fluid_budget = AdaptiveFluidBudget::new(base_fluid_tick_budget);
-    let selected_slot = inventory_state.selected_stack();
+    let selected_slot = ecs_runtime.world().resource::<PlayerInventoryState>().selected_stack();
+    let selected_hotbar = ecs_runtime
+        .world()
+        .resource::<PlayerInventoryState>()
+        .selected_hotbar;
 
     info!(
         tick_hz = fixed_config.tick_hz,
@@ -653,7 +619,7 @@ pub fn run() -> Result<()> {
         fluid_tick_budget_max = adaptive_fluid_budget.max(),
         fancy_graphics,
         bench_enabled = bench_config.enabled,
-        selected_hotbar_slot = usize::from(inventory_state.selected_hotbar) + 1,
+        selected_hotbar_slot = usize::from(selected_hotbar) + 1,
         selected_place_block = selected_slot.and_then(|stack| match stack.item {
             ItemKey::Block(id) if stack.count > 0 => Some(id),
             _ => None,
@@ -740,15 +706,17 @@ pub fn run() -> Result<()> {
                             &bootstrap_world.registry,
                         );
 
-                        let pre_inv = inventory_state.snapshot();
+                        let pre_inv = ecs_runtime
+                            .world()
+                            .resource::<PlayerInventoryState>()
+                            .snapshot();
 
-                        // Apply queued inventory commands in fixed tick (authoritative path).
-                        while let Some(cmd) = inventory_commands.pop_front() {
-                            let result = inventory_state.apply(cmd);
-                            if result.changed {
-                                hud_dirty = true;
-                            }
-                            if !result.dropped_to_world.is_empty() {
+                        // Inventory command fixed-step system: commands -> state change + drop events.
+                        let inventory_events = run_inventory_command_system(&mut ecs_runtime);
+                        if inventory_events.changed {
+                            hud_dirty = true;
+                        }
+                        if !inventory_events.dropped_to_world.is_empty() {
                                 let (drop_pos, drop_yaw, drop_pitch) = ecs_runtime
                                     .camera_snapshot()
                                     .map(|snapshot| {
@@ -764,26 +732,19 @@ pub fn run() -> Result<()> {
                                         )
                                     })
                                     .unwrap_or((DVec3::ZERO, 0.0, 0.0));
-                                for dropped in result.dropped_to_world {
-                                    let ItemKey::Block(block_id) = dropped.item;
-                                    for _ in 0..dropped.count {
-                                        crate::entity::spawn_player_dropped_item(
-                                            ecs_runtime.world_mut(),
-                                            block_id,
-                                            drop_pos,
-                                            drop_yaw,
-                                            drop_pitch,
-                                        );
-                                    }
+                                for dropped in inventory_events.dropped_to_world {
+                                    crate::entity::spawn_player_dropped_item_stack(
+                                        ecs_runtime.world_mut(),
+                                        dropped,
+                                        drop_pos,
+                                        drop_yaw,
+                                        drop_pitch,
+                                    );
                                 }
-                            }
                         }
 
                         // Item pickup (player walks over dropped items).
-                        if crate::entity::check_item_pickup(
-                            ecs_runtime.world_mut(),
-                            &mut inventory_state,
-                        ) {
+                        if crate::entity::check_item_pickup(ecs_runtime.world_mut()) {
                             hud_dirty = true;
                         }
 
@@ -791,7 +752,7 @@ pub fn run() -> Result<()> {
                             left_mouse_held = false;
                             mining_swing_hold_ticks = 0;
                             mining_start_requested = false;
-                            mining_state.stop();
+                            ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
                         }
 
                         if mining_start_requested {
@@ -799,8 +760,7 @@ pub fn run() -> Result<()> {
                                 &mut ecs_runtime,
                                 &mut chunk_streamer,
                                 &bootstrap_world.registry,
-                                &inventory_state,
-                                &mut mining_state,
+                                &tool_registry,
                                 &mut edit_latency_tracker,
                             ) {
                                 hud_dirty = true;
@@ -818,15 +778,14 @@ pub fn run() -> Result<()> {
                                 &mut ecs_runtime,
                                 &mut chunk_streamer,
                                 &bootstrap_world.registry,
-                                &inventory_state,
-                                &mut mining_state,
+                                &tool_registry,
                                 &mut edit_latency_tracker,
                             ) {
                                 hud_dirty = true;
                             }
                         } else {
                             mining_swing_hold_ticks = 0;
-                            mining_state.stop();
+                            ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
                         }
 
                         // Block interactions (place-only in this queue path).
@@ -836,13 +795,20 @@ pub fn run() -> Result<()> {
                             &mut chunk_streamer,
                             &mut block_interaction_requests,
                             &mut edit_latency_tracker,
-                            &mut inventory_state,
                         );
 
-                        if inventory_state.snapshot() != pre_inv {
+                        if ecs_runtime
+                            .world()
+                            .resource::<PlayerInventoryState>()
+                            .snapshot()
+                            != pre_inv
+                        {
                             hud_dirty = true;
                         }
-                        let selected_for_hand = inventory_state.selected_block_id();
+                        let selected_for_hand = ecs_runtime
+                            .world()
+                            .resource::<PlayerInventoryState>()
+                            .selected_item_key();
                         first_person_hand.tick(selected_for_hand);
                         if fluid_budget_remaining > 0 {
                             let ticks_left = usize::try_from(ticks_to_run - tick_index).unwrap_or(1);
@@ -927,15 +893,16 @@ pub fn run() -> Result<()> {
                     renderer.set_time_of_day(time_of_day);
                     if let Some(snapshot) = ecs_runtime.camera_snapshot() {
                         // Build entity sprite mesh for this frame.
-                        let entity_mesh = crate::entity::build_entity_sprite_mesh(
+                        let entity_meshes = crate::entity::build_entity_sprite_mesh(
                             ecs_runtime.world_mut(),
                             snapshot.interpolated.yaw,
                             &bootstrap_world.registry,
+                            &tool_registry,
                             &chunk_streamer,
                             ambient_darkness,
                             render_alpha,
                         );
-                        renderer.update_entity_sprites(&entity_mesh);
+                        renderer.update_entity_sprites(&entity_meshes.terrain, &entity_meshes.items);
 
                         let shadow_mesh = crate::entity::build_entity_shadow_mesh(
                             ecs_runtime.world_mut(),
@@ -1008,16 +975,20 @@ pub fn run() -> Result<()> {
                             ambient_darkness,
                         );
                         renderer.set_first_person_camera(hand_view_proj, hand_brightness);
-                        let held_block = first_person_hand.shown_block_id;
+                        let held_item = first_person_hand.shown_item;
                         let hand_item_mesh = build_first_person_item_mesh(
-                            held_block,
+                            held_item,
                             &bootstrap_world.registry,
+                            &tool_registry,
                             first_person_hand.equip_progress(render_alpha),
                             first_person_hand.attack_progress(render_alpha),
+                            snapshot.interpolated.yaw,
+                            snapshot.interpolated.pitch,
                         );
-                        renderer.update_first_person_item_mesh(&hand_item_mesh);
+                        let is_tool = matches!(held_item, Some(ItemKey::Tool(_)));
+                        renderer.update_first_person_item_mesh(&hand_item_mesh, is_tool);
                         let hand_arm_mesh = build_first_person_arm_mesh(
-                            held_block.is_none(),
+                            held_item.is_none(),
                             first_person_hand.equip_progress(render_alpha),
                             first_person_hand.attack_progress(render_alpha),
                         );
@@ -1044,7 +1015,9 @@ pub fn run() -> Result<()> {
                             |x, y, z| {
                                 let block_id = chunk_streamer.block_at_world(x, y, z)?;
                                 let allow_liquids =
-                                    selected_item_allows_liquid_targeting_stub(&inventory_state);
+                                    selected_item_allows_liquid_targeting_stub(
+                                        ecs_runtime.world().resource::<PlayerInventoryState>(),
+                                    );
                                 let metadata =
                                     chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
                                 let can_hit = is_raycast_targetable_block(
@@ -1057,6 +1030,7 @@ pub fn run() -> Result<()> {
                             },
                         );
                         renderer.set_block_outline(outline_hit.map(|h| h.block));
+                        let mining_state = *ecs_runtime.world().resource::<MiningState>();
                         let crack_target = mining_state.target.map(|t| [t.x, t.y, t.z]);
                         renderer.set_block_crack_overlay(
                             crack_target,
@@ -1110,22 +1084,17 @@ pub fn run() -> Result<()> {
                     // Build and upload HUD vertices only when state changes.
                     if hud_dirty {
                         let (sw, sh) = renderer.screen_size();
-                        let slot_counts: [u8; crate::inventory::HOTBAR_SLOT_COUNT] =
+                        let inventory_state = ecs_runtime.world().resource::<PlayerInventoryState>();
+                        let slot_items: [hud::HudSlotItem; crate::inventory::HOTBAR_SLOT_COUNT] =
                             std::array::from_fn(|i| {
-                                inventory_state.hotbar_stack(i).map_or(0, |stack| stack.count)
-                            });
-                        let slot_block_ids: [u8; crate::inventory::HOTBAR_SLOT_COUNT] =
-                            std::array::from_fn(|i| {
-                                inventory_state.hotbar_stack(i).map_or(AIR_BLOCK_ID, |stack| {
-                                    match stack.item {
-                                        ItemKey::Block(block_id) => block_id,
-                                    }
-                                })
+                                hud::hud_slot_item_from_stack(
+                                    inventory_state.hotbar_stack(i),
+                                    &tool_registry,
+                                )
                             });
                         let hud_state = hud::HudState {
                             selected_slot: usize::from(inventory_state.selected_hotbar),
-                            slot_counts,
-                            slot_block_ids,
+                            slot_items,
                             health: frame_camera.map_or(20, |snapshot| snapshot.vitals.health),
                             prev_health: frame_camera
                                 .map_or(20, |snapshot| snapshot.vitals.prev_health),
@@ -1163,6 +1132,7 @@ pub fn run() -> Result<()> {
                                 &inventory_state,
                                 mouse_screen_pos,
                                 &bootstrap_world.registry,
+                                &tool_registry,
                             );
                             hud_verts.append(&mut inventory_verts);
                         }
@@ -1311,11 +1281,16 @@ pub fn run() -> Result<()> {
                                 return;
                             }
                             if let Some(slot) = hotbar_slot_for_key(code) {
-                                inventory_commands.push_back(InventoryCommand::SelectHotbar {
-                                    index: slot as u8,
-                                });
+                                ecs_runtime
+                                    .world_mut()
+                                    .resource_mut::<InventoryCommandQueue>()
+                                    .pending
+                                    .push_back(InventoryCommand::SelectHotbar { index: slot as u8 });
                                 hud_dirty = true;
-                                let slot_state = inventory_state.hotbar_stack(slot);
+                                let slot_state = ecs_runtime
+                                    .world()
+                                    .resource::<PlayerInventoryState>()
+                                    .hotbar_stack(slot);
                                 let block_id = slot_state.and_then(|stack| match stack.item {
                                     ItemKey::Block(id) if stack.count > 0 => Some(id),
                                     _ => None,
@@ -1359,11 +1334,15 @@ pub fn run() -> Result<()> {
 
                         if code == KeyCode::Escape && is_pressed {
                             if inventory_open {
-                                inventory_commands.push_back(InventoryCommand::CloseInventory);
+                                ecs_runtime
+                                    .world_mut()
+                                    .resource_mut::<InventoryCommandQueue>()
+                                    .pending
+                                    .push_back(InventoryCommand::CloseInventory);
                                 inventory_open = false;
                                 left_mouse_held = false;
                                 mining_swing_hold_ticks = 0;
-                                mining_state.stop();
+                                ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
                                 if !ecs_runtime.player_is_dead() {
                                     mouse_captured = true;
                                     set_mouse_capture(window, true);
@@ -1372,7 +1351,7 @@ pub fn run() -> Result<()> {
                                 mouse_captured = false;
                                 left_mouse_held = false;
                                 mining_swing_hold_ticks = 0;
-                                mining_state.stop();
+                                ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
                                 set_mouse_capture(window, false);
                             }
                             hud_dirty = true;
@@ -1384,7 +1363,7 @@ pub fn run() -> Result<()> {
                                 mouse_captured = false;
                                 left_mouse_held = false;
                                 mining_swing_hold_ticks = 0;
-                                mining_state.stop();
+                                ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
                                 set_mouse_capture(window, false);
                                 ecs_runtime.clear_input_state();
                                 let size = window.inner_size();
@@ -1397,7 +1376,11 @@ pub fn run() -> Result<()> {
                                 }
                                 mouse_screen_pos = [center.x as f32, center.y as f32];
                             } else {
-                                inventory_commands.push_back(InventoryCommand::CloseInventory);
+                                ecs_runtime
+                                    .world_mut()
+                                    .resource_mut::<InventoryCommandQueue>()
+                                    .pending
+                                    .push_back(InventoryCommand::CloseInventory);
                                 if !ecs_runtime.player_is_dead() {
                                     mouse_captured = true;
                                     set_mouse_capture(window, true);
@@ -1430,14 +1413,22 @@ pub fn run() -> Result<()> {
                         if let Some(slot) =
                             hit_test_slot(mouse_screen_pos[0], mouse_screen_pos[1], sw, sh)
                         {
-                            inventory_commands.push_back(InventoryCommand::ClickSlot {
-                                slot,
-                                button: MouseButton::Left,
-                            });
+                            ecs_runtime
+                                .world_mut()
+                                .resource_mut::<InventoryCommandQueue>()
+                                .pending
+                                .push_back(InventoryCommand::ClickSlot {
+                                    slot,
+                                    button: MouseButton::Left,
+                                });
                         } else {
-                            inventory_commands.push_back(InventoryCommand::ClickOutside {
-                                button: MouseButton::Left,
-                            });
+                            ecs_runtime
+                                .world_mut()
+                                .resource_mut::<InventoryCommandQueue>()
+                                .pending
+                                .push_back(InventoryCommand::ClickOutside {
+                                    button: MouseButton::Left,
+                                });
                         }
                         hud_dirty = true;
                         return;
@@ -1463,7 +1454,7 @@ pub fn run() -> Result<()> {
                     left_mouse_held = false;
                     mining_swing_hold_ticks = 0;
                     mining_start_requested = false;
-                    mining_state.stop();
+                    ecs_runtime.world_mut().resource_mut::<MiningState>().stop();
                 }
                 WindowEvent::MouseInput {
                     button: MouseButton::Right,
@@ -1481,14 +1472,22 @@ pub fn run() -> Result<()> {
                         if let Some(slot) =
                             hit_test_slot(mouse_screen_pos[0], mouse_screen_pos[1], sw, sh)
                         {
-                            inventory_commands.push_back(InventoryCommand::ClickSlot {
-                                slot,
-                                button: MouseButton::Right,
-                            });
+                            ecs_runtime
+                                .world_mut()
+                                .resource_mut::<InventoryCommandQueue>()
+                                .pending
+                                .push_back(InventoryCommand::ClickSlot {
+                                    slot,
+                                    button: MouseButton::Right,
+                                });
                         } else {
-                            inventory_commands.push_back(InventoryCommand::ClickOutside {
-                                button: MouseButton::Right,
-                            });
+                            ecs_runtime
+                                .world_mut()
+                                .resource_mut::<InventoryCommandQueue>()
+                                .pending
+                                .push_back(InventoryCommand::ClickOutside {
+                                    button: MouseButton::Right,
+                                });
                         }
                         hud_dirty = true;
                         return;
@@ -1500,7 +1499,6 @@ pub fn run() -> Result<()> {
                         &mut ecs_runtime,
                         &chunk_streamer,
                         &bootstrap_world.registry,
-                        &inventory_state,
                         &mut block_interaction_requests,
                     ) {
                         first_person_hand.trigger_swing();
@@ -1519,9 +1517,13 @@ pub fn run() -> Result<()> {
                         winit::event::MouseScrollDelta::PixelDelta(p) => p.y as i32,
                     };
                     if amount != 0 {
-                        inventory_commands.push_back(InventoryCommand::ScrollHotbar {
-                            delta: amount.signum() as i8,
-                        });
+                        ecs_runtime
+                            .world_mut()
+                            .resource_mut::<InventoryCommandQueue>()
+                            .pending
+                            .push_back(InventoryCommand::ScrollHotbar {
+                                delta: amount.signum() as i8,
+                            });
                         hud_dirty = true;
                     }
                 }
@@ -1716,7 +1718,8 @@ fn alpha_break_block_and_collect_drop(
     block_y: i32,
     block_z: i32,
     edit_latency_tracker: &mut EditLatencyTracker,
-) -> Option<(u8, DVec3)> {
+    can_harvest: bool,
+) -> Option<Option<(u8, DVec3)>> {
     let broken_block_id = chunk_streamer
         .block_at_world(block_x, block_y, block_z)
         .unwrap_or(AIR_BLOCK_ID);
@@ -1727,73 +1730,117 @@ fn alpha_break_block_and_collect_drop(
         return None;
     }
     edit_latency_tracker.record_block_edit(block_x, block_z);
+    if !can_harvest {
+        return Some(None);
+    }
     let drop_block_id = chunk_streamer.dropped_item_block_id(broken_block_id)?;
     let spawn_pos = DVec3::new(
         block_x as f64 + 0.5,
         block_y as f64 + 0.5,
         block_z as f64 + 0.5,
     );
-    Some((drop_block_id, spawn_pos))
+    Some(Some((drop_block_id, spawn_pos)))
 }
 
-fn resolve_mining_tool_stub(_inventory: &PlayerInventoryState) -> MiningToolKind {
-    // TODO(alpha-tools): map selected stack to actual Alpha tool classes once tools are implemented.
-    MiningToolKind::None
+fn resolve_mining_tool(
+    inventory: &PlayerInventoryState,
+    tool_registry: &ToolRegistry,
+) -> MiningToolKind {
+    match inventory.selected_item_key() {
+        Some(ItemKey::Tool(id)) if tool_registry.get(id).is_some() => MiningToolKind::Tool(id),
+        _ => MiningToolKind::None,
+    }
 }
 
-fn alpha_tool_mining_speed_stub(_tool: MiningToolKind, _block_id: u8) -> Option<f32> {
-    // TODO(alpha-tools): return tool class/tier mining speed multiplier.
-    None
+fn alpha_tool_mining_speed(
+    tool: MiningToolKind,
+    block_id: u8,
+    tool_registry: &ToolRegistry,
+    block_registry: &BlockRegistry,
+) -> f32 {
+    match tool {
+        MiningToolKind::Tool(id) => {
+            if let Some(def) = tool_registry.get(id) {
+                tool_registry.mining_speed_for_block(def, block_id, block_registry)
+            } else {
+                1.0
+            }
+        }
+        MiningToolKind::None => 1.0,
+    }
 }
 
-fn alpha_can_harvest_block_stub(_tool: MiningToolKind, _block_id: u8) -> Option<bool> {
-    // TODO(alpha-tools): return harvest gate for pickaxe tier/material-sensitive blocks.
-    None
+fn alpha_can_harvest_block(
+    tool: MiningToolKind,
+    block_id: u8,
+    tool_registry: &ToolRegistry,
+    block_registry: &BlockRegistry,
+) -> bool {
+    match tool {
+        MiningToolKind::Tool(id) => {
+            if let Some(def) = tool_registry.get(id) {
+                tool_registry.can_harvest(def, block_id, block_registry)
+            } else {
+                crate::tool::hand_can_harvest(block_id, block_registry)
+            }
+        }
+        MiningToolKind::None => crate::tool::hand_can_harvest(block_id, block_registry),
+    }
 }
 
-fn alpha_block_mining_progress_per_tick(
+struct MiningCalc {
+    progress_per_tick: f32,
+    tool: MiningToolKind,
+    can_harvest: bool,
+}
+
+fn alpha_block_mining_calc(
     registry: &BlockRegistry,
     block_id: u8,
     inventory: &PlayerInventoryState,
+    tool_registry: &ToolRegistry,
     player_on_ground: bool,
     player_in_water: bool,
-) -> f32 {
+) -> MiningCalc {
     let mining_time = registry.mining_hardness_of(block_id);
-    if mining_time < 0.0 {
-        return 0.0;
-    }
-    if mining_time == 0.0 {
-        return f32::INFINITY;
-    }
+    let tool = resolve_mining_tool(inventory, tool_registry);
+    let can_harvest = alpha_can_harvest_block(tool, block_id, tool_registry, registry);
 
-    let tool = resolve_mining_tool_stub(inventory);
-    let can_harvest = alpha_can_harvest_block_stub(tool, block_id).unwrap_or(true);
-    if !can_harvest {
-        return 1.0 / mining_time / 100.0;
-    }
+    let progress_per_tick = if mining_time < 0.0 {
+        0.0
+    } else if mining_time == 0.0 {
+        f32::INFINITY
+    } else if !can_harvest {
+        1.0 / mining_time / 100.0
+    } else {
+        let mut player_speed = alpha_tool_mining_speed(tool, block_id, tool_registry, registry);
+        if player_in_water {
+            player_speed /= 5.0;
+        }
+        if !player_on_ground {
+            player_speed /= 5.0;
+        }
+        player_speed / mining_time / 30.0
+    };
 
-    let mut player_speed = alpha_tool_mining_speed_stub(tool, block_id).unwrap_or(1.0);
-    if player_in_water {
-        player_speed /= 5.0;
+    MiningCalc {
+        progress_per_tick,
+        tool,
+        can_harvest,
     }
-    if !player_on_ground {
-        player_speed /= 5.0;
-    }
-    player_speed / mining_time / 30.0
 }
 
 fn try_start_block_mining(
     ecs_runtime: &mut EcsRuntime,
     chunk_streamer: &mut ChunkStreamer,
     registry: &BlockRegistry,
-    inventory: &PlayerInventoryState,
-    mining_state: &mut MiningState,
+    tool_registry: &ToolRegistry,
     edit_latency_tracker: &mut EditLatencyTracker,
 ) -> bool {
     let Some(target) = raycast_current_mining_target(ecs_runtime, chunk_streamer, registry) else {
         return false;
     };
-    if mining_state.progress != 0.0 {
+    if ecs_runtime.world().resource::<MiningState>().progress != 0.0 {
         return false;
     }
 
@@ -1803,23 +1850,30 @@ fn try_start_block_mining(
     let block_id = chunk_streamer
         .block_at_world(target.x, target.y, target.z)
         .unwrap_or(AIR_BLOCK_ID);
-    let speed = alpha_block_mining_progress_per_tick(
-        registry,
-        block_id,
-        inventory,
-        snapshot.physics.on_ground,
-        snapshot.physics.in_water,
-    );
-    if speed >= 1.0 {
-        if let Some((drop_block_id, spawn_pos)) = alpha_break_block_and_collect_drop(
+    let calc = {
+        let inventory = ecs_runtime.world().resource::<PlayerInventoryState>();
+        alpha_block_mining_calc(
+            registry,
+            block_id,
+            inventory,
+            tool_registry,
+            snapshot.physics.on_ground,
+            snapshot.physics.in_water,
+        )
+    };
+    if calc.progress_per_tick >= 1.0 {
+        if let Some(drop) = alpha_break_block_and_collect_drop(
             chunk_streamer,
             target.x,
             target.y,
             target.z,
             edit_latency_tracker,
+            calc.can_harvest,
         ) {
-            crate::entity::spawn_dropped_item(ecs_runtime.world_mut(), drop_block_id, spawn_pos);
-            mining_state.on_block_broken();
+            if let Some((drop_block_id, spawn_pos)) = drop {
+                crate::entity::spawn_dropped_item(ecs_runtime.world_mut(), drop_block_id, spawn_pos);
+            }
+            apply_post_block_break_effects(ecs_runtime, tool_registry, calc.tool);
             return true;
         }
     }
@@ -1830,24 +1884,27 @@ fn tick_block_mining(
     ecs_runtime: &mut EcsRuntime,
     chunk_streamer: &mut ChunkStreamer,
     registry: &BlockRegistry,
-    inventory: &PlayerInventoryState,
-    mining_state: &mut MiningState,
+    tool_registry: &ToolRegistry,
     edit_latency_tracker: &mut EditLatencyTracker,
 ) -> bool {
+    let mut mining_state = *ecs_runtime.world().resource::<MiningState>();
     mining_state.last_progress = mining_state.progress;
     if mining_state.cooldown_ticks > 0 {
         mining_state.cooldown_ticks = mining_state.cooldown_ticks.saturating_sub(1);
+        *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
         return false;
     }
 
     let Some(target) = raycast_current_mining_target(ecs_runtime, chunk_streamer, registry) else {
         mining_state.stop();
+        *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
         return false;
     };
 
     let is_same_target = mining_state.target.is_some_and(|old| old == target);
     if !is_same_target {
         mining_state.retarget(target);
+        *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
         return false;
     }
 
@@ -1859,33 +1916,45 @@ fn tick_block_mining(
         .unwrap_or(AIR_BLOCK_ID);
     if block_id == AIR_BLOCK_ID {
         mining_state.stop();
+        *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
         return false;
     }
 
-    mining_state.progress += alpha_block_mining_progress_per_tick(
-        registry,
-        block_id,
-        inventory,
-        snapshot.physics.on_ground,
-        snapshot.physics.in_water,
-    );
+    let calc = {
+        let inventory = ecs_runtime.world().resource::<PlayerInventoryState>();
+        alpha_block_mining_calc(
+            registry,
+            block_id,
+            inventory,
+            tool_registry,
+            snapshot.physics.on_ground,
+            snapshot.physics.in_water,
+        )
+    };
+    mining_state.progress += calc.progress_per_tick;
     mining_state.ticks += 1.0;
     if mining_state.progress < 1.0 {
+        *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
         return false;
     }
 
-    if let Some((drop_block_id, spawn_pos)) = alpha_break_block_and_collect_drop(
+    if let Some(drop) = alpha_break_block_and_collect_drop(
         chunk_streamer,
         target.x,
         target.y,
         target.z,
         edit_latency_tracker,
+        calc.can_harvest,
     ) {
-        crate::entity::spawn_dropped_item(ecs_runtime.world_mut(), drop_block_id, spawn_pos);
-        mining_state.on_block_broken();
+        if let Some((drop_block_id, spawn_pos)) = drop {
+            crate::entity::spawn_dropped_item(ecs_runtime.world_mut(), drop_block_id, spawn_pos);
+        }
+        *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
+        apply_post_block_break_effects(ecs_runtime, tool_registry, calc.tool);
         return true;
     }
 
+    *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
     false
 }
 
@@ -1893,10 +1962,11 @@ fn enqueue_block_interaction_request(
     ecs_runtime: &mut EcsRuntime,
     chunk_streamer: &ChunkStreamer,
     registry: &BlockRegistry,
-    inventory: &PlayerInventoryState,
     queue: &mut VecDeque<BlockInteractionRequest>,
 ) -> bool {
-    let allow_liquids = selected_item_allows_liquid_targeting_stub(inventory);
+    let allow_liquids = selected_item_allows_liquid_targeting_stub(
+        ecs_runtime.world().resource::<PlayerInventoryState>(),
+    );
     if raycast_interaction_target(ecs_runtime, chunk_streamer, registry, allow_liquids).is_none() {
         return false;
     }
@@ -2005,7 +2075,6 @@ fn process_block_interaction_requests(
     chunk_streamer: &mut ChunkStreamer,
     queue: &mut VecDeque<BlockInteractionRequest>,
     edit_latency_tracker: &mut EditLatencyTracker,
-    inventory: &mut PlayerInventoryState,
 ) {
     while let Some(request) = queue.pop_front() {
         process_single_block_interaction_request(
@@ -2014,7 +2083,6 @@ fn process_block_interaction_requests(
             chunk_streamer,
             request,
             edit_latency_tracker,
-            inventory,
         );
     }
 }
@@ -2025,9 +2093,14 @@ fn process_single_block_interaction_request(
     chunk_streamer: &mut ChunkStreamer,
     request: BlockInteractionRequest,
     edit_latency_tracker: &mut EditLatencyTracker,
-    inventory: &mut PlayerInventoryState,
 ) {
-    let allow_liquids = selected_item_allows_liquid_targeting_stub(inventory);
+    let (allow_liquids, selected_block_id) = {
+        let inventory = ecs_runtime.world().resource::<PlayerInventoryState>();
+        (
+            selected_item_allows_liquid_targeting_stub(inventory),
+            inventory.selected_block_id(),
+        )
+    };
     let Some(hit) = raycast_first_solid_block(
         request.origin,
         request.direction,
@@ -2049,7 +2122,7 @@ fn process_single_block_interaction_request(
     if hit.normal == [0, 0, 0] {
         return;
     }
-    let Some(block_id) = inventory.selected_block_id() else {
+    let Some(block_id) = selected_block_id else {
         return;
     };
     let target_block_id = chunk_streamer
@@ -2081,7 +2154,10 @@ fn process_single_block_interaction_request(
         || can_replace_block_for_placement(registry, place_target_block))
         && chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id)
     {
-        let _ = inventory.apply(InventoryCommand::ConsumeSelected { amount: 1 });
+        let _ = ecs_runtime
+            .world_mut()
+            .resource_mut::<PlayerInventoryState>()
+            .apply(InventoryCommand::ConsumeSelected { amount: 1 });
         edit_latency_tracker.record_block_edit(place_x, place_z);
     }
 }
@@ -2599,17 +2675,210 @@ fn alpha_is_eye_submerged_in_material(
 }
 
 fn build_first_person_item_mesh(
-    held_block: Option<u8>,
+    held_item: Option<ItemKey>,
+    registry: &BlockRegistry,
+    tool_registry: &ToolRegistry,
+    equip_progress: f32,
+    attack_progress: f32,
+    view_yaw: f32,
+    view_pitch: f32,
+) -> ChunkMesh {
+    let Some(item_key) = held_item else {
+        return ChunkMesh::default();
+    };
+
+    match item_key {
+        ItemKey::Tool(id) => {
+            return build_first_person_tool_mesh(
+                id,
+                tool_registry,
+                equip_progress,
+                attack_progress,
+                view_yaw,
+                view_pitch,
+            );
+        }
+        ItemKey::Block(block_id) => {
+            if !registry.is_defined_block(block_id) {
+                return ChunkMesh::default();
+            }
+            return build_first_person_block_mesh(block_id, registry, equip_progress, attack_progress);
+        }
+    }
+}
+
+/// Build a "thick sprite" mesh for a held tool, matching Alpha's
+/// `ItemInHandRenderer.render()`.  The sprite gets front/back faces and
+/// per-pixel-column edge quads that give it visible 3-D depth.
+fn build_first_person_tool_mesh(
+    tool_id: u16,
+    tool_registry: &ToolRegistry,
+    equip_progress: f32,
+    attack_progress: f32,
+    view_yaw: f32,
+    view_pitch: f32,
+) -> ChunkMesh {
+    let Some(def) = tool_registry.get(tool_id) else {
+        return ChunkMesh::default();
+    };
+    let mut mesh = ChunkMesh::default();
+
+    // Alpha ItemInHandRenderer.render() lines 58-66:
+    //   translate(-k, -l, 0)  where k=0, l=0.3
+    //   scale(1.5)
+    //   rotateY(50)
+    //   rotateZ(335)
+    //   translate(-0.9375, -0.0625, 0)
+    // These are applied inside the common hand transform (after scale(0.4)).
+    let common = alpha_first_person_item_transform(equip_progress, attack_progress);
+    let model = common
+        * Mat4::from_translation(Vec3::new(0.0, -0.3, 0.0))
+        * Mat4::from_scale(Vec3::splat(1.5))
+        * Mat4::from_rotation_y(50.0_f32.to_radians())
+        * Mat4::from_rotation_z(335.0_f32.to_radians())
+        * Mat4::from_translation(Vec3::new(-0.9375, -0.0625, 0.0));
+
+    // UV coordinates matching Alpha (lines 53-56).
+    // Alpha uses: f = left_u, g = right_u (reversed from usual naming).
+    // In Alpha: g = (sprite%16*16 + 0) / 256;  f = (sprite%16*16 + 15.99) / 256
+    //           h = (sprite/16*16 + 0) / 256;   i = (sprite/16*16 + 15.99) / 256
+    let col = def.sprite_index % 16;
+    let row = def.sprite_index / 16;
+    let u_left  = (col as f32 * 16.0) / 256.0;              // Alpha 'f' (actually left)
+    let u_right = (col as f32 * 16.0 + 15.99) / 256.0;      // Alpha 'g' (actually right)
+    let v_top   = (row as f32 * 16.0) / 256.0;              // Alpha 'h'
+    let v_bot   = (row as f32 * 16.0 + 15.99) / 256.0;      // Alpha 'i'
+
+    // Map to Alpha variable names exactly:
+    //   f = left U,  g = right U,  h = top V,  i = bottom V
+    // The front face uses (g,i) at x=0 and (f,i) at x=j, so the sprite
+    // appears horizontally mirrored — matching Alpha behaviour.
+    let (f, g, h, i) = (u_left, u_right, v_top, v_bot);
+
+    let n = 0.0625_f32; // thickness = 1/16 block
+    let j = 1.0_f32;    // width
+    let light = [15_u8, 15, 255, 0];
+
+    // Alpha ItemInHandRenderer.renderHand():
+    //   glRotatef(playerPitch, 1,0,0); glRotatef(playerYaw, 0,1,0); Lighting.turnOn();
+    // The light directions are transformed by those camera rotations, so held
+    // item shading shifts as the player looks around.
+    let light_rotation =
+        Mat4::from_rotation_x(view_pitch) * Mat4::from_rotation_y(view_yaw);
+    // Alpha Lighting.turnOn() uses OpenGL fixed-function lighting with:
+    // ambient = 0.4, two diffuse lights at 0.6 each.
+    let light0 = light_rotation
+        .transform_vector3(Vec3::new(0.2, 1.0, -0.7))
+        .normalize_or_zero();
+    let light1 = light_rotation
+        .transform_vector3(Vec3::new(-0.2, 1.0, 0.7))
+        .normalize_or_zero();
+    let alpha_lit_tint = |local_normal: Vec3| -> [u8; 4] {
+        let n = model.transform_vector3(local_normal).normalize_or_zero();
+        let brightness = (0.4 + 0.6 * n.dot(light0).max(0.0) + 0.6 * n.dot(light1).max(0.0))
+            .clamp(0.0, 1.0);
+        let c = (brightness * 255.0).round() as u8;
+        [c, c, c, 255]
+    };
+
+    // Helper: push one quad (4 verts + 6 indices) through the model transform.
+    let push_quad = |mesh: &mut ChunkMesh,
+                         corners: [[f32; 3]; 4],
+                         uvs: [[f32; 2]; 4],
+                         tint_rgba: [u8; 4]| {
+        let base = mesh.vertices.len() as u32;
+        for idx in 0..4 {
+            let p = model.transform_point3(Vec3::from_array(corners[idx]));
+            mesh.vertices.push(MeshVertex {
+                position: [p.x, p.y, p.z],
+                uv: uvs[idx],
+                tint_rgba,
+                light_data: light,
+            });
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+
+    // Front face (z=0), normal +Z.  Alpha lines 69-73.
+    push_quad(
+        &mut mesh,
+        [[0.0, 0.0, 0.0], [j, 0.0, 0.0], [j, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        [[g, i], [f, i], [f, h], [g, h]],
+        alpha_lit_tint(Vec3::Z),
+    );
+
+    // Back face (z=-n), normal -Z.  Alpha lines 76-80.
+    push_quad(
+        &mut mesh,
+        [[0.0, 1.0, -n], [j, 1.0, -n], [j, 0.0, -n], [0.0, 0.0, -n]],
+        [[g, h], [f, h], [f, i], [g, i]],
+        alpha_lit_tint(-Vec3::Z),
+    );
+
+    // Left edge quads (normal -X).  Alpha lines 83-92.
+    // 16 thin vertical quads, one per pixel column.
+    let bleed = 0.001953125_f32; // 1/512 texel bleed guard
+    for col_i in 0..16_u32 {
+        let p = col_i as f32 / 16.0;
+        let t = g + (f - g) * p - bleed;
+        let x = j * p;
+        push_quad(
+            &mut mesh,
+            [[x, 0.0, -n], [x, 0.0, 0.0], [x, 1.0, 0.0], [x, 1.0, -n]],
+            [[t, i], [t, i], [t, h], [t, h]],
+            alpha_lit_tint(-Vec3::X),
+        );
+    }
+
+    // Right edge quads (normal +X).  Alpha lines 95-104.
+    for col_i in 0..16_u32 {
+        let q = col_i as f32 / 16.0;
+        let u = g + (f - g) * q - bleed;
+        let y = j * q + 0.0625;
+        push_quad(
+            &mut mesh,
+            [[y, 1.0, -n], [y, 1.0, 0.0], [y, 0.0, 0.0], [y, 0.0, -n]],
+            [[u, h], [u, h], [u, i], [u, i]],
+            alpha_lit_tint(Vec3::X),
+        );
+    }
+
+    // Top edge quads (normal +Y).  Alpha lines 107-116.
+    for row_i in 0..16_u32 {
+        let r = row_i as f32 / 16.0;
+        let v = i + (h - i) * r - bleed;
+        let z = j * r + 0.0625;
+        push_quad(
+            &mut mesh,
+            [[0.0, z, 0.0], [j, z, 0.0], [j, z, -n], [0.0, z, -n]],
+            [[g, v], [f, v], [f, v], [g, v]],
+            alpha_lit_tint(Vec3::Y),
+        );
+    }
+
+    // Bottom edge quads (normal -Y).  Alpha lines 119-128.
+    for row_i in 0..16_u32 {
+        let s = row_i as f32 / 16.0;
+        let w = i + (h - i) * s - bleed;
+        let aa = j * s;
+        push_quad(
+            &mut mesh,
+            [[j, aa, 0.0], [0.0, aa, 0.0], [0.0, aa, -n], [j, aa, -n]],
+            [[f, w], [g, w], [g, w], [f, w]],
+            alpha_lit_tint(-Vec3::Y),
+        );
+    }
+
+    mesh
+}
+
+fn build_first_person_block_mesh(
+    block_id: u8,
     registry: &BlockRegistry,
     equip_progress: f32,
     attack_progress: f32,
 ) -> ChunkMesh {
-    let Some(block_id) = held_block else {
-        return ChunkMesh::default();
-    };
-    if !registry.is_defined_block(block_id) {
-        return ChunkMesh::default();
-    }
 
     let mut mesh = ChunkMesh::default();
     let model = alpha_first_person_item_transform(equip_progress, attack_progress);
@@ -3460,15 +3729,21 @@ mod tests {
 
     use super::{
         affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
-        alpha_block_mining_progress_per_tick, alpha_brightness_from_light_level,
-        alpha_fog_brightness_target, alpha_star_brightness, alpha_sunrise_color, alpha_time_of_day,
-        can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
-        is_raycast_targetable_block, parse_env_bool, parse_env_u32, placement_intersects_player,
-        raycast_first_solid_block, resolve_axis, AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID,
+        alpha_block_mining_calc, alpha_brightness_from_light_level,
+        alpha_fog_brightness_target, alpha_star_brightness, alpha_sunrise_color,
+        alpha_time_of_day, has_target_directive, hotbar_slot_for_key,
+        can_replace_block_for_placement, is_raycast_targetable_block, parse_env_bool,
+        parse_env_u32, placement_intersects_player, raycast_first_solid_block,
+        resolve_axis, AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID,
     };
     use crate::ecs::EcsRuntime;
-    use crate::inventory::PlayerInventoryState;
+    use crate::gameplay::{
+        apply_post_block_break_effects, run_inventory_command_system, InventoryCommandQueue,
+        MiningState, MiningToolKind, ALPHA_MINING_COOLDOWN_TICKS,
+    };
+    use crate::inventory::{InventoryCommand, ItemStack, PlayerInventoryState};
     use crate::streaming::{ChunkStreamer, ResidencyConfig};
+    use crate::tool::ToolRegistry;
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
 
     #[test]
@@ -3532,23 +3807,89 @@ mod tests {
     fn alpha_mining_progress_matches_hand_stone_rate() {
         let inv = PlayerInventoryState::alpha_defaults();
         let registry = BlockRegistry::alpha_1_2_6();
-        let per_tick = alpha_block_mining_progress_per_tick(
-            &registry, 1, // stone
-            &inv, true, false,
-        );
-        // 1.0 / 1.5 / 30.0
-        assert!((per_tick - (1.0 / 45.0)).abs() < 1e-6);
+        let tool_reg = ToolRegistry::alpha_1_2_6();
+        let calc = alpha_block_mining_calc(&registry, 1, &inv, &tool_reg, true, false);
+        // Hand cannot harvest stone, so penalty path: 1.0 / 1.5 / 100.0
+        assert!((calc.progress_per_tick - (1.0 / 1.5 / 100.0)).abs() < 1e-6);
     }
 
     #[test]
     fn alpha_mining_progress_applies_water_and_airborne_penalties() {
         let inv = PlayerInventoryState::alpha_defaults();
         let registry = BlockRegistry::alpha_1_2_6();
-        let grounded = alpha_block_mining_progress_per_tick(&registry, 3, &inv, true, false);
-        let in_water = alpha_block_mining_progress_per_tick(&registry, 3, &inv, true, true);
-        let airborne = alpha_block_mining_progress_per_tick(&registry, 3, &inv, false, false);
+        let tool_reg = ToolRegistry::alpha_1_2_6();
+        let grounded = alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, true, false).progress_per_tick;
+        let in_water = alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, true, true).progress_per_tick;
+        let airborne = alpha_block_mining_calc(&registry, 3, &inv, &tool_reg, false, false).progress_per_tick;
         assert!((in_water - grounded / 5.0).abs() < 1e-6);
         assert!((airborne - grounded / 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn inventory_command_system_drains_queue_and_emits_drop_events() {
+        let mut ecs = EcsRuntime::new();
+        ecs.world_mut().insert_resource(PlayerInventoryState::alpha_defaults());
+        ecs.world_mut().insert_resource(InventoryCommandQueue::default());
+        ecs.world_mut()
+            .resource_mut::<PlayerInventoryState>()
+            .cursor = Some(ItemStack::tool(270));
+        ecs.world_mut()
+            .resource_mut::<InventoryCommandQueue>()
+            .pending
+            .push_back(InventoryCommand::CloseInventory);
+
+        let events = run_inventory_command_system(&mut ecs);
+
+        assert!(events.changed);
+        assert_eq!(events.dropped_to_world, vec![ItemStack::tool(270)]);
+        assert!(ecs
+            .world()
+            .resource::<InventoryCommandQueue>()
+            .pending
+            .is_empty());
+    }
+
+    #[test]
+    fn instant_break_consumes_tool_durability() {
+        let mut ecs = EcsRuntime::new();
+        ecs.world_mut().insert_resource(PlayerInventoryState::alpha_defaults());
+        ecs.world_mut().insert_resource(MiningState::default());
+        let _ = ecs
+            .world_mut()
+            .resource_mut::<PlayerInventoryState>()
+            .apply(InventoryCommand::SelectHotbar { index: 4 });
+        let tool_reg = ToolRegistry::alpha_1_2_6();
+        let before = ecs
+            .world()
+            .resource::<PlayerInventoryState>()
+            .selected_stack()
+            .expect("selected tool")
+            .metadata;
+
+        apply_post_block_break_effects(&mut ecs, &tool_reg, MiningToolKind::Tool(270));
+
+        let mining_state = *ecs.world().resource::<MiningState>();
+        let after = ecs
+            .world()
+            .resource::<PlayerInventoryState>()
+            .selected_stack()
+            .expect("selected tool")
+            .metadata;
+        assert_eq!(mining_state.cooldown_ticks, ALPHA_MINING_COOLDOWN_TICKS);
+        assert!(after > before);
+    }
+
+    #[test]
+    fn non_harvest_break_still_applies_mining_cooldown() {
+        let mut ecs = EcsRuntime::new();
+        ecs.world_mut().insert_resource(PlayerInventoryState::alpha_defaults());
+        ecs.world_mut().insert_resource(MiningState::default());
+        let tool_reg = ToolRegistry::alpha_1_2_6();
+
+        apply_post_block_break_effects(&mut ecs, &tool_reg, MiningToolKind::None);
+
+        let mining_state = *ecs.world().resource::<MiningState>();
+        assert_eq!(mining_state.cooldown_ticks, ALPHA_MINING_COOLDOWN_TICKS);
     }
 
     #[test]

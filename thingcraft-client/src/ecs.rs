@@ -491,6 +491,11 @@ impl EcsRuntime {
         &mut self.world
     }
 
+    /// Read-only access to ECS world resources/state.
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
     #[cfg(test)]
     pub fn queued_commands_len(&self) -> usize {
         self.world.resource::<SimCommandQueue>().0.len()
