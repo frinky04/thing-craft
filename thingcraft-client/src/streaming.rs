@@ -26,6 +26,20 @@ const COBBLESTONE_ID: u8 = 4;
 const OBSIDIAN_ID: u8 = 49;
 const LIQUID_BLOCKING_IDS: [u8; 5] = [64, 71, 63, 65, 83];
 
+#[cfg(feature = "tracy")]
+macro_rules! streaming_tick_span {
+    ($name:literal) => {
+        Some(tracing::info_span!($name).entered())
+    };
+}
+
+#[cfg(not(feature = "tracy"))]
+macro_rules! streaming_tick_span {
+    ($name:literal) => {
+        None::<()>
+    };
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
 struct FluidCell {
     x: i32,
@@ -703,41 +717,41 @@ impl ChunkStreamer {
     }
 
     pub fn tick(&mut self, center_chunk: ChunkPos) {
-        let _tick_span = tracing::info_span!("streaming.tick").entered();
+        let _tick_span = streaming_tick_span!("streaming.tick");
         {
-            let _span = tracing::info_span!("streaming.refresh_required_set").entered();
+            let _span = streaming_tick_span!("streaming.refresh_required_set");
             self.refresh_required_set(center_chunk);
         }
         {
-            let _span = tracing::info_span!("streaming.poll_generation_results").entered();
+            let _span = streaming_tick_span!("streaming.poll_generation_results");
             self.poll_generation_results();
         }
         {
-            let _span = tracing::info_span!("streaming.poll_lighting_results").entered();
+            let _span = streaming_tick_span!("streaming.poll_lighting_results");
             self.poll_lighting_results();
         }
         {
-            let _span = tracing::info_span!("streaming.poll_meshing_results").entered();
+            let _span = streaming_tick_span!("streaming.poll_meshing_results");
             self.poll_meshing_results();
         }
         {
-            let _span = tracing::info_span!("streaming.dispatch_lighting").entered();
+            let _span = streaming_tick_span!("streaming.dispatch_lighting");
             self.dispatch_lighting(center_chunk);
         }
         {
-            let _span = tracing::info_span!("streaming.dispatch_meshing").entered();
+            let _span = streaming_tick_span!("streaming.dispatch_meshing");
             self.dispatch_meshing(center_chunk);
         }
         {
-            let _span = tracing::info_span!("streaming.dispatch_generation").entered();
+            let _span = streaming_tick_span!("streaming.dispatch_generation");
             self.dispatch_generation(center_chunk);
         }
         {
-            let _span = tracing::info_span!("streaming.flush_render_uploads").entered();
+            let _span = streaming_tick_span!("streaming.flush_render_uploads");
             self.flush_render_uploads();
         }
         {
-            let _span = tracing::info_span!("streaming.cleanup_evicted").entered();
+            let _span = streaming_tick_span!("streaming.cleanup_evicted");
             self.cleanup_evicted();
         }
     }
