@@ -649,7 +649,8 @@ impl BlockRegistry {
 
     #[must_use]
     pub fn material_of(&self, block_id: u8) -> MaterialKind {
-        self.get(block_id).map_or(MaterialKind::Air, |block| block.material)
+        self.get(block_id)
+            .map_or(MaterialKind::Air, |block| block.material)
     }
 
     #[must_use]

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use glam::Mat4;
@@ -617,11 +617,7 @@ impl GpuProfiler {
         Some(slot_idx)
     }
 
-    fn encode_frame(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        slot_idx: usize,
-    ) {
+    fn encode_frame(&mut self, encoder: &mut wgpu::CommandEncoder, slot_idx: usize) {
         let resolved_bytes = (GPU_TIMESTAMP_QUERY_COUNT as u64) * std::mem::size_of::<u64>() as u64;
         encoder.resolve_query_set(
             &self.query_set,
@@ -671,15 +667,21 @@ impl GpuProfiler {
         let delta_ms = |start: u32, end: u32| -> f64 {
             let a = stamps.get(start as usize).copied().unwrap_or(0);
             let b = stamps.get(end as usize).copied().unwrap_or(0);
-            if b > a { (b - a) as f64 * period } else { 0.0 }
+            if b > a {
+                (b - a) as f64 * period
+            } else {
+                0.0
+            }
         };
         self.accum.samples = self.accum.samples.saturating_add(1);
         self.accum.world_ms_total += delta_ms(QUERY_WORLD_BEGIN, QUERY_WORLD_END);
-        self.accum.first_person_ms_total += delta_ms(QUERY_FIRST_PERSON_BEGIN, QUERY_FIRST_PERSON_END);
+        self.accum.first_person_ms_total +=
+            delta_ms(QUERY_FIRST_PERSON_BEGIN, QUERY_FIRST_PERSON_END);
         self.accum.hud_ms_total += delta_ms(QUERY_HUD_BEGIN, QUERY_HUD_END);
         if self.supports_inside_pass {
             self.accum.opaque_ms_total += delta_ms(QUERY_OPAQUE_BEGIN, QUERY_OPAQUE_END);
-            self.accum.transparent_ms_total += delta_ms(QUERY_TRANSPARENT_BEGIN, QUERY_TRANSPARENT_END);
+            self.accum.transparent_ms_total +=
+                delta_ms(QUERY_TRANSPARENT_BEGIN, QUERY_TRANSPARENT_END);
             self.accum.clouds_ms_total += delta_ms(QUERY_CLOUDS_BEGIN, QUERY_CLOUDS_END);
         }
         if self.frame_counter % GPU_TIMESTAMP_LOG_EVERY_FRAMES == 0 && self.accum.samples > 0 {
@@ -1010,8 +1012,8 @@ impl<'w> Renderer<'w> {
             "timestamp feature support"
         );
         let mut required_features = wgpu::Features::empty();
-        let gpu_timestamps_supported =
-            supports_timestamp_query && (supports_timestamp_inside_encoder || supports_timestamp_inside_pass);
+        let gpu_timestamps_supported = supports_timestamp_query
+            && (supports_timestamp_inside_encoder || supports_timestamp_inside_pass);
         if gpu_timestamps_requested && gpu_timestamps_supported {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
             if supports_timestamp_inside_pass {
@@ -1036,8 +1038,10 @@ impl<'w> Renderer<'w> {
         );
         tracing::info!(
             enabled_query = required_features.contains(wgpu::Features::TIMESTAMP_QUERY),
-            enabled_inside_passes = required_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES),
-            enabled_inside_encoders = required_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+            enabled_inside_passes =
+                required_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES),
+            enabled_inside_encoders =
+                required_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
             "timestamp features requested on device"
         );
 
@@ -1091,7 +1095,8 @@ impl<'w> Renderer<'w> {
             .copied()
             .find(|mode| *mode == CompositeAlphaMode::Opaque)
             .unwrap_or(surface_caps.alpha_modes[0]);
-        let surface_copy_src_supported = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let surface_copy_src_supported =
+            surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let surface_usage = if surface_copy_src_supported {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
         } else {
@@ -2220,6 +2225,16 @@ impl<'w> Renderer<'w> {
                     wgpu::BindGroupLayoutEntry {
                         binding: 7,
                         visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -2334,6 +2349,42 @@ impl<'w> Renderer<'w> {
                 depth_or_array_layers: 1,
             },
         );
+        let (crafting_w, crafting_h, crafting_rgba) = load_png_rgba(Path::new(
+            "resources/minecraft-a1.2.6-client/gui/crafting.png",
+        ));
+        let crafting_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thingcraft-hud-crafting-texture"),
+            size: wgpu::Extent3d {
+                width: crafting_w,
+                height: crafting_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &crafting_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &crafting_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * crafting_w),
+                rows_per_image: Some(crafting_h),
+            },
+            wgpu::Extent3d {
+                width: crafting_w,
+                height: crafting_h,
+                depth_or_array_layers: 1,
+            },
+        );
         let (font_w, font_h, font_rgba) = load_png_rgba(Path::new(
             "resources/minecraft-a1.2.6-client/font/default.png",
         ));
@@ -2420,6 +2471,7 @@ impl<'w> Renderer<'w> {
         let gui_view = gui_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let icons_view = icons_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let inventory_view = inventory_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let crafting_view = crafting_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let font_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let water_overlay_view =
             water_overlay_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2461,6 +2513,10 @@ impl<'w> Renderer<'w> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&crafting_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: wgpu::BindingResource::Sampler(&hud_sampler),
                 },
             ],
@@ -2839,7 +2895,8 @@ impl<'w> Renderer<'w> {
     /// `terrain_mesh` uses terrain.png, `items_mesh` uses items.png.
     pub fn update_entity_sprites(&mut self, terrain_mesh: &ChunkMesh, items_mesh: &ChunkMesh) {
         self.entity_sprite_mesh = self.upload_mesh(terrain_mesh, "thingcraft-entity-sprite");
-        self.entity_items_sprite_mesh = self.upload_mesh(items_mesh, "thingcraft-entity-items-sprite");
+        self.entity_items_sprite_mesh =
+            self.upload_mesh(items_mesh, "thingcraft-entity-items-sprite");
     }
 
     /// Upload entity shadow geometry for this frame (ground-projected discs).
@@ -3337,7 +3394,11 @@ impl<'w> Renderer<'w> {
             });
         let screenshot_capture = self.prepare_screenshot_capture();
         if gpu_capture_slot.is_some() && !gpu_supports_inside_pass && gpu_supports_inside_encoder {
-            if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
+            if let Some(query_set) = self
+                .gpu_profiler
+                .as_ref()
+                .map(|profiler| &profiler.query_set)
+            {
                 encoder.write_timestamp(query_set, QUERY_WORLD_BEGIN);
                 gpu_query_written[QUERY_WORLD_BEGIN as usize] = true;
             }
@@ -3565,10 +3626,8 @@ impl<'w> Renderer<'w> {
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 render_pass.set_bind_group(1, &self.items_atlas_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, items_mesh.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(
-                    items_mesh.index_buffer.slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
+                render_pass
+                    .set_index_buffer(items_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..items_mesh.index_count, 0, 0..1);
             }
 
@@ -3695,7 +3754,11 @@ impl<'w> Renderer<'w> {
             }
         }
         if gpu_capture_slot.is_some() && !gpu_supports_inside_pass && gpu_supports_inside_encoder {
-            if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
+            if let Some(query_set) = self
+                .gpu_profiler
+                .as_ref()
+                .map(|profiler| &profiler.query_set)
+            {
                 encoder.write_timestamp(query_set, QUERY_WORLD_END);
                 gpu_query_written[QUERY_WORLD_END as usize] = true;
             }
@@ -3706,8 +3769,15 @@ impl<'w> Renderer<'w> {
             && (self.first_person_item_mesh.is_some() || self.first_person_arm_mesh.is_some())
         {
             let _span = tracing::info_span!("renderer.first_person_pass").entered();
-            if gpu_capture_slot.is_some() && !gpu_supports_inside_pass && gpu_supports_inside_encoder {
-                if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
+            if gpu_capture_slot.is_some()
+                && !gpu_supports_inside_pass
+                && gpu_supports_inside_encoder
+            {
+                if let Some(query_set) = self
+                    .gpu_profiler
+                    .as_ref()
+                    .map(|profiler| &profiler.query_set)
+                {
                     encoder.write_timestamp(query_set, QUERY_FIRST_PERSON_BEGIN);
                     gpu_query_written[QUERY_FIRST_PERSON_BEGIN as usize] = true;
                 }
@@ -3765,8 +3835,15 @@ impl<'w> Renderer<'w> {
                 fp_pass.draw_indexed(0..arm_mesh.index_count, 0, 0..1);
             }
             drop(fp_pass);
-            if gpu_capture_slot.is_some() && !gpu_supports_inside_pass && gpu_supports_inside_encoder {
-                if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
+            if gpu_capture_slot.is_some()
+                && !gpu_supports_inside_pass
+                && gpu_supports_inside_encoder
+            {
+                if let Some(query_set) = self
+                    .gpu_profiler
+                    .as_ref()
+                    .map(|profiler| &profiler.query_set)
+                {
                     encoder.write_timestamp(query_set, QUERY_FIRST_PERSON_END);
                     gpu_query_written[QUERY_FIRST_PERSON_END as usize] = true;
                 }
@@ -3777,8 +3854,15 @@ impl<'w> Renderer<'w> {
         if self.render_debug_toggles.hud {
             if let Some(hud_vb) = &self.hud_vertex_buffer {
                 let _span = tracing::info_span!("renderer.hud_pass").entered();
-                if gpu_capture_slot.is_some() && !gpu_supports_inside_pass && gpu_supports_inside_encoder {
-                    if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
+                if gpu_capture_slot.is_some()
+                    && !gpu_supports_inside_pass
+                    && gpu_supports_inside_encoder
+                {
+                    if let Some(query_set) = self
+                        .gpu_profiler
+                        .as_ref()
+                        .map(|profiler| &profiler.query_set)
+                    {
                         encoder.write_timestamp(query_set, QUERY_HUD_BEGIN);
                         gpu_query_written[QUERY_HUD_BEGIN as usize] = true;
                     }
@@ -3818,8 +3902,15 @@ impl<'w> Renderer<'w> {
                 hud_pass.set_vertex_buffer(0, hud_vb.slice(..));
                 hud_pass.draw(0..self.hud_vertex_count, 0..1);
                 drop(hud_pass);
-                if gpu_capture_slot.is_some() && !gpu_supports_inside_pass && gpu_supports_inside_encoder {
-                    if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
+                if gpu_capture_slot.is_some()
+                    && !gpu_supports_inside_pass
+                    && gpu_supports_inside_encoder
+                {
+                    if let Some(query_set) = self
+                        .gpu_profiler
+                        .as_ref()
+                        .map(|profiler| &profiler.query_set)
+                    {
                         encoder.write_timestamp(query_set, QUERY_HUD_END);
                         gpu_query_written[QUERY_HUD_END as usize] = true;
                     }
@@ -3833,7 +3924,11 @@ impl<'w> Renderer<'w> {
                 self.encode_screenshot_copy(&mut encoder, &output.texture, capture);
             }
             if gpu_capture_slot.is_some() && gpu_supports_inside_encoder {
-                if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
+                if let Some(query_set) = self
+                    .gpu_profiler
+                    .as_ref()
+                    .map(|profiler| &profiler.query_set)
+                {
                     for (index, written) in gpu_query_written.iter_mut().enumerate() {
                         if !*written {
                             encoder.write_timestamp(query_set, index as u32);
@@ -4296,7 +4391,8 @@ fn create_texture_bind_group(
     label_prefix: &str,
     filter: wgpu::FilterMode,
 ) -> wgpu::BindGroup {
-    let (_texture, view) = load_png_texture(device, queue, path, &format!("{label_prefix}-texture"));
+    let (_texture, view) =
+        load_png_texture(device, queue, path, &format!("{label_prefix}-texture"));
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some(&format!("{label_prefix}-sampler")),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -6057,7 +6153,8 @@ var<uniform> screen: HudScreen;
 @group(1) @binding(4) var hud_font_tex: texture_2d<f32>;
 @group(1) @binding(5) var hud_water_overlay_tex: texture_2d<f32>;
 @group(1) @binding(6) var hud_items_tex: texture_2d<f32>;
-@group(1) @binding(7) var hud_sampler: sampler;
+@group(1) @binding(7) var hud_crafting_tex: texture_2d<f32>;
+@group(1) @binding(8) var hud_sampler: sampler;
 
 struct VertexIn {
     @location(0) position: vec2<f32>,
@@ -6106,6 +6203,8 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         texel = textureSample(hud_water_overlay_tex, hud_sampler, fract(input.uv));
     } else if (input.texture_kind >= 5.5 && input.texture_kind < 6.5) {
         texel = textureSample(hud_items_tex, hud_sampler, input.uv);
+    } else if (input.texture_kind >= 6.5 && input.texture_kind < 7.5) {
+        texel = textureSample(hud_crafting_tex, hud_sampler, input.uv);
     }
     if (texel.a <= 0.01) {
         discard;
@@ -6199,12 +6298,3 @@ mod tests {
         assert!(vertices.iter().skip(1).all(|v| v.color[3] <= 0.0001));
     }
 }
-
-
-
-
-
-
-
-
-

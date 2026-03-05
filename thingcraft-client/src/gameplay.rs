@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use bevy_ecs::prelude::Resource;
 
+use crate::crafting::CraftingRegistry;
 use crate::ecs::EcsRuntime;
 use crate::inventory::{InventoryCommand, ItemStack, PlayerInventoryState};
 use crate::tool::ToolRegistry;
@@ -64,16 +65,21 @@ pub struct InventoryCommandEvents {
 }
 
 pub fn run_inventory_command_system(ecs_runtime: &mut EcsRuntime) -> InventoryCommandEvents {
+    let crafting = ecs_runtime.world().resource::<CraftingRegistry>().clone();
     let pending_commands: Vec<InventoryCommand> = {
-        let mut queue = ecs_runtime.world_mut().resource_mut::<InventoryCommandQueue>();
+        let mut queue = ecs_runtime
+            .world_mut()
+            .resource_mut::<InventoryCommandQueue>();
         queue.pending.drain(..).collect()
     };
 
     let mut events = InventoryCommandEvents::default();
     for cmd in pending_commands {
         let result = {
-            let mut inventory = ecs_runtime.world_mut().resource_mut::<PlayerInventoryState>();
-            inventory.apply(cmd)
+            let mut inventory = ecs_runtime
+                .world_mut()
+                .resource_mut::<PlayerInventoryState>();
+            inventory.apply_with_crafting(cmd, Some(&crafting))
         };
         events.changed |= result.changed;
         events.dropped_to_world.extend(result.dropped_to_world);
@@ -92,7 +98,10 @@ pub fn apply_post_block_break_effects(
     tool_registry: &ToolRegistry,
     tool: MiningToolKind,
 ) {
-    ecs_runtime.world_mut().resource_mut::<MiningState>().on_block_broken();
+    ecs_runtime
+        .world_mut()
+        .resource_mut::<MiningState>()
+        .on_block_broken();
     if let MiningToolKind::Tool(id) = tool {
         if let Some(def) = tool_registry.get(id) {
             let cost = ToolRegistry::mining_durability_cost(def);
