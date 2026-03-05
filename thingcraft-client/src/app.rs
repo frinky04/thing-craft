@@ -1845,7 +1845,11 @@ fn alpha_break_block_and_collect_drop(
             crate::entity::spawn_dropped_item_stack(
                 ecs_runtime.world_mut(),
                 drop,
-                DVec3::new(block_x as f64 + ox, block_y as f64 + oy, block_z as f64 + oz),
+                DVec3::new(
+                    block_x as f64 + ox,
+                    block_y as f64 + oy,
+                    block_z as f64 + oz,
+                ),
             );
         }
     }
@@ -2593,8 +2597,7 @@ fn process_single_block_interaction_request(
                 y: hit.block[1],
                 z: hit.block[2],
             };
-            let Some(menu) =
-                alpha_resolve_chest_menu_target(registry, chunk_streamer, chest_pos)
+            let Some(menu) = alpha_resolve_chest_menu_target(registry, chunk_streamer, chest_pos)
             else {
                 return None;
             };
@@ -2773,10 +2776,7 @@ fn is_point_inside_inventory_panel(
     let (panel_w, panel_h) = menu_panel_size(menu);
     let mx = mouse_x / layout.scale;
     let my = mouse_y / layout.scale;
-    mx >= layout.left
-        && mx < layout.left + panel_w
-        && my >= layout.top
-        && my < layout.top + panel_h
+    mx >= layout.left && mx < layout.left + panel_w && my >= layout.top && my < layout.top + panel_h
 }
 
 fn raycast_first_solid_block<F>(
@@ -4048,26 +4048,8 @@ fn resolve_player_physics(
     );
     let in_fluid_at_end = in_water_at_end || in_lava_at_end;
 
-    // Fall distance tracking.
-    let mut fall_distance = physics.fall_distance;
-    if delta.y < 0.0 {
-        fall_distance -= delta.y;
-    } else {
-        fall_distance = 0.0;
-    }
-    if in_fluid_at_end {
-        fall_distance = 0.0;
-    }
-    let mut damage_taken = 0;
-    if on_ground {
-        if fall_distance > 3.0 {
-            damage_taken = (fall_distance - 3.0).ceil() as i32;
-        }
-        fall_distance = 0.0;
-    }
-    if in_fluid_at_end {
-        damage_taken = 0;
-    }
+    let (fall_distance, damage_taken) =
+        alpha_fall_distance_and_damage(physics.fall_distance, delta.y, on_ground, in_fluid_at_end);
 
     // Velocity: zero out any component that was collision-clamped.
     let mut velocity = physics.velocity;
@@ -4102,6 +4084,7 @@ fn resolve_player_physics(
                 ),
                 chunk_streamer,
                 registry,
+                true,
             )
     } else {
         false
@@ -4166,6 +4149,18 @@ fn player_body_touches_material(
     chunk_streamer: &ChunkStreamer,
     is_material: impl Fn(u8) -> bool,
 ) -> bool {
+    aabb_touches_material(position, width, height, is_material, |x, y, z| {
+        chunk_streamer.block_at_world(x, y, z)
+    })
+}
+
+fn aabb_touches_material(
+    position: DVec3,
+    width: f64,
+    height: f64,
+    is_material: impl Fn(u8) -> bool,
+    mut block_at_world: impl FnMut(i32, i32, i32) -> Option<u8>,
+) -> bool {
     let half_w = width / 2.0;
     let min_x = (position.x - half_w).floor() as i32;
     let max_x = (position.x + half_w).floor() as i32;
@@ -4180,7 +4175,7 @@ fn player_body_touches_material(
                 continue;
             }
             for z in min_z..=max_z {
-                let Some(block_id) = chunk_streamer.block_at_world(x, y, z) else {
+                let Some(block_id) = block_at_world(x, y, z) else {
                     continue;
                 };
                 if is_material(block_id) {
@@ -4209,6 +4204,7 @@ fn clamp_sneak_edge_delta(
             DVec3::new(delta.x, -1.0, 0.0),
             chunk_streamer,
             registry,
+            false,
         )
     {
         if delta.x.abs() < step {
@@ -4227,6 +4223,7 @@ fn clamp_sneak_edge_delta(
             DVec3::new(0.0, -1.0, delta.z),
             chunk_streamer,
             registry,
+            false,
         )
     {
         if delta.z.abs() < step {
@@ -4247,6 +4244,7 @@ fn can_move_player(
     offset: DVec3,
     chunk_streamer: &ChunkStreamer,
     registry: &BlockRegistry,
+    reject_liquids: bool,
 ) -> bool {
     let half_w = width / 2.0;
     let moved_pos = position + offset;
@@ -4273,7 +4271,41 @@ fn can_move_player(
             return false;
         }
     }
+    if reject_liquids
+        && player_body_touches_material(moved_pos, width, height, chunk_streamer, |block_id| {
+            registry.is_water(block_id) || registry.is_lava(block_id)
+        })
+    {
+        return false;
+    }
     true
+}
+
+fn alpha_fall_distance_and_damage(
+    prev_fall_distance: f64,
+    resolved_dy: f64,
+    on_ground: bool,
+    in_fluid: bool,
+) -> (f64, i32) {
+    let mut fall_distance = prev_fall_distance;
+    // Track net vertical drop over an airtime segment so jump ascent
+    // offsets descent from small ledges (matches observed Alpha behavior).
+    fall_distance -= resolved_dy;
+    if in_fluid {
+        fall_distance = 0.0;
+    }
+
+    let mut damage_taken = 0;
+    if on_ground {
+        if fall_distance > 3.0 {
+            damage_taken = (fall_distance - 3.0).ceil() as i32;
+        }
+        fall_distance = 0.0;
+    }
+    if in_fluid {
+        damage_taken = 0;
+    }
+    (fall_distance, damage_taken)
 }
 
 /// Resolve movement along a single axis against block AABBs. Returns clamped delta.
@@ -4332,13 +4364,13 @@ mod tests {
     use winit::keyboard::KeyCode;
 
     use super::{
-        affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
+        aabb_touches_material, affected_chunks_for_block_edit, alpha_ambient_darkness,
+        alpha_apply_fog_brightness, alpha_block_mining_calc, alpha_brightness_from_light_level,
         alpha_can_place_chest_at, alpha_chest_facing_from_solid_neighbors,
-        alpha_block_mining_calc, alpha_brightness_from_light_level,
-        alpha_fog_brightness_target, alpha_horizontal_face_from_look,
-        alpha_opposite_face, alpha_placement_metadata_from_look, alpha_star_brightness,
-        alpha_sunrise_color, alpha_time_of_day, can_replace_block_for_placement,
-        has_target_directive, hotbar_slot_for_key,
+        alpha_fall_distance_and_damage, alpha_fog_brightness_target,
+        alpha_horizontal_face_from_look, alpha_opposite_face, alpha_placement_metadata_from_look,
+        alpha_star_brightness, alpha_sunrise_color, alpha_time_of_day,
+        can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
         is_point_inside_inventory_panel, is_raycast_targetable_block, parse_env_bool,
         parse_env_u32, placement_intersects_player, raycast_first_solid_block, resolve_axis,
         AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, CHEST_BLOCK_ID, FURNACE_BLOCK_ID,
@@ -4609,10 +4641,22 @@ mod tests {
 
     #[test]
     fn alpha_face_mapping_from_look_direction_matches_cardinals() {
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, 1.0)), 3);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, -1.0)), 2);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(1.0, 0.0, 0.0)), 5);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(-1.0, 0.0, 0.0)), 4);
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, 1.0)),
+            3
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, -1.0)),
+            2
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(1.0, 0.0, 0.0)),
+            5
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(-1.0, 0.0, 0.0)),
+            4
+        );
         assert_eq!(alpha_opposite_face(2), 3);
         assert_eq!(alpha_opposite_face(5), 4);
     }
@@ -4665,10 +4709,7 @@ mod tests {
 
     #[test]
     fn chest_placement_rejects_triple_chest_layout() {
-        let blocks = vec![
-            ((-1, 0, 0), CHEST_BLOCK_ID),
-            ((1, 0, 0), CHEST_BLOCK_ID),
-        ];
+        let blocks = vec![((-1, 0, 0), CHEST_BLOCK_ID), ((1, 0, 0), CHEST_BLOCK_ID)];
         let lookup = |x: i32, y: i32, z: i32| {
             blocks
                 .iter()
@@ -4680,10 +4721,7 @@ mod tests {
 
     #[test]
     fn chest_placement_rejects_attaching_to_existing_double_chest() {
-        let blocks = vec![
-            ((0, 0, 0), CHEST_BLOCK_ID),
-            ((1, 0, 0), CHEST_BLOCK_ID),
-        ];
+        let blocks = vec![((0, 0, 0), CHEST_BLOCK_ID), ((1, 0, 0), CHEST_BLOCK_ID)];
         let lookup = |x: i32, y: i32, z: i32| {
             blocks
                 .iter()
@@ -4841,5 +4879,50 @@ mod tests {
         let slice = budget.urgent_slice_for_tick(20);
         assert!(slice >= 16);
         assert!(slice <= 20);
+    }
+
+    #[test]
+    fn alpha_fall_damage_keeps_distance_while_rising() {
+        let (fall_distance, damage_taken) = alpha_fall_distance_and_damage(4.0, 0.2, false, false);
+        assert!((fall_distance - 3.8).abs() < 1e-10);
+        assert_eq!(damage_taken, 0);
+    }
+
+    #[test]
+    fn alpha_fall_damage_uses_ceil_distance_minus_three() {
+        let (fall_distance, damage_taken) = alpha_fall_distance_and_damage(0.0, -4.2, true, false);
+        assert!((fall_distance - 0.0).abs() < 1e-10);
+        assert_eq!(damage_taken, 2);
+    }
+
+    #[test]
+    fn jump_off_two_block_pillar_does_not_apply_fall_damage() {
+        let (mid_fall_distance, mid_damage) =
+            alpha_fall_distance_and_damage(0.0, 1.25, false, false);
+        assert!((mid_fall_distance - (-1.25)).abs() < 1e-10);
+        assert_eq!(mid_damage, 0);
+
+        let (landed_fall_distance, landed_damage) =
+            alpha_fall_distance_and_damage(mid_fall_distance, -3.25, true, false);
+        assert!((landed_fall_distance - 0.0).abs() < 1e-10);
+        assert_eq!(landed_damage, 0);
+    }
+
+    #[test]
+    fn aabb_material_scan_detects_underwater_block_volume() {
+        let touches = aabb_touches_material(
+            DVec3::new(0.5, 10.0, 0.5),
+            0.6,
+            1.8,
+            |block_id| block_id == 9,
+            |x, y, z| {
+                if (x, y, z) == (0, 10, 0) {
+                    Some(9)
+                } else {
+                    Some(0)
+                }
+            },
+        );
+        assert!(touches);
     }
 }
