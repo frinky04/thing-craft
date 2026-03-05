@@ -27,6 +27,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p thingcraft-client
 ```
 
+World seed launch overrides:
+
+```bash
+# deterministic seed
+cargo run -p thingcraft-client -- --seed 123456789
+
+# hexadecimal seed
+cargo run -p thingcraft-client -- --seed 0xA1260001
+
+# time-based random seed
+cargo run -p thingcraft-client -- --random-seed
+```
+
+Environment fallback is also supported: `THINGCRAFT_WORLD_SEED=<seed>` (CLI flags take precedence).
+
 For debug runtime stats without `wgpu` internals flooding output:
 
 ```bash

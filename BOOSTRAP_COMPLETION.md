@@ -7,6 +7,7 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Fixed 20 TPS simulation loop separated from render frame loop.
 - [x] Standalone `bevy_ecs` schedules for input capture, fixed simulation, and render interpolation.
 - [x] Command-queue input flow established (network-ready pattern for future multiplayer).
+- [x] Launch-seed overrides added: world seed can now be set via CLI (`--seed`, `--seed=<value>`, `--random-seed`) with `THINGCRAFT_WORLD_SEED` env fallback.
 - [x] CI + lint/test baseline added.
 - [x] Alpha-derived block registry skeleton added (with explicit Alpha-excluded block IDs).
 - [x] Chunk core storage model added (`16x16x128`, nibble light channels, Alpha index layout).
@@ -63,7 +64,7 @@ This document tracks implementation/bootstrap milestones that are not direct Alp
 - [x] Meshing now includes a greedy top-face merge pass for merge-safe opaque terrain quads (same sprite/tint/light/material marker), reducing face count on broad exposed terrain while preserving existing non-cube/liquid paths.
 - [x] Transparent render pipeline added: split opaque/transparent chunk meshing, alpha-blended water pass (no depth write, double-sided), shader `vec4` light channel with vertex alpha passthrough.
 - [x] Foliage biome tinting added: generic `BiomeColorMap` loader used for both grass and foliage color maps, leaf blocks tinted per-column from Alpha `foliagecolor.png`.
-- [x] Birch and pine tree shape variants added: biome-driven tree kind selection (Taiga→pine, Forest/SeasonalForest→1-in-3 birch, others→oak) with distinct canopy geometries.
+- [x] Tree population parity follow-up added: runtime decoration now uses Alpha chunk-level tree attempt counts (`forestNoise` weighting + biome offsets), per-chunk feature selection (oak vs large-oak rates), no default Birch/Pine placement in world population, and a direct `LargeOakTreeFeature` branch/trunk/foliage port.
 - [x] Tree decoration now uses a world-space population pass with cross-chunk writes (vanilla-style source chunk influence and `+8` feature offsets), fixing chunk-border tree clipping/truncation artifacts.
 - [x] Chunk storage now includes per-block metadata nibble channels with runtime world-coordinate metadata mutation APIs (needed for Alpha liquid depth/state simulation).
 - [x] Day/night runtime path added: fixed-tick world time, Alpha time-of-day/ambient-darkness formulas, and renderer uniform updates for fog color + skylight attenuation without full relight churn.
