@@ -112,6 +112,8 @@ const SNOWBALL_ITEM_ID: u16 = 332;
 const RANDOM_TICK_CHUNK_RADIUS: i32 = 9;
 const RANDOM_TICKS_PER_CHUNK: usize = 80;
 const RANDOM_TICK_LCG_INCREMENT: i32 = 1_013_904_223;
+const DEBUG_SIM_SPEEDUP_MULTIPLIER: usize = 8;
+const DEBUG_SIM_SPEEDUP_TICK_CAP: usize = 256;
 const BENCH_MOVE_ASCEND_BLOCKS: f64 = 20.0;
 
 #[derive(Debug, Clone, Copy)]
@@ -650,8 +652,7 @@ pub fn run() -> Result<()> {
     let mut sim_ticks: u64 = 0;
     let mut random_tick_lcg: i32 = (WORLD_SEED as u32 ^ 0x9E37_79B9) as i32;
     let mut random_tick_rng = SmallRng::seed_from_u64(WORLD_SEED ^ 0xA11A_A11A_55AA_F00D);
-    let mut time_offset_ticks: u64 = 0; // debug: accelerated by T key
-    let mut time_accel_held = false;
+    let mut sim_speedup_held = false;
     let mut last_fog_brightness = 1.0_f32;
     let mut fog_brightness = 1.0_f32;
     let base_fluid_tick_budget = resolve_fluid_tick_budget();
@@ -741,7 +742,14 @@ pub fn run() -> Result<()> {
                     ecs_runtime.run_input();
 
                     let tick_timer_start = Instant::now();
-                    let ticks_to_run = fixed_clock.advance(frame_delta);
+                    let base_ticks_to_run = fixed_clock.advance(frame_delta);
+                    let ticks_to_run = if sim_speedup_held {
+                        base_ticks_to_run
+                            .saturating_mul(DEBUG_SIM_SPEEDUP_MULTIPLIER as u32)
+                            .min(DEBUG_SIM_SPEEDUP_TICK_CAP as u32)
+                    } else {
+                        base_ticks_to_run
+                    };
                     let fixed_dt_seconds = fixed_clock.tick_dt().as_secs_f64();
                     let fluid_tick_budget = adaptive_fluid_budget.current();
                     let mut fluid_budget_remaining = fluid_tick_budget;
@@ -750,9 +758,6 @@ pub fn run() -> Result<()> {
                     for tick_index in 0..ticks_to_run {
                         let _tick_span = tracing::info_span!("fixed_tick").entered();
                         sim_ticks = sim_ticks.wrapping_add(1);
-                        if time_accel_held {
-                            time_offset_ticks = time_offset_ticks.wrapping_add(200);
-                        }
                         chunk_streamer.begin_sim_tick(sim_ticks);
                         ecs_runtime.run_fixed(fixed_dt_seconds);
                         let fly_mode = ecs_runtime.is_fly_mode();
@@ -966,7 +971,7 @@ pub fn run() -> Result<()> {
 
                         // Alpha GameRenderer.tick(): smooth fog brightness toward sampled player
                         // brightness, biased by view-distance setting.
-                        let tick_time_of_day = alpha_time_of_day(sim_ticks.wrapping_add(time_offset_ticks), 0.0);
+                        let tick_time_of_day = alpha_time_of_day(sim_ticks, 0.0);
                         let tick_ambient_darkness = alpha_ambient_darkness(tick_time_of_day);
                         let player_pos = ecs_runtime
                             .camera_snapshot()
@@ -1000,7 +1005,7 @@ pub fn run() -> Result<()> {
 
                     let mut frame_camera: Option<crate::ecs::CameraSnapshot> = None;
                     let mut camera_chunk = ChunkPos { x: 0, z: 0 };
-                    let time_of_day = alpha_time_of_day(sim_ticks.wrapping_add(time_offset_ticks), render_alpha);
+                    let time_of_day = alpha_time_of_day(sim_ticks, render_alpha);
                     let ambient_darkness = alpha_ambient_darkness(time_of_day);
                     let cloud_color = alpha_cloud_color(time_of_day);
                     let sunrise_color = alpha_sunrise_color(time_of_day);
@@ -1450,9 +1455,9 @@ pub fn run() -> Result<()> {
                             );
                         }
 
-                        // T key: hold to accelerate time of day (debug).
+                        // T key: hold to accelerate simulation ticks (debug).
                         if code == KeyCode::KeyT {
-                            time_accel_held = is_pressed;
+                            sim_speedup_held = is_pressed;
                         }
 
                         if code == KeyCode::Escape && is_pressed {

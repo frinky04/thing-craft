@@ -385,6 +385,13 @@ impl PlayerInventoryState {
         main[7] = Some(ItemStack::block(47, 64)); // Bookshelf
         main[8] = Some(ItemStack::block(52, 64)); // Mob Spawner
         main[9] = Some(ItemStack::block(79, 64)); // Ice
+        main[10] = Some(ItemStack::block(81, 64)); // Cactus
+        main[11] = Some(ItemStack::block(12, 64)); // Sand
+        main[12] = Some(ItemStack::block(6, 64)); // Sapling
+        main[13] = Some(ItemStack::block(78, 64)); // Snow Layer
+        main[14] = Some(ItemStack::block(18, 64)); // Leaves
+        main[15] = Some(ItemStack::block(17, 64)); // Log
+        main[16] = Some(ItemStack::block(50, 64)); // Torch
 
         Self {
             hotbar,
