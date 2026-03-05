@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
@@ -71,6 +71,45 @@ const FURNACE_BLOCK_ID: u8 = 61;
 const LIT_FURNACE_BLOCK_ID: u8 = 62;
 const PUMPKIN_BLOCK_ID: u8 = 86;
 const LIT_PUMPKIN_BLOCK_ID: u8 = 91;
+const GRASS_BLOCK_ID: u8 = 2;
+const STONE_BLOCK_ID: u8 = 1;
+const COBBLESTONE_BLOCK_ID: u8 = 4;
+const GLASS_BLOCK_ID: u8 = 20;
+const BOOKSHELF_BLOCK_ID: u8 = 47;
+const MOB_SPAWNER_BLOCK_ID: u8 = 52;
+const DIRT_BLOCK_ID: u8 = 3;
+const SAPLING_BLOCK_ID: u8 = 6;
+const OAK_LEAVES_BLOCK_ID: u8 = 18;
+const FARMLAND_BLOCK_ID: u8 = 60;
+const FLOWING_WATER_BLOCK_ID: u8 = 8;
+const WATER_BLOCK_ID: u8 = 9;
+const COAL_ORE_BLOCK_ID: u8 = 16;
+const DIAMOND_ORE_BLOCK_ID: u8 = 56;
+const REDSTONE_ORE_BLOCK_ID: u8 = 73;
+const LIT_REDSTONE_ORE_BLOCK_ID: u8 = 74;
+const GRAVEL_BLOCK_ID: u8 = 13;
+const SNOW_LAYER_BLOCK_ID: u8 = 78;
+const SNOW_BLOCK_ID: u8 = 80;
+const CLAY_BLOCK_ID: u8 = 82;
+const GLOWSTONE_BLOCK_ID: u8 = 89;
+const YELLOW_FLOWER_BLOCK_ID: u8 = 37;
+const RED_FLOWER_BLOCK_ID: u8 = 38;
+const BROWN_MUSHROOM_BLOCK_ID: u8 = 39;
+const RED_MUSHROOM_BLOCK_ID: u8 = 40;
+const SUGAR_CANE_BLOCK_ID: u8 = 83;
+const OAK_LOG_BLOCK_ID: u8 = 17;
+const ICE_BLOCK_ID: u8 = 79;
+const COAL_ITEM_ID: u16 = 263;
+const DIAMOND_ITEM_ID: u16 = 264;
+const REDSTONE_ITEM_ID: u16 = 331;
+const REEDS_ITEM_ID: u16 = 338;
+const FLINT_ITEM_ID: u16 = 318;
+const CLAY_BALL_ITEM_ID: u16 = 337;
+const GLOWSTONE_DUST_ITEM_ID: u16 = 348;
+const SNOWBALL_ITEM_ID: u16 = 332;
+const RANDOM_TICK_CHUNK_RADIUS: i32 = 9;
+const RANDOM_TICKS_PER_CHUNK: usize = 80;
+const RANDOM_TICK_LCG_INCREMENT: i32 = 1_013_904_223;
 const BENCH_MOVE_ASCEND_BLOCKS: f64 = 20.0;
 
 #[derive(Debug, Clone, Copy)]
@@ -607,6 +646,8 @@ pub fn run() -> Result<()> {
     let mut first_person_hand = FirstPersonHandState::default();
     let mut hud_dirty = true;
     let mut sim_ticks: u64 = 0;
+    let mut random_tick_lcg: i32 = (WORLD_SEED as u32 ^ 0x9E37_79B9) as i32;
+    let mut random_tick_rng = SmallRng::seed_from_u64(WORLD_SEED ^ 0xA11A_A11A_55AA_F00D);
     let mut time_offset_ticks: u64 = 0; // debug: accelerated by T key
     let mut time_accel_held = false;
     let mut last_fog_brightness = 1.0_f32;
@@ -892,6 +933,24 @@ pub fn run() -> Result<()> {
                                 fluid_processed_this_frame += processed;
                                 fluid_budget_remaining =
                                     fluid_budget_remaining.saturating_sub(processed);
+                            }
+                        }
+
+                        if let Some(snapshot) = ecs_runtime.camera_snapshot() {
+                            let center_chunk = world_pos_to_chunk_pos(
+                                snapshot.authoritative.position.x,
+                                snapshot.authoritative.position.z,
+                            );
+                            if tick_random_blocks(
+                                &mut ecs_runtime,
+                                &mut chunk_streamer,
+                                &bootstrap_world.registry,
+                                &mut edit_latency_tracker,
+                                center_chunk,
+                                &mut random_tick_lcg,
+                                &mut random_tick_rng,
+                            ) {
+                                hud_dirty = true;
                             }
                         }
 
@@ -1790,15 +1849,696 @@ fn raycast_current_mining_target(
     })
 }
 
-fn alpha_break_block_and_collect_drop(
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DropRule {
+    None,
+    SelfBlock,
+    Block(u8),
+    Item {
+        item_id: u16,
+        min_count: u8,
+        max_count: u8,
+    },
+    ChanceBlock {
+        block_id: u8,
+        chance_denominator: u8,
+    },
+    ChanceItem {
+        item_id: u16,
+        chance_denominator: u8,
+        fallback_block_id: Option<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PlacementRule {
+    Default,
+    PlantSoil,
+    SolidSupport,
+    SugarCane,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SurvivalRule {
+    None,
+    Flower,
+    Mushroom,
+    SugarCane,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct BlockBehavior {
+    drop_rule: DropRule,
+    placement_rule: PlacementRule,
+    survival_rule: SurvivalRule,
+}
+
+const DEFAULT_BLOCK_BEHAVIOR: BlockBehavior = BlockBehavior {
+    drop_rule: DropRule::SelfBlock,
+    placement_rule: PlacementRule::Default,
+    survival_rule: SurvivalRule::None,
+};
+
+fn block_behavior(block_id: u8) -> BlockBehavior {
+    match block_id {
+        AIR_BLOCK_ID | FLOWING_WATER_BLOCK_ID | WATER_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::None,
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        LIT_FURNACE_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Block(FURNACE_BLOCK_ID),
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        STONE_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Block(COBBLESTONE_BLOCK_ID),
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        GRASS_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Block(DIRT_BLOCK_ID),
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        GLASS_BLOCK_ID | BOOKSHELF_BLOCK_ID | MOB_SPAWNER_BLOCK_ID | ICE_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::None,
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        COAL_ORE_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Item {
+                item_id: COAL_ITEM_ID,
+                min_count: 1,
+                max_count: 1,
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        DIAMOND_ORE_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Item {
+                item_id: DIAMOND_ITEM_ID,
+                min_count: 1,
+                max_count: 1,
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        REDSTONE_ORE_BLOCK_ID | LIT_REDSTONE_ORE_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Item {
+                item_id: REDSTONE_ITEM_ID,
+                min_count: 4,
+                max_count: 5,
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        OAK_LEAVES_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::ChanceBlock {
+                block_id: SAPLING_BLOCK_ID,
+                chance_denominator: 20,
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        GRAVEL_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::ChanceItem {
+                item_id: FLINT_ITEM_ID,
+                chance_denominator: 10,
+                fallback_block_id: Some(GRAVEL_BLOCK_ID),
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        CLAY_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Item {
+                item_id: CLAY_BALL_ITEM_ID,
+                min_count: 4,
+                max_count: 4,
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        GLOWSTONE_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Item {
+                item_id: GLOWSTONE_DUST_ITEM_ID,
+                min_count: 1,
+                max_count: 1,
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        SNOW_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Item {
+                item_id: SNOWBALL_ITEM_ID,
+                min_count: 4,
+                max_count: 4,
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        SNOW_LAYER_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Item {
+                item_id: SNOWBALL_ITEM_ID,
+                min_count: 1,
+                max_count: 1,
+            },
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        SUGAR_CANE_BLOCK_ID => BlockBehavior {
+            drop_rule: DropRule::Item {
+                item_id: REEDS_ITEM_ID,
+                min_count: 1,
+                max_count: 1,
+            },
+            placement_rule: PlacementRule::SugarCane,
+            survival_rule: SurvivalRule::SugarCane,
+        },
+        YELLOW_FLOWER_BLOCK_ID | RED_FLOWER_BLOCK_ID => BlockBehavior {
+            placement_rule: PlacementRule::PlantSoil,
+            survival_rule: SurvivalRule::Flower,
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        BROWN_MUSHROOM_BLOCK_ID | RED_MUSHROOM_BLOCK_ID => BlockBehavior {
+            placement_rule: PlacementRule::SolidSupport,
+            survival_rule: SurvivalRule::Mushroom,
+            ..DEFAULT_BLOCK_BEHAVIOR
+        },
+        _ => DEFAULT_BLOCK_BEHAVIOR,
+    }
+}
+
+fn can_place_plant_on(block_id: u8) -> bool {
+    matches!(block_id, GRASS_BLOCK_ID | DIRT_BLOCK_ID | FARMLAND_BLOCK_ID)
+}
+
+fn has_water_adjacent_to_ground(
+    chunk_streamer: &ChunkStreamer,
+    x: i32,
+    ground_y: i32,
+    z: i32,
+) -> bool {
+    let neighbors = [
+        (x - 1, ground_y, z),
+        (x + 1, ground_y, z),
+        (x, ground_y, z - 1),
+        (x, ground_y, z + 1),
+    ];
+    neighbors.into_iter().any(|(nx, ny, nz)| {
+        chunk_streamer
+            .block_at_world(nx, ny, nz)
+            .is_some_and(|id| id == FLOWING_WATER_BLOCK_ID || id == WATER_BLOCK_ID)
+    })
+}
+
+fn can_sugar_cane_survive(chunk_streamer: &ChunkStreamer, x: i32, y: i32, z: i32) -> bool {
+    let Some(below) = y
+        .checked_sub(1)
+        .and_then(|by| chunk_streamer.block_at_world(x, by, z))
+    else {
+        return false;
+    };
+    if below == SUGAR_CANE_BLOCK_ID {
+        return true;
+    }
+    (below == GRASS_BLOCK_ID || below == DIRT_BLOCK_ID)
+        && has_water_adjacent_to_ground(chunk_streamer, x, y - 1, z)
+}
+
+fn alpha_material_is_opaque(material: MaterialKind) -> bool {
+    !matches!(
+        material,
+        MaterialKind::Air
+            | MaterialKind::Plant
+            | MaterialKind::Decoration
+            | MaterialKind::SnowLayer
+            | MaterialKind::Fire
+    )
+}
+
+fn block_drop_stack(
+    block_id: u8,
+    can_harvest: bool,
+    registry: &BlockRegistry,
+    rng: &mut SmallRng,
+) -> Option<crate::inventory::ItemStack> {
+    if !can_harvest || block_id == AIR_BLOCK_ID || registry.is_liquid(block_id) {
+        return None;
+    }
+    let drop = match block_behavior(block_id).drop_rule {
+        DropRule::None => return None,
+        DropRule::SelfBlock => crate::inventory::ItemStack::block(block_id, 1),
+        DropRule::Block(id) => crate::inventory::ItemStack::block(id, 1),
+        DropRule::Item {
+            item_id,
+            min_count,
+            max_count,
+        } => {
+            let count = if min_count == max_count {
+                min_count
+            } else {
+                rng.gen_range(min_count..=max_count)
+            };
+            crate::inventory::ItemStack::item(item_id, count)
+        }
+        DropRule::ChanceBlock {
+            block_id,
+            chance_denominator,
+        } => {
+            if chance_denominator == 0 || rng.gen_range(0..chance_denominator) != 0 {
+                return None;
+            }
+            crate::inventory::ItemStack::block(block_id, 1)
+        }
+        DropRule::ChanceItem {
+            item_id,
+            chance_denominator,
+            fallback_block_id,
+        } => {
+            if chance_denominator > 0 && rng.gen_range(0..chance_denominator) == 0 {
+                crate::inventory::ItemStack::item(item_id, 1)
+            } else if let Some(block_id) = fallback_block_id {
+                crate::inventory::ItemStack::block(block_id, 1)
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(drop)
+}
+
+fn random_tick_lcg_next(random_tick_lcg: &mut i32) -> i32 {
+    *random_tick_lcg = random_tick_lcg
+        .wrapping_mul(3)
+        .wrapping_add(RANDOM_TICK_LCG_INCREMENT);
+    *random_tick_lcg
+}
+
+fn random_tick_local_coords(random_tick_lcg: &mut i32) -> (i32, i32, i32) {
+    let t = random_tick_lcg_next(random_tick_lcg) >> 2;
+    let local_x = t & 0xF;
+    let local_z = (t >> 8) & 0xF;
+    let y = (t >> 16) & 0x7F;
+    (local_x, y, local_z)
+}
+
+fn break_block_with_drop(
     ecs_runtime: &mut EcsRuntime,
     chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
+    edit_latency_tracker: &mut EditLatencyTracker,
+    x: i32,
+    y: i32,
+    z: i32,
+    block_id: u8,
+    rng: &mut SmallRng,
+) -> bool {
+    let replacement_block = if block_id == ICE_BLOCK_ID
+        && y > 0
+        && chunk_streamer
+            .block_at_world(x, y - 1, z)
+            .is_some_and(|below| registry.blocks_movement(below) || registry.is_liquid(below))
+    {
+        FLOWING_WATER_BLOCK_ID
+    } else {
+        AIR_BLOCK_ID
+    };
+    if !chunk_streamer.set_block_at_world(x, y, z, replacement_block) {
+        return false;
+    }
+    edit_latency_tracker.record_block_edit(x, z);
+    if let Some(drop) = block_drop_stack(block_id, true, registry, rng) {
+        crate::entity::spawn_dropped_item_stack(
+            ecs_runtime.world_mut(),
+            drop,
+            DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+        );
+    }
+    true
+}
+
+fn leaf_has_log_within_decay_distance(
+    chunk_streamer: &ChunkStreamer,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    const MAX_DISTANCE: u8 = 4;
+    let mut pending = VecDeque::new();
+    let mut visited = HashSet::new();
+    pending.push_back((x, y, z, 0_u8));
+    visited.insert((x, y, z));
+
+    while let Some((cx, cy, cz, distance)) = pending.pop_front() {
+        if distance >= MAX_DISTANCE {
+            continue;
+        }
+        for (nx, ny, nz) in [
+            (cx + 1, cy, cz),
+            (cx - 1, cy, cz),
+            (cx, cy + 1, cz),
+            (cx, cy - 1, cz),
+            (cx, cy, cz + 1),
+            (cx, cy, cz - 1),
+        ] {
+            if (nx - x).abs() > i32::from(MAX_DISTANCE)
+                || (ny - y).abs() > i32::from(MAX_DISTANCE)
+                || (nz - z).abs() > i32::from(MAX_DISTANCE)
+                || !visited.insert((nx, ny, nz))
+            {
+                continue;
+            }
+
+            let Some(block_id) = chunk_streamer.block_at_world(nx, ny, nz) else {
+                continue;
+            };
+            if block_id == OAK_LOG_BLOCK_ID {
+                return true;
+            }
+            if block_id == OAK_LEAVES_BLOCK_ID {
+                pending.push_back((nx, ny, nz, distance + 1));
+            }
+        }
+    }
+
+    false
+}
+
+fn can_survive_random_tick(
+    chunk_streamer: &ChunkStreamer,
+    registry: &BlockRegistry,
+    behavior: BlockBehavior,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    match behavior.survival_rule {
+        SurvivalRule::None => true,
+        SurvivalRule::Flower => {
+            if y <= 0 {
+                return false;
+            }
+            let bright = chunk_streamer.raw_brightness_at_world(x, y, z).unwrap_or(0) >= 8;
+            let sky_access = chunk_streamer.sky_light_at_world(x, y, z).unwrap_or(0) == 15;
+            (bright || sky_access)
+                && chunk_streamer
+                    .block_at_world(x, y - 1, z)
+                    .is_some_and(can_place_plant_on)
+        }
+        SurvivalRule::Mushroom => {
+            if y <= 0 {
+                return false;
+            }
+            chunk_streamer
+                .raw_brightness_at_world(x, y, z)
+                .unwrap_or(u8::MAX)
+                <= 13
+                && chunk_streamer
+                    .block_at_world(x, y - 1, z)
+                    .is_some_and(|below| registry.blocks_movement(below))
+        }
+        SurvivalRule::SugarCane => can_sugar_cane_survive(chunk_streamer, x, y, z),
+    }
+}
+
+fn tick_random_block_at(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
+    edit_latency_tracker: &mut EditLatencyTracker,
+    x: i32,
+    y: i32,
+    z: i32,
+    block_id: u8,
+    rng: &mut SmallRng,
+) -> bool {
+    let behavior = block_behavior(block_id);
+    if !can_survive_random_tick(chunk_streamer, registry, behavior, x, y, z) {
+        let broken = break_block_with_drop(
+            ecs_runtime,
+            chunk_streamer,
+            registry,
+            edit_latency_tracker,
+            x,
+            y,
+            z,
+            block_id,
+            rng,
+        );
+        if broken {
+            apply_post_edit_support_rules(
+                ecs_runtime,
+                chunk_streamer,
+                registry,
+                edit_latency_tracker,
+                x,
+                y,
+                z,
+            );
+        }
+        return broken;
+    }
+
+    match block_id {
+        GRASS_BLOCK_ID => {
+            let above_y = y + 1;
+            let above_block = chunk_streamer
+                .block_at_world(x, above_y, z)
+                .unwrap_or(AIR_BLOCK_ID);
+            let above_opaque = alpha_material_is_opaque(registry.material_of(above_block));
+            let above_brightness = chunk_streamer
+                .raw_brightness_at_world(x, above_y, z)
+                .unwrap_or(0);
+            if above_brightness < 4 && above_opaque {
+                if rng.gen_range(0..4) != 0 {
+                    return false;
+                }
+                if chunk_streamer.set_block_at_world(x, y, z, DIRT_BLOCK_ID) {
+                    edit_latency_tracker.record_block_edit(x, z);
+                    return true;
+                }
+                return false;
+            }
+            if above_brightness >= 9 {
+                let nx = x + rng.gen_range(-1..=1);
+                let ny = y + rng.gen_range(-3..=1);
+                let nz = z + rng.gen_range(-1..=1);
+                if chunk_streamer.block_at_world(nx, ny, nz) != Some(DIRT_BLOCK_ID) {
+                    return false;
+                }
+                let n_above = chunk_streamer
+                    .block_at_world(nx, ny + 1, nz)
+                    .unwrap_or(AIR_BLOCK_ID);
+                let n_above_opaque = registry.get(n_above).is_some_and(|def| def.opacity >= 255);
+                let n_brightness = chunk_streamer
+                    .raw_brightness_at_world(nx, ny + 1, nz)
+                    .unwrap_or(0);
+                if n_brightness >= 4
+                    && !n_above_opaque
+                    && chunk_streamer.set_block_at_world(nx, ny, nz, GRASS_BLOCK_ID)
+                {
+                    edit_latency_tracker.record_block_edit(nx, nz);
+                    return true;
+                }
+            }
+            false
+        }
+        OAK_LEAVES_BLOCK_ID => {
+            if leaf_has_log_within_decay_distance(chunk_streamer, x, y, z) {
+                false
+            } else {
+                break_block_with_drop(
+                    ecs_runtime,
+                    chunk_streamer,
+                    registry,
+                    edit_latency_tracker,
+                    x,
+                    y,
+                    z,
+                    block_id,
+                    rng,
+                )
+            }
+        }
+        SUGAR_CANE_BLOCK_ID => {
+            if chunk_streamer.block_at_world(x, y + 1, z) != Some(AIR_BLOCK_ID) {
+                return false;
+            }
+            let mut height = 1_i32;
+            while chunk_streamer.block_at_world(x, y - height, z) == Some(SUGAR_CANE_BLOCK_ID) {
+                height += 1;
+            }
+            if height >= 3 {
+                return false;
+            }
+            let meta = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
+            if meta >= 15 {
+                if chunk_streamer.set_block_at_world(x, y + 1, z, SUGAR_CANE_BLOCK_ID) {
+                    let _ = chunk_streamer.set_block_with_metadata_at_world(
+                        x,
+                        y,
+                        z,
+                        SUGAR_CANE_BLOCK_ID,
+                        0,
+                    );
+                    edit_latency_tracker.record_block_edit(x, z);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                chunk_streamer.set_block_with_metadata_at_world(
+                    x,
+                    y,
+                    z,
+                    SUGAR_CANE_BLOCK_ID,
+                    meta + 1,
+                )
+            }
+        }
+        SNOW_BLOCK_ID | SNOW_LAYER_BLOCK_ID => {
+            if chunk_streamer.block_light_at_world(x, y, z).unwrap_or(0) > 11 {
+                break_block_with_drop(
+                    ecs_runtime,
+                    chunk_streamer,
+                    registry,
+                    edit_latency_tracker,
+                    x,
+                    y,
+                    z,
+                    block_id,
+                    rng,
+                )
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn tick_random_blocks(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
+    edit_latency_tracker: &mut EditLatencyTracker,
+    center_chunk: ChunkPos,
+    random_tick_lcg: &mut i32,
+    rng: &mut SmallRng,
+) -> bool {
+    let mut changed = false;
+    for dz in -RANDOM_TICK_CHUNK_RADIUS..=RANDOM_TICK_CHUNK_RADIUS {
+        for dx in -RANDOM_TICK_CHUNK_RADIUS..=RANDOM_TICK_CHUNK_RADIUS {
+            let chunk_x = center_chunk.x + dx;
+            let chunk_z = center_chunk.z + dz;
+            let base_x = chunk_x * CHUNK_WIDTH as i32;
+            let base_z = chunk_z * CHUNK_DEPTH as i32;
+            for _ in 0..RANDOM_TICKS_PER_CHUNK {
+                let (local_x, y, local_z) = random_tick_local_coords(random_tick_lcg);
+                let world_x = base_x + local_x;
+                let world_z = base_z + local_z;
+                let Some(block_id) = chunk_streamer.block_at_world(world_x, y, world_z) else {
+                    continue;
+                };
+                if !registry.ticks_randomly_of(block_id) {
+                    continue;
+                }
+                if tick_random_block_at(
+                    ecs_runtime,
+                    chunk_streamer,
+                    registry,
+                    edit_latency_tracker,
+                    world_x,
+                    y,
+                    world_z,
+                    block_id,
+                    rng,
+                ) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn apply_post_edit_support_rules(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
+    edit_latency_tracker: &mut EditLatencyTracker,
+    origin_x: i32,
+    origin_y: i32,
+    origin_z: i32,
+) {
+    let mut pending = VecDeque::new();
+    let mut visited = HashSet::new();
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                pending.push_back((origin_x + dx, origin_y + dy, origin_z + dz));
+            }
+        }
+    }
+    while let Some((x, y, z)) = pending.pop_front() {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) || !visited.insert((x, y, z)) {
+            continue;
+        }
+        let Some(block_id) = chunk_streamer.block_at_world(x, y, z) else {
+            continue;
+        };
+        if block_id == AIR_BLOCK_ID {
+            continue;
+        }
+
+        let behavior = block_behavior(block_id);
+        let should_break = match behavior.survival_rule {
+            SurvivalRule::None => false,
+            SurvivalRule::Flower => {
+                !(y > 0
+                    && chunk_streamer
+                        .block_at_world(x, y - 1, z)
+                        .is_some_and(can_place_plant_on))
+            }
+            SurvivalRule::Mushroom => {
+                !(y > 0
+                    && chunk_streamer
+                        .block_at_world(x, y - 1, z)
+                        .is_some_and(|below| registry.blocks_movement(below)))
+            }
+            SurvivalRule::SugarCane => !can_sugar_cane_survive(chunk_streamer, x, y, z),
+        };
+        if !should_break {
+            continue;
+        }
+
+        if chunk_streamer.set_block_at_world(x, y, z, AIR_BLOCK_ID) {
+            edit_latency_tracker.record_block_edit(x, z);
+            let seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0_u64, |d| d.as_nanos() as u64)
+                ^ (u64::from(x as u32) << 32)
+                ^ (u64::from(y as u32) << 16)
+                ^ u64::from(z as u32);
+            let mut rng = SmallRng::seed_from_u64(seed);
+            if let Some(drop) = block_drop_stack(block_id, true, registry, &mut rng) {
+                crate::entity::spawn_dropped_item_stack(
+                    ecs_runtime.world_mut(),
+                    drop,
+                    DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+                );
+            }
+            for (nx, ny, nz) in [
+                (x, y + 1, z),
+                (x, y - 1, z),
+                (x + 1, y, z),
+                (x - 1, y, z),
+                (x, y, z + 1),
+                (x, y, z - 1),
+            ] {
+                pending.push_back((nx, ny, nz));
+            }
+        }
+    }
+}
+
+fn break_block_and_collect_drop(
+    ecs_runtime: &mut EcsRuntime,
+    chunk_streamer: &mut ChunkStreamer,
+    registry: &BlockRegistry,
     block_x: i32,
     block_y: i32,
     block_z: i32,
     edit_latency_tracker: &mut EditLatencyTracker,
     can_harvest: bool,
-) -> Option<Option<(u8, DVec3)>> {
+) -> Option<Option<(crate::inventory::ItemStack, DVec3)>> {
     let broken_block_id = chunk_streamer
         .block_at_world(block_x, block_y, block_z)
         .unwrap_or(AIR_BLOCK_ID);
@@ -1845,29 +2585,47 @@ fn alpha_break_block_and_collect_drop(
             crate::entity::spawn_dropped_item_stack(
                 ecs_runtime.world_mut(),
                 drop,
-                DVec3::new(block_x as f64 + ox, block_y as f64 + oy, block_z as f64 + oz),
+                DVec3::new(
+                    block_x as f64 + ox,
+                    block_y as f64 + oy,
+                    block_z as f64 + oz,
+                ),
             );
         }
     }
-    if !chunk_streamer.set_block_at_world(block_x, block_y, block_z, AIR_BLOCK_ID) {
+    let replacement_block = if broken_block_id == ICE_BLOCK_ID
+        && block_y > 0
+        && chunk_streamer
+            .block_at_world(block_x, block_y - 1, block_z)
+            .is_some_and(|below| registry.blocks_movement(below) || registry.is_liquid(below))
+    {
+        FLOWING_WATER_BLOCK_ID
+    } else {
+        AIR_BLOCK_ID
+    };
+    if !chunk_streamer.set_block_at_world(block_x, block_y, block_z, replacement_block) {
         return None;
     }
     edit_latency_tracker.record_block_edit(block_x, block_z);
+    apply_post_edit_support_rules(
+        ecs_runtime,
+        chunk_streamer,
+        registry,
+        edit_latency_tracker,
+        block_x,
+        block_y,
+        block_z,
+    );
     if !can_harvest {
         return Some(None);
     }
-    let drop_source_id = if broken_block_id == LIT_FURNACE_BLOCK_ID {
-        FURNACE_BLOCK_ID
-    } else {
-        broken_block_id
-    };
-    let drop_block_id = chunk_streamer.dropped_item_block_id(drop_source_id)?;
+    let drop_stack = block_drop_stack(broken_block_id, can_harvest, registry, &mut rng)?;
     let spawn_pos = DVec3::new(
         block_x as f64 + 0.5,
         block_y as f64 + 0.5,
         block_z as f64 + 0.5,
     );
-    Some(Some((drop_block_id, spawn_pos)))
+    Some(Some((drop_stack, spawn_pos)))
 }
 
 fn resolve_mining_tool(
@@ -1990,19 +2748,20 @@ fn try_start_block_mining(
         )
     };
     if calc.progress_per_tick >= 1.0 {
-        if let Some(drop) = alpha_break_block_and_collect_drop(
+        if let Some(drop) = break_block_and_collect_drop(
             ecs_runtime,
             chunk_streamer,
+            registry,
             target.x,
             target.y,
             target.z,
             edit_latency_tracker,
             calc.can_harvest,
         ) {
-            if let Some((drop_block_id, spawn_pos)) = drop {
-                crate::entity::spawn_dropped_item(
+            if let Some((drop_stack, spawn_pos)) = drop {
+                crate::entity::spawn_dropped_item_stack(
                     ecs_runtime.world_mut(),
-                    drop_block_id,
+                    drop_stack,
                     spawn_pos,
                 );
             }
@@ -2071,17 +2830,18 @@ fn tick_block_mining(
         return false;
     }
 
-    if let Some(drop) = alpha_break_block_and_collect_drop(
+    if let Some(drop) = break_block_and_collect_drop(
         ecs_runtime,
         chunk_streamer,
+        registry,
         target.x,
         target.y,
         target.z,
         edit_latency_tracker,
         calc.can_harvest,
     ) {
-        if let Some((drop_block_id, spawn_pos)) = drop {
-            crate::entity::spawn_dropped_item(ecs_runtime.world_mut(), drop_block_id, spawn_pos);
+        if let Some((drop_stack, spawn_pos)) = drop {
+            crate::entity::spawn_dropped_item_stack(ecs_runtime.world_mut(), drop_stack, spawn_pos);
         }
         *ecs_runtime.world_mut().resource_mut::<MiningState>() = mining_state;
         apply_post_block_break_effects(ecs_runtime, tool_registry, calc.tool);
@@ -2250,6 +3010,38 @@ fn can_replace_block_for_placement(registry: &BlockRegistry, target_block_id: u8
         || registry.is_lava(target_block_id)
         || target_block_id == FIRE_BLOCK_ID
         || registry.is_snow_layer(target_block_id)
+}
+
+fn alpha_can_place_block_at(
+    registry: &BlockRegistry,
+    chunk_streamer: &ChunkStreamer,
+    block_id: u8,
+    place_x: i32,
+    place_y: i32,
+    place_z: i32,
+) -> bool {
+    match block_behavior(block_id).placement_rule {
+        PlacementRule::Default => true,
+        PlacementRule::PlantSoil => {
+            if place_y <= 0 {
+                return false;
+            }
+            chunk_streamer
+                .block_at_world(place_x, place_y - 1, place_z)
+                .is_some_and(can_place_plant_on)
+        }
+        PlacementRule::SolidSupport => {
+            if place_y <= 0 {
+                return false;
+            }
+            chunk_streamer
+                .block_at_world(place_x, place_y - 1, place_z)
+                .is_some_and(|below| registry.blocks_movement(below))
+        }
+        PlacementRule::SugarCane => {
+            can_sugar_cane_survive(chunk_streamer, place_x, place_y, place_z)
+        }
+    }
 }
 
 fn alpha_is_chest_block(block_id: u8) -> bool {
@@ -2593,8 +3385,7 @@ fn process_single_block_interaction_request(
                 y: hit.block[1],
                 z: hit.block[2],
             };
-            let Some(menu) =
-                alpha_resolve_chest_menu_target(registry, chunk_streamer, chest_pos)
+            let Some(menu) = alpha_resolve_chest_menu_target(registry, chunk_streamer, chest_pos)
             else {
                 return None;
             };
@@ -2678,6 +3469,14 @@ fn try_place_selected_block(
     };
     if (place_target_block == AIR_BLOCK_ID
         || can_replace_block_for_placement(registry, place_target_block))
+        && alpha_can_place_block_at(
+            registry,
+            chunk_streamer,
+            block_id,
+            place_x,
+            place_y,
+            place_z,
+        )
         && chunk_streamer.set_block_with_metadata_at_world(
             place_x,
             place_y,
@@ -2710,6 +3509,15 @@ fn try_place_selected_block(
             .resource_mut::<PlayerInventoryState>()
             .apply(InventoryCommand::ConsumeSelected { amount: 1 });
         edit_latency_tracker.record_block_edit(place_x, place_z);
+        apply_post_edit_support_rules(
+            ecs_runtime,
+            chunk_streamer,
+            registry,
+            edit_latency_tracker,
+            place_x,
+            place_y,
+            place_z,
+        );
         return true;
     }
     false
@@ -2773,10 +3581,7 @@ fn is_point_inside_inventory_panel(
     let (panel_w, panel_h) = menu_panel_size(menu);
     let mx = mouse_x / layout.scale;
     let my = mouse_y / layout.scale;
-    mx >= layout.left
-        && mx < layout.left + panel_w
-        && my >= layout.top
-        && my < layout.top + panel_h
+    mx >= layout.left && mx < layout.left + panel_w && my >= layout.top && my < layout.top + panel_h
 }
 
 fn raycast_first_solid_block<F>(
@@ -4326,23 +5131,31 @@ pub(crate) fn resolve_axis(
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
     use std::time::Duration;
 
     use glam::DVec3;
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
     use winit::keyboard::KeyCode;
 
     use super::{
         affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
-        alpha_can_place_chest_at, alpha_chest_facing_from_solid_neighbors,
-        alpha_block_mining_calc, alpha_brightness_from_light_level,
-        alpha_fog_brightness_target, alpha_horizontal_face_from_look,
-        alpha_opposite_face, alpha_placement_metadata_from_look, alpha_star_brightness,
-        alpha_sunrise_color, alpha_time_of_day, can_replace_block_for_placement,
-        has_target_directive, hotbar_slot_for_key,
+        block_drop_stack, alpha_block_mining_calc, alpha_brightness_from_light_level,
+        alpha_can_place_chest_at, can_place_plant_on,
+        alpha_chest_facing_from_solid_neighbors, alpha_fog_brightness_target,
+        alpha_horizontal_face_from_look, alpha_opposite_face, alpha_placement_metadata_from_look,
+        alpha_star_brightness, alpha_sunrise_color, alpha_time_of_day, block_behavior,
+        break_block_with_drop,
+        can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
         is_point_inside_inventory_panel, is_raycast_targetable_block, parse_env_bool,
-        parse_env_u32, placement_intersects_player, raycast_first_solid_block, resolve_axis,
-        AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, CHEST_BLOCK_ID, FURNACE_BLOCK_ID,
-        LIT_FURNACE_BLOCK_ID, LIT_PUMPKIN_BLOCK_ID, PUMPKIN_BLOCK_ID,
+        parse_env_u32, placement_intersects_player, random_tick_lcg_next,
+        raycast_first_solid_block, resolve_axis, tick_random_block_at, tick_random_blocks,
+        AdaptiveFluidBudget, BlockRayHit, DropRule, EditLatencyTracker, PlacementRule,
+        SurvivalRule, AIR_BLOCK_ID, CHEST_BLOCK_ID, FLOWING_WATER_BLOCK_ID, FURNACE_BLOCK_ID, LIT_FURNACE_BLOCK_ID,
+        LIT_PUMPKIN_BLOCK_ID, OAK_LEAVES_BLOCK_ID, OAK_LOG_BLOCK_ID, PUMPKIN_BLOCK_ID,
+        RANDOM_TICKS_PER_CHUNK, RANDOM_TICK_CHUNK_RADIUS, SUGAR_CANE_BLOCK_ID,
+        WATER_BLOCK_ID, DIRT_BLOCK_ID, GRASS_BLOCK_ID, ICE_BLOCK_ID,
     };
     use crate::crafting::CraftingRegistry;
     use crate::ecs::EcsRuntime;
@@ -4350,10 +5163,30 @@ mod tests {
         apply_post_block_break_effects, run_inventory_command_system, InventoryCommandQueue,
         MiningState, MiningToolKind, ALPHA_MINING_COOLDOWN_TICKS,
     };
-    use crate::inventory::{InventoryCommand, InventoryMenuKind, ItemStack, PlayerInventoryState};
+    use crate::inventory::{
+        InventoryCommand, InventoryMenuKind, ItemKey, ItemStack, PlayerInventoryState,
+    };
     use crate::streaming::{ChunkStreamer, ResidencyConfig};
     use crate::tool::ToolRegistry;
     use crate::world::{BlockRegistry, ChunkPos, CHUNK_DEPTH, CHUNK_WIDTH};
+
+    fn wait_until_streamer_has_block(
+        streamer: &mut ChunkStreamer,
+        target: ChunkPos,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+    ) {
+        let _ = streamer.update_target(target);
+        for _ in 0..240 {
+            streamer.tick(target);
+            if streamer.block_at_world(world_x, world_y, world_z).is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("streamer did not load test chunk in time");
+    }
 
     #[test]
     fn detects_target_directives_exactly() {
@@ -4584,6 +5417,334 @@ mod tests {
     }
 
     #[test]
+    fn break_drop_rules_match_special_cases() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut rng = SmallRng::seed_from_u64(0xA126);
+
+        let grass = block_drop_stack(2, true, &registry, &mut rng).expect("grass drop");
+        assert_eq!(grass, ItemStack::block(3, 1));
+
+        let coal_ore = block_drop_stack(16, true, &registry, &mut rng).expect("coal drop");
+        assert_eq!(coal_ore, ItemStack::item(263, 1));
+
+        let diamond_ore =
+            block_drop_stack(56, true, &registry, &mut rng).expect("diamond drop");
+        assert_eq!(diamond_ore, ItemStack::item(264, 1));
+
+        let cane = block_drop_stack(83, true, &registry, &mut rng).expect("reeds drop");
+        assert_eq!(cane, ItemStack::item(338, 1));
+
+        // Leaves never drop themselves in Alpha; they occasionally drop saplings.
+        let mut saw_sapling = false;
+        for _ in 0..200 {
+            if let Some(drop) = block_drop_stack(18, true, &registry, &mut rng) {
+                assert_eq!(drop, ItemStack::block(6, 1));
+                saw_sapling = true;
+            }
+        }
+        assert!(saw_sapling);
+    }
+
+    #[test]
+    fn break_drop_rules_cover_gravel_clay_glowstone_and_snow() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut rng = SmallRng::seed_from_u64(0xC1A7_2026);
+
+        let clay = block_drop_stack(82, true, &registry, &mut rng).expect("clay drop");
+        assert_eq!(clay, ItemStack::item(337, 4));
+
+        let glow = block_drop_stack(89, true, &registry, &mut rng).expect("glowstone drop");
+        assert_eq!(glow, ItemStack::item(348, 1));
+
+        let snow = block_drop_stack(80, true, &registry, &mut rng).expect("snow drop");
+        assert_eq!(snow, ItemStack::item(332, 4));
+
+        let snow_layer =
+            block_drop_stack(78, true, &registry, &mut rng).expect("snow layer drop");
+        assert_eq!(snow_layer, ItemStack::item(332, 1));
+
+        let mut saw_flint = false;
+        let mut saw_gravel = false;
+        for _ in 0..160 {
+            let drop = block_drop_stack(13, true, &registry, &mut rng).expect("gravel drop");
+            match drop.item {
+                ItemKey::Item(318) => saw_flint = true,
+                ItemKey::Block(13) => saw_gravel = true,
+                _ => panic!("unexpected gravel drop: {drop:?}"),
+            }
+        }
+        assert!(saw_flint);
+        assert!(saw_gravel);
+    }
+
+    #[test]
+    fn break_drop_rules_cover_stone_glass_bookshelf_spawner_and_ice() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut rng = SmallRng::seed_from_u64(2);
+
+        let stone = block_drop_stack(1, true, &registry, &mut rng).expect("stone drop");
+        assert_eq!(stone.item, ItemKey::Block(4));
+        assert_eq!(stone.count, 1);
+
+        assert!(block_drop_stack(20, true, &registry, &mut rng).is_none());
+        assert!(block_drop_stack(47, true, &registry, &mut rng).is_none());
+        assert!(block_drop_stack(52, true, &registry, &mut rng).is_none());
+        assert!(block_drop_stack(79, true, &registry, &mut rng).is_none());
+    }
+
+    #[test]
+    fn breaking_ice_replaces_with_flowing_water_when_blocked_below() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(777, registry.clone(), ResidencyConfig::default());
+        wait_until_streamer_has_block(&mut streamer, ChunkPos { x: 0, z: 0 }, 8, 40, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+
+        let _ = streamer.set_block_at_world(8, 39, 8, 1);
+        let _ = streamer.set_block_at_world(8, 40, 8, ICE_BLOCK_ID);
+        assert_eq!(streamer.block_at_world(8, 39, 8), Some(1));
+        assert_eq!(streamer.block_at_world(8, 40, 8), Some(ICE_BLOCK_ID));
+        let mut rng = SmallRng::seed_from_u64(999);
+        assert!(break_block_with_drop(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            40,
+            8,
+            ICE_BLOCK_ID,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 40, 8), Some(FLOWING_WATER_BLOCK_ID));
+    }
+
+    #[test]
+    fn behavior_table_exposes_expected_special_rules() {
+        let reeds = block_behavior(83);
+        assert_eq!(reeds.placement_rule, PlacementRule::SugarCane);
+        assert_eq!(reeds.survival_rule, SurvivalRule::SugarCane);
+
+        let flower = block_behavior(37);
+        assert_eq!(flower.placement_rule, PlacementRule::PlantSoil);
+        assert_eq!(flower.survival_rule, SurvivalRule::Flower);
+
+        let coal = block_behavior(16);
+        assert_eq!(
+            coal.drop_rule,
+            DropRule::Item {
+                item_id: 263,
+                min_count: 1,
+                max_count: 1
+            }
+        );
+
+        let gravel = block_behavior(13);
+        assert_eq!(
+            gravel.drop_rule,
+            DropRule::ChanceItem {
+                item_id: 318,
+                chance_denominator: 10,
+                fallback_block_id: Some(13)
+            }
+        );
+    }
+
+    #[test]
+    fn flower_placement_supports_grass_dirt_and_farmland_only() {
+        assert!(can_place_plant_on(2)); // grass
+        assert!(can_place_plant_on(3)); // dirt
+        assert!(can_place_plant_on(60)); // farmland
+        assert!(!can_place_plant_on(1)); // stone
+        assert!(!can_place_plant_on(12)); // sand
+    }
+
+    #[test]
+    fn random_tick_leaves_decay_after_log_support_is_removed() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(123, registry.clone(), ResidencyConfig::default());
+        wait_until_streamer_has_block(&mut streamer, ChunkPos { x: 0, z: 0 }, 8, 70, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        for dy in -4..=4 {
+            for dz in -4..=4 {
+                for dx in -4..=4 {
+                    let _ = streamer.set_block_at_world(8 + dx, 70 + dy, 8 + dz, AIR_BLOCK_ID);
+                }
+            }
+        }
+        let _ = streamer.set_block_at_world(8, 69, 8, OAK_LOG_BLOCK_ID);
+        assert!(streamer.set_block_with_metadata_at_world(8, 70, 8, OAK_LEAVES_BLOCK_ID, 0));
+
+        assert!(!tick_random_block_at(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            70,
+            8,
+            18,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 70, 8), Some(OAK_LEAVES_BLOCK_ID));
+
+        let _ = streamer.set_block_at_world(8, 69, 8, AIR_BLOCK_ID);
+        assert!(tick_random_block_at(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            70,
+            8,
+            18,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 70, 8), Some(AIR_BLOCK_ID));
+    }
+
+    #[test]
+    fn random_tick_grass_underwater_decays_via_alpha_tick_rule() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(321, registry.clone(), ResidencyConfig::default());
+        wait_until_streamer_has_block(&mut streamer, ChunkPos { x: 0, z: 0 }, 8, 30, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(77);
+
+        assert!(streamer.set_block_at_world(8, 31, 8, WATER_BLOCK_ID));
+        assert!(streamer.set_block_at_world(8, 30, 8, GRASS_BLOCK_ID));
+        assert_eq!(streamer.block_at_world(8, 30, 8), Some(GRASS_BLOCK_ID));
+        assert!(
+            matches!(
+                streamer.block_at_world(8, 31, 8),
+                Some(WATER_BLOCK_ID | FLOWING_WATER_BLOCK_ID)
+            ),
+            "expected water directly above grass"
+        );
+        let mut decayed = false;
+        for _ in 0..128 {
+            let _ = tick_random_block_at(
+                &mut ecs,
+                &mut streamer,
+                &registry,
+                &mut latency,
+                8,
+                30,
+                8,
+                GRASS_BLOCK_ID,
+                &mut rng,
+            );
+            if streamer.block_at_world(8, 30, 8) == Some(DIRT_BLOCK_ID) {
+                decayed = true;
+                break;
+            }
+        }
+        assert!(decayed, "grass should eventually decay under opaque-above rule");
+        assert_eq!(streamer.block_at_world(8, 30, 8), Some(DIRT_BLOCK_ID));
+    }
+
+    #[test]
+    fn random_tick_unsupported_sugar_cane_breaks_entire_stack() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(654, registry.clone(), ResidencyConfig::default());
+        wait_until_streamer_has_block(&mut streamer, ChunkPos { x: 0, z: 0 }, 8, 40, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(88);
+
+        let _ = streamer.set_block_at_world(8, 39, 8, 12);
+        let _ = streamer.set_block_at_world(8, 40, 8, SUGAR_CANE_BLOCK_ID);
+        let _ = streamer.set_block_at_world(8, 41, 8, SUGAR_CANE_BLOCK_ID);
+        let _ = streamer.set_block_at_world(8, 42, 8, SUGAR_CANE_BLOCK_ID);
+
+        assert!(tick_random_block_at(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            40,
+            8,
+            SUGAR_CANE_BLOCK_ID,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 40, 8), Some(AIR_BLOCK_ID));
+        assert_eq!(streamer.block_at_world(8, 41, 8), Some(AIR_BLOCK_ID));
+        assert_eq!(streamer.block_at_world(8, 42, 8), Some(AIR_BLOCK_ID));
+    }
+
+    #[test]
+    fn random_tick_flower_breaks_in_low_light_closed_space() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(456, registry.clone(), ResidencyConfig::default());
+        wait_until_streamer_has_block(&mut streamer, ChunkPos { x: 0, z: 0 }, 8, 20, 8);
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(7);
+
+        for y in 20..=22 {
+            for z in 7..=9 {
+                for x in 7..=9 {
+                    let _ = streamer.set_block_at_world(x, y, z, 1);
+                }
+            }
+        }
+        let _ = streamer.set_block_at_world(8, 19, 8, 3);
+        let _ = streamer.set_block_at_world(8, 20, 8, 37);
+        assert_eq!(streamer.block_at_world(8, 20, 8), Some(37));
+        assert!(
+            streamer.raw_brightness_at_world(8, 20, 8).unwrap_or(15) < 8,
+            "expected low-light chamber"
+        );
+
+        assert!(tick_random_block_at(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            8,
+            20,
+            8,
+            37,
+            &mut rng,
+        ));
+        assert_eq!(streamer.block_at_world(8, 20, 8), Some(0));
+    }
+
+    #[test]
+    fn random_tick_scheduler_consumes_attempt_budget() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let mut streamer = ChunkStreamer::new(789, registry.clone(), ResidencyConfig::default());
+        let mut ecs = EcsRuntime::new();
+        let mut latency = EditLatencyTracker::default();
+        let mut rng = SmallRng::seed_from_u64(99);
+        let mut lcg = 1_i32;
+
+        let attempts =
+            ((RANDOM_TICK_CHUNK_RADIUS * 2 + 1) as usize).pow(2) * RANDOM_TICKS_PER_CHUNK;
+        let mut expected = lcg;
+        for _ in 0..attempts {
+            let _ = random_tick_lcg_next(&mut expected);
+        }
+
+        let changed = tick_random_blocks(
+            &mut ecs,
+            &mut streamer,
+            &registry,
+            &mut latency,
+            ChunkPos { x: 0, z: 0 },
+            &mut lcg,
+            &mut rng,
+        );
+        assert!(!changed);
+        assert_eq!(lcg, expected);
+    }
+
+    #[test]
     fn raycast_hits_expected_voxel_and_face() {
         let hit = raycast_first_solid_block(
             DVec3::new(0.5, 1.5, 0.5),
@@ -4609,10 +5770,22 @@ mod tests {
 
     #[test]
     fn alpha_face_mapping_from_look_direction_matches_cardinals() {
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, 1.0)), 3);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, -1.0)), 2);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(1.0, 0.0, 0.0)), 5);
-        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(-1.0, 0.0, 0.0)), 4);
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, 1.0)),
+            3
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, -1.0)),
+            2
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(1.0, 0.0, 0.0)),
+            5
+        );
+        assert_eq!(
+            alpha_horizontal_face_from_look(DVec3::new(-1.0, 0.0, 0.0)),
+            4
+        );
         assert_eq!(alpha_opposite_face(2), 3);
         assert_eq!(alpha_opposite_face(5), 4);
     }
@@ -4665,10 +5838,7 @@ mod tests {
 
     #[test]
     fn chest_placement_rejects_triple_chest_layout() {
-        let blocks = vec![
-            ((-1, 0, 0), CHEST_BLOCK_ID),
-            ((1, 0, 0), CHEST_BLOCK_ID),
-        ];
+        let blocks = vec![((-1, 0, 0), CHEST_BLOCK_ID), ((1, 0, 0), CHEST_BLOCK_ID)];
         let lookup = |x: i32, y: i32, z: i32| {
             blocks
                 .iter()
@@ -4680,10 +5850,7 @@ mod tests {
 
     #[test]
     fn chest_placement_rejects_attaching_to_existing_double_chest() {
-        let blocks = vec![
-            ((0, 0, 0), CHEST_BLOCK_ID),
-            ((1, 0, 0), CHEST_BLOCK_ID),
-        ];
+        let blocks = vec![((0, 0, 0), CHEST_BLOCK_ID), ((1, 0, 0), CHEST_BLOCK_ID)];
         let lookup = |x: i32, y: i32, z: i32| {
             blocks
                 .iter()
@@ -4843,3 +6010,4 @@ mod tests {
         assert!(slice <= 20);
     }
 }
+
