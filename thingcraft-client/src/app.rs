@@ -1,5 +1,9 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use glam::{DVec3, Mat4, Vec3};
@@ -52,6 +56,7 @@ const DAY_TICKS: u64 = 24_000;
 const WORLD_SEED: u64 = 0xA126_0001;
 const ALPHA_MINING_COOLDOWN_TICKS: u8 = 5;
 const FIRE_BLOCK_ID: u8 = 51;
+const BENCH_MOVE_ASCEND_BLOCKS: f64 = 20.0;
 
 #[derive(Debug, Clone, Copy)]
 struct BlockInteractionRequest {
@@ -129,6 +134,36 @@ struct LoopReport {
     tps: f64,
     avg_frame_ms: f64,
     avg_tick_ms: f64,
+}
+
+#[derive(Debug, Clone)]
+struct BenchConfig {
+    enabled: bool,
+    still_secs: u32,
+    turn_secs: u32,
+    move_secs: u32,
+    turn_pixels_per_sec: f64,
+    output_path: PathBuf,
+}
+
+struct BenchRuntime {
+    config: BenchConfig,
+    start: Instant,
+    output: File,
+    last_phase: BenchPhase,
+    screenshot_run_dir: PathBuf,
+    screenshot_latest_dir: PathBuf,
+    captured_still: bool,
+    captured_turn: bool,
+    captured_move: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BenchPhase {
+    Still,
+    Turn,
+    Move,
+    Done,
 }
 
 #[derive(Debug, Default)]
@@ -337,6 +372,137 @@ impl LoopStats {
     }
 }
 
+impl BenchRuntime {
+    fn new(config: BenchConfig) -> Result<Self> {
+        let screenshot_run_dir = screenshot_run_dir_for_output(&config.output_path);
+        let screenshot_latest_dir = screenshot_latest_dir_for_output(&config.output_path);
+        if let Some(parent) = config.output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut output = File::create(&config.output_path)?;
+        writeln!(
+            output,
+            "phase,elapsed_s,fps,tps,avg_frame_ms,avg_tick_ms,resident_chunks,ready_chunks,generating_chunks,meshing_chunks,evicting_chunks,dirty_chunks,visible_chunks"
+        )?;
+        Ok(Self {
+            config,
+            start: Instant::now(),
+            output,
+            last_phase: BenchPhase::Still,
+            screenshot_run_dir,
+            screenshot_latest_dir,
+            captured_still: false,
+            captured_turn: false,
+            captured_move: false,
+        })
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    fn phase(&self) -> BenchPhase {
+        let elapsed = self.elapsed().as_secs_f32();
+        let still_end = self.config.still_secs as f32;
+        let turn_end = still_end + self.config.turn_secs as f32;
+        let move_end = turn_end + self.config.move_secs as f32;
+        if elapsed < still_end {
+            BenchPhase::Still
+        } else if elapsed < turn_end {
+            BenchPhase::Turn
+        } else if elapsed < move_end {
+            BenchPhase::Move
+        } else {
+            BenchPhase::Done
+        }
+    }
+
+    fn phase_name(&self) -> &'static str {
+        match self.phase() {
+            BenchPhase::Still => "still",
+            BenchPhase::Turn => "turn",
+            BenchPhase::Move => "move",
+            BenchPhase::Done => "done",
+        }
+    }
+
+    fn apply_controls(&mut self, ecs_runtime: &mut EcsRuntime, frame_delta: Duration) {
+        let phase = self.phase();
+        if phase != self.last_phase {
+            if matches!(phase, BenchPhase::Move) {
+                ecs_runtime.offset_player_position(DVec3::new(0.0, BENCH_MOVE_ASCEND_BLOCKS, 0.0));
+                ecs_runtime.set_look_angles(0.0, 0.0);
+            }
+            self.last_phase = phase;
+        }
+
+        let move_forward = matches!(phase, BenchPhase::Move);
+        ecs_runtime.handle_key(KeyCode::KeyW, move_forward);
+        if matches!(phase, BenchPhase::Turn) {
+            let delta_x = self.config.turn_pixels_per_sec * frame_delta.as_secs_f64();
+            ecs_runtime.add_mouse_delta(delta_x, 0.0);
+        }
+    }
+
+    fn write_sample(
+        &mut self,
+        report: LoopReport,
+        residency: crate::streaming::ResidencyMetrics,
+        visible_chunks: usize,
+    ) -> Result<()> {
+        writeln!(
+            self.output,
+            "{},{:.3},{:.2},{:.2},{:.3},{:.3},{},{},{},{},{},{},{},",
+            self.phase_name(),
+            self.elapsed().as_secs_f64(),
+            report.fps,
+            report.tps,
+            report.avg_frame_ms,
+            report.avg_tick_ms,
+            residency.total,
+            residency.ready,
+            residency.generating,
+            residency.meshing,
+            residency.evicting,
+            residency.dirty_chunks,
+            visible_chunks
+        )?;
+        Ok(())
+    }
+
+    fn take_screenshot_request(&mut self) -> Option<Vec<PathBuf>> {
+        let elapsed_s = self.elapsed().as_secs_f32();
+        let still_trigger = bench_phase_capture_offset(self.config.still_secs);
+        let turn_trigger = self.config.still_secs as f32 + bench_phase_capture_offset(self.config.turn_secs);
+        let move_trigger = self.config.still_secs as f32
+            + self.config.turn_secs as f32
+            + bench_phase_capture_offset(self.config.move_secs);
+
+        if !self.captured_still && elapsed_s >= still_trigger {
+            self.captured_still = true;
+            return Some(self.screenshot_paths_for_label("still"));
+        }
+        if !self.captured_turn && elapsed_s >= turn_trigger {
+            self.captured_turn = true;
+            return Some(self.screenshot_paths_for_label("turn"));
+        }
+        if !self.captured_move && elapsed_s >= move_trigger {
+            self.captured_move = true;
+            return Some(self.screenshot_paths_for_label("move"));
+        }
+        None
+    }
+
+    fn screenshot_paths_for_label(&self, label: &str) -> Vec<PathBuf> {
+        vec![
+            self.screenshot_run_dir.join(format!("{label}.png")),
+            self.screenshot_latest_dir.join(format!("latest_{label}.png")),
+        ]
+    }
+}
+
 impl EditLatencyTracker {
     fn record_block_edit(&mut self, world_x: i32, world_z: i32) {
         let now = Instant::now();
@@ -419,6 +585,12 @@ pub fn run() -> Result<()> {
         bootstrap_world.registry.clone(),
         residency_config,
     );
+    let bench_config = resolve_bench_config();
+    let mut bench_runtime = if bench_config.enabled {
+        Some(BenchRuntime::new(bench_config.clone())?)
+    } else {
+        None
+    };
     let biome_source = BiomeSource::new(WORLD_SEED);
     let alpha_view_distance = alpha_view_distance_setting(residency_config.view_radius);
     let render_distance_blocks = alpha_render_distance_blocks(alpha_view_distance);
@@ -480,6 +652,7 @@ pub fn run() -> Result<()> {
         fluid_tick_budget_min = adaptive_fluid_budget.min(),
         fluid_tick_budget_max = adaptive_fluid_budget.max(),
         fancy_graphics,
+        bench_enabled = bench_config.enabled,
         selected_hotbar_slot = usize::from(inventory_state.selected_hotbar) + 1,
         selected_place_block = selected_slot.and_then(|stack| match stack.item {
             ItemKey::Block(id) if stack.count > 0 => Some(id),
@@ -488,6 +661,18 @@ pub fn run() -> Result<()> {
         selected_place_count = selected_slot.map_or(0, |stack| stack.count),
         "thingcraft client booted"
     );
+    if let Some(bench) = &bench_runtime {
+        info!(
+            still_secs = bench.config.still_secs,
+            turn_secs = bench.config.turn_secs,
+            move_secs = bench.config.move_secs,
+            turn_px_per_sec = bench.config.turn_pixels_per_sec,
+            output = %bench.config.output_path.display(),
+            screenshot_run_dir = %bench.screenshot_run_dir.display(),
+            screenshot_latest_dir = %bench.screenshot_latest_dir.display(),
+            "benchmark mode enabled"
+        );
+    }
 
     event_loop.run(move |event, event_loop| {
         event_loop.set_control_flow(ControlFlow::Poll);
@@ -512,6 +697,10 @@ pub fn run() -> Result<()> {
                     // Inventory screen should not preserve prior movement/look intents.
                     if inventory_open {
                         ecs_runtime.clear_input_state();
+                    }
+                    if let Some(bench) = &mut bench_runtime {
+                        ecs_runtime.clear_input_state();
+                        bench.apply_controls(&mut ecs_runtime, frame_delta);
                     }
                     ecs_runtime.run_input();
 
@@ -981,6 +1170,12 @@ pub fn run() -> Result<()> {
                         hud_dirty = false;
                     }
 
+                    if let Some(bench) = &mut bench_runtime {
+                        if let Some(paths) = bench.take_screenshot_request() {
+                            renderer.request_screenshot_paths(paths);
+                        }
+                    }
+
                     let render_result = {
                         let _render_span = tracing::info_span!("render").entered();
                         renderer.render()
@@ -1005,6 +1200,15 @@ pub fn run() -> Result<()> {
                     {
                         let residency = chunk_streamer.metrics();
                         let edit_latency = edit_latency_tracker.metrics();
+                        if let Some(bench) = &mut bench_runtime {
+                            if let Err(err) = bench.write_sample(
+                                report,
+                                residency,
+                                renderer.visible_chunk_count(),
+                            ) {
+                                warn!(?err, "failed to write benchmark sample");
+                            }
+                        }
                         if let Some(snapshot) = frame_camera {
                             debug!(
                                 fps = report.fps,
@@ -1078,8 +1282,21 @@ pub fn run() -> Result<()> {
                             "runtime stats"
                         );
                     }
+                    if let Some(bench) = &bench_runtime {
+                        if bench.phase() == BenchPhase::Done {
+                            info!(
+                                output = %bench.config.output_path.display(),
+                                "benchmark finished; exiting"
+                            );
+                            event_loop.exit();
+                            return;
+                        }
+                    }
                 }},
                 WindowEvent::KeyboardInput { event, .. } => {
+                    if bench_runtime.is_some() {
+                        return;
+                    }
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let is_pressed = event.state == ElementState::Pressed;
                         let player_dead = ecs_runtime.player_is_dead();
@@ -1202,6 +1419,9 @@ pub fn run() -> Result<()> {
                     state: ElementState::Pressed,
                     ..
                 } => {
+                    if bench_runtime.is_some() {
+                        return;
+                    }
                     if ecs_runtime.player_is_dead() {
                         return;
                     }
@@ -1237,6 +1457,9 @@ pub fn run() -> Result<()> {
                     state: ElementState::Released,
                     ..
                 } => {
+                    if bench_runtime.is_some() {
+                        return;
+                    }
                     left_mouse_held = false;
                     mining_swing_hold_ticks = 0;
                     mining_start_requested = false;
@@ -1247,6 +1470,9 @@ pub fn run() -> Result<()> {
                     state: ElementState::Pressed,
                     ..
                 } => {
+                    if bench_runtime.is_some() {
+                        return;
+                    }
                     if ecs_runtime.player_is_dead() {
                         return;
                     }
@@ -1282,6 +1508,9 @@ pub fn run() -> Result<()> {
                     }
                 },
                 WindowEvent::MouseWheel { delta, .. } => {
+                    if bench_runtime.is_some() {
+                        return;
+                    }
                     if inventory_open || ecs_runtime.player_is_dead() {
                         return;
                     }
@@ -1297,6 +1526,9 @@ pub fn run() -> Result<()> {
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
+                    if bench_runtime.is_some() {
+                        return;
+                    }
                     mouse_screen_pos = [position.x as f32, position.y as f32];
                     if inventory_open {
                         hud_dirty = true;
@@ -1308,6 +1540,9 @@ pub fn run() -> Result<()> {
                 event: DeviceEvent::MouseMotion { delta },
                 ..
             } if mouse_captured && !inventory_open => {
+                if bench_runtime.is_some() {
+                    return;
+                }
                 if ecs_runtime.player_is_dead() {
                     return;
                 }
@@ -2102,6 +2337,59 @@ fn resolve_fluid_tick_budget() -> usize {
 
 fn resolve_fancy_graphics() -> bool {
     parse_env_bool("THINGCRAFT_FANCY_GRAPHICS").unwrap_or(true)
+}
+
+fn resolve_bench_config() -> BenchConfig {
+    let enabled = parse_env_bool("THINGCRAFT_BENCH").unwrap_or(false);
+    let still_secs = parse_env_u32("THINGCRAFT_BENCH_STILL_SECS").unwrap_or(10);
+    let turn_secs = parse_env_u32("THINGCRAFT_BENCH_TURN_SECS").unwrap_or(10);
+    let move_secs = parse_env_u32("THINGCRAFT_BENCH_MOVE_SECS").unwrap_or(10);
+    let turn_pixels_per_sec = std::env::var("THINGCRAFT_BENCH_TURN_PX_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(240.0);
+    let output_path = std::env::var("THINGCRAFT_BENCH_OUTPUT")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_bench_output_path);
+    BenchConfig {
+        enabled,
+        still_secs,
+        turn_secs,
+        move_secs,
+        turn_pixels_per_sec,
+        output_path,
+    }
+}
+
+fn default_bench_output_path() -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    PathBuf::from(format!("docs/reports/benchmarks/bench_{stamp}.csv"))
+}
+
+fn screenshot_latest_dir_for_output(output_path: &std::path::Path) -> PathBuf {
+    output_path
+        .parent()
+        .map_or_else(|| PathBuf::from("docs/reports/benchmarks"), PathBuf::from)
+}
+
+fn screenshot_run_dir_for_output(output_path: &std::path::Path) -> PathBuf {
+    let root = screenshot_latest_dir_for_output(output_path);
+    let stem = output_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bench");
+    root.join(format!("{stem}_screens"))
+}
+
+fn bench_phase_capture_offset(duration_secs: u32) -> f32 {
+    if duration_secs <= 1 {
+        (duration_secs as f32) * 0.5
+    } else {
+        duration_secs as f32 - 1.0
+    }
 }
 
 fn parse_env_u32(key: &str) -> Option<u32> {

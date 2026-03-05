@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Context, Result};
 use glam::Mat4;
 use thiserror::Error;
+use tracing::{info, warn};
 use wgpu::util::DeviceExt;
 use wgpu::{CompositeAlphaMode, PresentMode, SurfaceError};
 use winit::dpi::PhysicalSize;
@@ -81,6 +84,7 @@ pub struct Renderer<'w> {
     /// View-proj with translation stripped — for sky dome and celestial bodies (infinite distance).
     cached_sky_view_proj: [[f32; 4]; 4],
     visible_chunk_meshes: usize,
+    surface_copy_src_supported: bool,
     hud_pipeline: wgpu::RenderPipeline,
     hud_uniform_buffer: wgpu::Buffer,
     hud_uniform_bind_group: wgpu::BindGroup,
@@ -111,6 +115,7 @@ pub struct Renderer<'w> {
     first_person_skin_bind_group: wgpu::BindGroup,
     render_debug_toggles: RenderDebugToggles,
     gpu_profiler: Option<GpuProfiler>,
+    pending_screenshot_paths: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +162,14 @@ struct SceneMeshGpu {
     index_format: wgpu::IndexFormat,
     vertex_bytes: u64,
     index_bytes: u64,
+}
+
+struct PendingScreenshotCapture {
+    paths: Vec<PathBuf>,
+    buffer: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
 }
 
 enum PackedIndices {
@@ -1075,9 +1088,18 @@ impl<'w> Renderer<'w> {
             .copied()
             .find(|mode| *mode == CompositeAlphaMode::Opaque)
             .unwrap_or(surface_caps.alpha_modes[0]);
+        let surface_copy_src_supported = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let surface_usage = if surface_copy_src_supported {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
+        if !surface_copy_src_supported {
+            warn!("surface does not support COPY_SRC; benchmark screenshots disabled");
+        }
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: surface_usage,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -2627,6 +2649,7 @@ impl<'w> Renderer<'w> {
             cached_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             cached_sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             visible_chunk_meshes: 0,
+            surface_copy_src_supported,
             hud_pipeline,
             hud_uniform_buffer,
             hud_uniform_bind_group,
@@ -2657,6 +2680,7 @@ impl<'w> Renderer<'w> {
             first_person_skin_bind_group,
             render_debug_toggles,
             gpu_profiler,
+            pending_screenshot_paths: None,
         })
     }
 
@@ -3200,6 +3224,17 @@ impl<'w> Renderer<'w> {
         self.depth_view = depth_view;
     }
 
+    pub fn request_screenshot_paths(&mut self, paths: Vec<PathBuf>) {
+        let filtered: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        self.pending_screenshot_paths = Some(filtered);
+    }
+
     pub fn render(&mut self) -> Result<(), RenderError> {
         let _render_total_span = tracing::info_span!("renderer.render_total").entered();
         if self.size.width == 0 || self.size.height == 0 {
@@ -3246,6 +3281,7 @@ impl<'w> Renderer<'w> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("thingcraft-render-encoder"),
             });
+        let screenshot_capture = self.prepare_screenshot_capture();
         if gpu_capture_slot.is_some() && !gpu_supports_inside_pass && gpu_supports_inside_encoder {
             if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
                 encoder.write_timestamp(query_set, QUERY_WORLD_BEGIN);
@@ -3723,6 +3759,9 @@ impl<'w> Renderer<'w> {
 
         {
             let _span = tracing::info_span!("renderer.submit_present").entered();
+            if let Some(capture) = screenshot_capture.as_ref() {
+                self.encode_screenshot_copy(&mut encoder, &output.texture, capture);
+            }
             if gpu_capture_slot.is_some() && gpu_supports_inside_encoder {
                 if let Some(query_set) = self.gpu_profiler.as_ref().map(|profiler| &profiler.query_set) {
                     for (index, written) in gpu_query_written.iter_mut().enumerate() {
@@ -3738,10 +3777,136 @@ impl<'w> Renderer<'w> {
             }
             self.queue.submit(std::iter::once(encoder.finish()));
             output.present();
+            if let Some(capture) = screenshot_capture {
+                if let Err(err) = self.finalize_screenshot_capture(capture) {
+                    warn!(?err, "failed to save benchmark screenshot");
+                }
+            }
             if let (Some(profiler), Some(slot_idx)) = (&mut self.gpu_profiler, gpu_capture_slot) {
                 profiler.start_readback(&self.device, slot_idx);
             }
         }
+        Ok(())
+    }
+
+    fn prepare_screenshot_capture(&mut self) -> Option<PendingScreenshotCapture> {
+        let paths = self.pending_screenshot_paths.take()?;
+        if !self.surface_copy_src_supported {
+            warn!("skipping screenshot capture: surface COPY_SRC unsupported");
+            return None;
+        }
+        if self.config.width == 0 || self.config.height == 0 {
+            return None;
+        }
+
+        let bytes_per_pixel = 4_u32;
+        let unpadded_bytes_per_row = self.config.width.saturating_mul(bytes_per_pixel);
+        let padded_bytes_per_row = unpadded_bytes_per_row
+            .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            .saturating_mul(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer_size = u64::from(padded_bytes_per_row) * u64::from(self.config.height);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("thingcraft-screenshot-readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        Some(PendingScreenshotCapture {
+            paths,
+            buffer,
+            width: self.config.width,
+            height: self.config.height,
+            padded_bytes_per_row,
+        })
+    }
+
+    fn encode_screenshot_copy(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source_texture: &wgpu::Texture,
+        capture: &PendingScreenshotCapture,
+    ) {
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: source_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &capture.buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(capture.padded_bytes_per_row),
+                    rows_per_image: Some(capture.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: capture.width,
+                height: capture.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn finalize_screenshot_capture(&self, capture: PendingScreenshotCapture) -> Result<()> {
+        let slice = capture.buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.recv()
+            .context("screenshot readback channel dropped")?
+            .context("screenshot readback map_async failed")?;
+
+        let bytes_per_pixel = 4_usize;
+        let row_unpadded = capture.width as usize * bytes_per_pixel;
+        let row_padded = capture.padded_bytes_per_row as usize;
+        let mapped = slice.get_mapped_range();
+        let mut rgba = vec![0_u8; row_unpadded * capture.height as usize];
+
+        for y in 0..capture.height as usize {
+            let src_start = y * row_padded;
+            let src_end = src_start + row_unpadded;
+            let src_row = &mapped[src_start..src_end];
+            let dst_row = &mut rgba[(y * row_unpadded)..((y + 1) * row_unpadded)];
+            for x in 0..capture.width as usize {
+                let src = x * bytes_per_pixel;
+                let dst = src;
+                // Surface readback is BGRA8 on our swapchain path; convert to RGBA.
+                dst_row[dst] = src_row[src + 2];
+                dst_row[dst + 1] = src_row[src + 1];
+                dst_row[dst + 2] = src_row[src];
+                dst_row[dst + 3] = src_row[src + 3];
+            }
+        }
+
+        drop(mapped);
+        capture.buffer.unmap();
+
+        for path in capture.paths {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("creating screenshot directory {}", parent.display())
+                    })?;
+                }
+            }
+            image::save_buffer_with_format(
+                &path,
+                &rgba,
+                capture.width,
+                capture.height,
+                image::ColorType::Rgba8,
+                image::ImageFormat::Png,
+            )
+            .with_context(|| format!("writing screenshot {}", path.display()))?;
+            info!(path = %path.display(), "benchmark screenshot saved");
+        }
+
         Ok(())
     }
 

@@ -321,6 +321,25 @@ impl EcsRuntime {
         input.mouse_delta += DVec2::new(dx, dy);
     }
 
+    pub fn set_look_angles(&mut self, yaw: f64, pitch: f64) {
+        let clamped_pitch = pitch.clamp(-FRAC_PI_2 + 0.01, FRAC_PI_2 - 0.01);
+        let mut query = self.world.query_filtered::<&mut Transform64, With<Player>>();
+        if let Some(mut transform) = query.iter_mut(&mut self.world).next() {
+            transform.yaw = yaw;
+            transform.prev_yaw = yaw;
+            transform.pitch = clamped_pitch;
+            transform.prev_pitch = clamped_pitch;
+        }
+    }
+
+    pub fn offset_player_position(&mut self, delta: DVec3) {
+        let mut query = self.world.query_filtered::<&mut Transform64, With<Player>>();
+        if let Some(mut transform) = query.iter_mut(&mut self.world).next() {
+            transform.position += delta;
+            transform.prev_position += delta;
+        }
+    }
+
     pub fn run_input(&mut self) {
         self.input_schedule.run(&mut self.world);
     }

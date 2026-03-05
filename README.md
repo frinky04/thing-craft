@@ -61,6 +61,32 @@ THINGCRAFT_GPU_TIMESTAMPS=1 cargo run -p thingcraft-client --features tracy
 
 # Pass toggles for quick A/B perf checks
 THINGCRAFT_RENDER_TRANSPARENT=0 THINGCRAFT_RENDER_CLOUDS=0 THINGCRAFT_RENDER_FIRST_PERSON=0 THINGCRAFT_RENDER_HUD=0 cargo run -p thingcraft-client --features tracy
+
+## Deterministic Benchmark Mode
+
+For repeatable profiling without manual movement:
+
+```powershell
+.\scripts\run_bench.ps1
+```
+
+This runs three scripted phases (`still`, `turn`, `move`), auto-exits, and writes a CSV to `docs/reports/benchmarks/`.
+Each run also captures phase screenshots to:
+- `docs/reports/benchmarks/<bench_name>_screens/still.png`
+- `docs/reports/benchmarks/<bench_name>_screens/turn.png`
+- `docs/reports/benchmarks/<bench_name>_screens/move.png`
+
+And updates rolling latest references:
+- `docs/reports/benchmarks/latest_still.png`
+- `docs/reports/benchmarks/latest_turn.png`
+- `docs/reports/benchmarks/latest_move.png`
+
+To summarize any benchmark CSV (or latest by default):
+
+```powershell
+.\scripts\summarize_bench.ps1
+.\scripts\summarize_bench.ps1 -Path docs\reports\benchmarks\bench_1772682786.csv
+```
 ```
 
 When enabled, the client emits tracing spans for:
