@@ -4,7 +4,9 @@ use bevy_ecs::prelude::Resource;
 
 use crate::crafting::CraftingRegistry;
 use crate::ecs::EcsRuntime;
-use crate::inventory::{InventoryCommand, ItemStack, PlayerInventoryState};
+use crate::inventory::{
+    ContainerRuntimeState, InventoryCommand, InventoryMenuKind, ItemStack, PlayerInventoryState,
+};
 use crate::tool::ToolRegistry;
 
 pub const ALPHA_MINING_COOLDOWN_TICKS: u8 = 5;
@@ -64,7 +66,10 @@ pub struct InventoryCommandEvents {
     pub dropped_to_world: Vec<ItemStack>,
 }
 
-pub fn run_inventory_command_system(ecs_runtime: &mut EcsRuntime) -> InventoryCommandEvents {
+pub fn run_inventory_command_system(
+    ecs_runtime: &mut EcsRuntime,
+    open_menu: Option<InventoryMenuKind>,
+) -> InventoryCommandEvents {
     let crafting = ecs_runtime.world().resource::<CraftingRegistry>().clone();
     let pending_commands: Vec<InventoryCommand> = {
         let mut queue = ecs_runtime
@@ -75,11 +80,33 @@ pub fn run_inventory_command_system(ecs_runtime: &mut EcsRuntime) -> InventoryCo
 
     let mut events = InventoryCommandEvents::default();
     for cmd in pending_commands {
-        let result = {
+        let has_containers = ecs_runtime
+            .world()
+            .contains_resource::<ContainerRuntimeState>();
+        let result = if has_containers {
+            ecs_runtime.world_mut().resource_scope(
+                |world, mut inventory: bevy_ecs::change_detection::Mut<'_, PlayerInventoryState>| {
+                    world.resource_scope(
+                        |_,
+                         mut containers: bevy_ecs::change_detection::Mut<
+                            '_,
+                            ContainerRuntimeState,
+                        >| {
+                            inventory.apply_with_crafting_and_containers(
+                                cmd,
+                                Some(&crafting),
+                                Some(&mut containers),
+                                open_menu,
+                            )
+                        },
+                    )
+                },
+            )
+        } else {
             let mut inventory = ecs_runtime
                 .world_mut()
                 .resource_mut::<PlayerInventoryState>();
-            inventory.apply_with_crafting(cmd, Some(&crafting))
+            inventory.apply_with_crafting_and_containers(cmd, Some(&crafting), None, open_menu)
         };
         events.changed |= result.changed;
         events.dropped_to_world.extend(result.dropped_to_world);

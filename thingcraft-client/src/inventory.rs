@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use bevy_ecs::prelude::Resource;
 use winit::event::MouseButton;
 
@@ -81,14 +83,30 @@ pub enum PlayerSlot {
     PlayerCraftResult,
     CraftingTableInput(u8),
     CraftingTableResult,
+    Chest(u8),
+    FurnaceInput,
+    FurnaceFuel,
+    FurnaceResult,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct BlockPos {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InventoryMenuKind {
     Player,
     CraftingTable,
-    ChestStub,
-    FurnaceStub,
+    Chest {
+        primary: BlockPos,
+        secondary: Option<BlockPos>,
+    },
+    Furnace {
+        pos: BlockPos,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -118,6 +136,208 @@ pub enum InventoryCommand {
 pub struct InventoryApplyResult {
     pub changed: bool,
     pub dropped_to_world: Vec<ItemStack>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChestInventory {
+    slots: [Option<ItemStack>; 27],
+}
+
+impl ChestInventory {
+    #[must_use]
+    pub fn slot(&self, index: usize) -> Option<ItemStack> {
+        self.slots.get(index).copied().flatten()
+    }
+
+    pub fn set_slot(&mut self, index: usize, stack: Option<ItemStack>) {
+        if let Some(dst) = self.slots.get_mut(index) {
+            *dst = stack;
+        }
+    }
+
+    pub fn slots(&self) -> &[Option<ItemStack>; 27] {
+        &self.slots
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FurnaceInventory {
+    slots: [Option<ItemStack>; 3],
+    pub fuel_time: i32,
+    pub total_fuel_time: i32,
+    pub cook_time: i32,
+}
+
+impl FurnaceInventory {
+    #[must_use]
+    pub fn slot(&self, index: usize) -> Option<ItemStack> {
+        self.slots.get(index).copied().flatten()
+    }
+
+    pub fn set_slot(&mut self, index: usize, stack: Option<ItemStack>) {
+        if let Some(dst) = self.slots.get_mut(index) {
+            *dst = stack;
+        }
+    }
+
+    #[must_use]
+    pub fn has_fuel(&self) -> bool {
+        self.fuel_time > 0
+    }
+
+    #[must_use]
+    pub fn get_lit_progress(&self, range: i32) -> i32 {
+        let total = if self.total_fuel_time == 0 {
+            200
+        } else {
+            self.total_fuel_time
+        };
+        self.fuel_time * range / total
+    }
+
+    #[must_use]
+    pub fn get_cook_progress(&self, range: i32) -> i32 {
+        self.cook_time * range / 200
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct FurnaceTickResult {
+    pub changed: bool,
+    pub lit_state_changed: bool,
+    pub now_lit: bool,
+}
+
+#[derive(Resource, Debug, Clone, Default)]
+pub struct ContainerRuntimeState {
+    pub chests: HashMap<BlockPos, ChestInventory>,
+    pub furnaces: HashMap<BlockPos, FurnaceInventory>,
+}
+
+impl ContainerRuntimeState {
+    pub fn ensure_chest(&mut self, pos: BlockPos) {
+        self.chests.entry(pos).or_default();
+    }
+
+    pub fn remove_chest(&mut self, pos: BlockPos) -> Option<ChestInventory> {
+        self.chests.remove(&pos)
+    }
+
+    pub fn ensure_furnace(&mut self, pos: BlockPos) {
+        self.furnaces.entry(pos).or_default();
+    }
+
+    pub fn remove_furnace(&mut self, pos: BlockPos) -> Option<FurnaceInventory> {
+        self.furnaces.remove(&pos)
+    }
+
+    #[must_use]
+    pub fn furnace(&self, pos: BlockPos) -> Option<&FurnaceInventory> {
+        self.furnaces.get(&pos)
+    }
+
+    #[must_use]
+    pub fn chest(&self, pos: BlockPos) -> Option<&ChestInventory> {
+        self.chests.get(&pos)
+    }
+
+    pub fn tick_furnaces(&mut self) -> Vec<(BlockPos, FurnaceTickResult)> {
+        let mut changed = Vec::new();
+        for (pos, furnace) in &mut self.furnaces {
+            let tick = tick_furnace_inventory(furnace);
+            if tick.changed || tick.lit_state_changed {
+                changed.push((*pos, tick));
+            }
+        }
+        changed
+    }
+}
+
+fn tick_furnace_inventory(furnace: &mut FurnaceInventory) -> FurnaceTickResult {
+    let was_lit = furnace.fuel_time > 0;
+    let mut changed = false;
+    if furnace.fuel_time > 0 {
+        furnace.fuel_time -= 1;
+    }
+
+    if furnace.fuel_time == 0 && furnace_can_cook(furnace) {
+        let fuel_time = furnace
+            .slot(1)
+            .map_or(0, |stack| alpha_fuel_time_for_item(stack.alpha_item_id()));
+        furnace.total_fuel_time = fuel_time;
+        furnace.fuel_time = fuel_time;
+        if fuel_time > 0 {
+            changed = true;
+            if let Some(mut fuel) = furnace.slot(1) {
+                fuel.count = fuel.count.saturating_sub(1);
+                furnace.set_slot(1, if fuel.count == 0 { None } else { Some(fuel) });
+            }
+        }
+    }
+
+    if furnace.fuel_time > 0 && furnace_can_cook(furnace) {
+        furnace.cook_time += 1;
+        if furnace.cook_time == 200 {
+            furnace.cook_time = 0;
+            furnace_finish_cooking(furnace);
+            changed = true;
+        }
+    } else if furnace.cook_time != 0 {
+        furnace.cook_time = 0;
+        changed = true;
+    }
+
+    let is_lit = furnace.fuel_time > 0;
+    FurnaceTickResult {
+        changed,
+        lit_state_changed: was_lit != is_lit,
+        now_lit: is_lit,
+    }
+}
+
+fn furnace_can_cook(furnace: &FurnaceInventory) -> bool {
+    let Some(input) = furnace.slot(0) else {
+        return false;
+    };
+    let Some(result_item) = alpha_furnace_result_for_input(input.alpha_item_id()) else {
+        return false;
+    };
+    let Some(output) = furnace.slot(2) else {
+        return true;
+    };
+    if output.alpha_item_id() != result_item {
+        return false;
+    }
+    output.count < output.max_stack_size()
+}
+
+fn furnace_finish_cooking(furnace: &mut FurnaceInventory) {
+    let Some(input) = furnace.slot(0) else {
+        return;
+    };
+    let Some(result_item) = alpha_furnace_result_for_input(input.alpha_item_id()) else {
+        return;
+    };
+
+    let result_stack = if result_item < 256 {
+        ItemStack::block(result_item as u8, 1)
+    } else {
+        ItemStack::item(result_item, 1)
+    };
+    match furnace.slot(2) {
+        None => furnace.set_slot(2, Some(result_stack)),
+        Some(mut output)
+            if output.item == result_stack.item && output.metadata == result_stack.metadata =>
+        {
+            output.count = output.count.saturating_add(1);
+            furnace.set_slot(2, Some(output));
+        }
+        _ => return,
+    }
+
+    let mut new_input = input;
+    new_input.count = new_input.count.saturating_sub(1);
+    furnace.set_slot(0, if new_input.count == 0 { None } else { Some(new_input) });
 }
 
 #[derive(Resource, Debug, Clone, Eq, PartialEq)]
@@ -283,14 +503,16 @@ impl PlayerInventoryState {
 
     #[must_use]
     pub fn apply(&mut self, cmd: InventoryCommand) -> InventoryApplyResult {
-        self.apply_with_crafting(cmd, None)
+        self.apply_with_crafting_and_containers(cmd, None, None, None)
     }
 
     #[must_use]
-    pub fn apply_with_crafting(
+    pub fn apply_with_crafting_and_containers(
         &mut self,
         cmd: InventoryCommand,
         crafting: Option<&crate::crafting::CraftingRegistry>,
+        mut containers: Option<&mut ContainerRuntimeState>,
+        open_menu: Option<InventoryMenuKind>,
     ) -> InventoryApplyResult {
         let mut result = InventoryApplyResult::default();
         let prev_player_crafting = self.player_craft_input;
@@ -322,7 +544,8 @@ impl PlayerInventoryState {
             InventoryCommand::ConsumeSelected { amount } => {
                 if amount > 0 {
                     let slot = PlayerSlot::Hotbar(self.selected_hotbar);
-                    if consume_slot_amount(self, slot, amount) {
+                    if consume_slot_amount(self, containers.as_deref_mut(), open_menu, slot, amount)
+                    {
                         result.changed = true;
                     }
                 }
@@ -374,7 +597,7 @@ impl PlayerInventoryState {
                         }
                         self.table_craft_result = None;
                     }
-                    InventoryMenuKind::ChestStub | InventoryMenuKind::FurnaceStub => {}
+                    InventoryMenuKind::Chest { .. } | InventoryMenuKind::Furnace { .. } => {}
                 }
             }
             InventoryCommand::ClickSlot { slot, button } => match (slot, button) {
@@ -391,7 +614,13 @@ impl PlayerInventoryState {
                     }
                 }
                 (_, MouseButton::Left) | (_, MouseButton::Right) => {
-                    if apply_slot_click(self, slot, button) {
+                    if apply_slot_click(
+                        self,
+                        containers.as_deref_mut(),
+                        open_menu,
+                        slot,
+                        button,
+                    ) {
                         result.changed = true;
                     }
                 }
@@ -429,16 +658,22 @@ impl PlayerInventoryState {
     }
 }
 
-fn apply_slot_click(inv: &mut PlayerInventoryState, slot: PlayerSlot, button: MouseButton) -> bool {
+fn apply_slot_click(
+    inv: &mut PlayerInventoryState,
+    mut containers: Option<&mut ContainerRuntimeState>,
+    open_menu: Option<InventoryMenuKind>,
+    slot: PlayerSlot,
+    button: MouseButton,
+) -> bool {
     if matches!(
         slot,
         PlayerSlot::PlayerCraftResult | PlayerSlot::CraftingTableResult
     ) {
         return false;
     }
-    let slot_max = slot_max_stack_size(slot);
+    let slot_max = slot_max_stack_size(slot, open_menu);
     let slot_allows = |stack: ItemStack| slot_accepts_item(slot, stack);
-    let current_slot_item = get_slot(inv, slot);
+    let current_slot_item = get_slot(inv, containers.as_deref(), open_menu, slot);
     if current_slot_item.is_none() && inv.cursor.is_none() {
         return false;
     }
@@ -453,7 +688,13 @@ fn apply_slot_click(inv: &mut PlayerInventoryState, slot: PlayerSlot, button: Mo
         };
         src.count -= take;
         let picked = ItemStack { count: take, ..src };
-        set_slot(inv, slot, if src.count == 0 { None } else { Some(src) });
+        set_slot(
+            inv,
+            containers.as_deref_mut(),
+            open_menu,
+            slot,
+            if src.count == 0 { None } else { Some(src) },
+        );
         inv.cursor = Some(picked);
         return true;
     }
@@ -475,6 +716,8 @@ fn apply_slot_click(inv: &mut PlayerInventoryState, slot: PlayerSlot, button: Mo
         cursor.count -= place;
         set_slot(
             inv,
+            containers.as_deref_mut(),
+            open_menu,
             slot,
             Some(ItemStack {
                 count: place,
@@ -502,7 +745,7 @@ fn apply_slot_click(inv: &mut PlayerInventoryState, slot: PlayerSlot, button: Mo
                 <= u16::from(cursor.max_stack_size())
         {
             cursor.count = cursor.count.saturating_add(slot_item.count);
-            set_slot(inv, slot, None);
+            set_slot(inv, containers.as_deref_mut(), open_menu, slot, None);
             inv.cursor = Some(cursor);
             return true;
         }
@@ -514,7 +757,7 @@ fn apply_slot_click(inv: &mut PlayerInventoryState, slot: PlayerSlot, button: Mo
         if button != MouseButton::Left || cursor.count > slot_max {
             return false;
         }
-        set_slot(inv, slot, Some(cursor));
+        set_slot(inv, containers.as_deref_mut(), open_menu, slot, Some(cursor));
         inv.cursor = Some(slot_item);
         return true;
     }
@@ -534,7 +777,13 @@ fn apply_slot_click(inv: &mut PlayerInventoryState, slot: PlayerSlot, button: Mo
     }
     slot_item.count += add;
     cursor.count -= add;
-    set_slot(inv, slot, Some(slot_item));
+    set_slot(
+        inv,
+        containers.as_deref_mut(),
+        open_menu,
+        slot,
+        Some(slot_item),
+    );
     inv.cursor = if cursor.count == 0 {
         None
     } else {
@@ -543,19 +792,36 @@ fn apply_slot_click(inv: &mut PlayerInventoryState, slot: PlayerSlot, button: Mo
     true
 }
 
-fn consume_slot_amount(inv: &mut PlayerInventoryState, slot: PlayerSlot, amount: u8) -> bool {
-    let Some(mut stack) = get_slot(inv, slot) else {
+fn consume_slot_amount(
+    inv: &mut PlayerInventoryState,
+    containers: Option<&mut ContainerRuntimeState>,
+    open_menu: Option<InventoryMenuKind>,
+    slot: PlayerSlot,
+    amount: u8,
+) -> bool {
+    let Some(mut stack) = get_slot(inv, containers.as_deref(), open_menu, slot) else {
         return false;
     };
     if stack.count < amount {
         return false;
     }
     stack.count -= amount;
-    set_slot(inv, slot, if stack.count == 0 { None } else { Some(stack) });
+    set_slot(
+        inv,
+        containers,
+        open_menu,
+        slot,
+        if stack.count == 0 { None } else { Some(stack) },
+    );
     true
 }
 
-fn get_slot(inv: &PlayerInventoryState, slot: PlayerSlot) -> Option<ItemStack> {
+fn get_slot(
+    inv: &PlayerInventoryState,
+    containers: Option<&ContainerRuntimeState>,
+    open_menu: Option<InventoryMenuKind>,
+    slot: PlayerSlot,
+) -> Option<ItemStack> {
     match slot {
         PlayerSlot::Hotbar(i) => inv.hotbar.get(usize::from(i)).copied().flatten(),
         PlayerSlot::Main(i) => inv.main.get(usize::from(i)).copied().flatten(),
@@ -570,10 +836,54 @@ fn get_slot(inv: &PlayerInventoryState, slot: PlayerSlot) -> Option<ItemStack> {
             inv.table_craft_input.get(usize::from(i)).copied().flatten()
         }
         PlayerSlot::CraftingTableResult => inv.table_craft_result,
+        PlayerSlot::Chest(i) => {
+            let (menu, containers) = (open_menu?, containers?);
+            let InventoryMenuKind::Chest { primary, secondary } = menu else {
+                return None;
+            };
+            if i < 27 {
+                return containers
+                    .chests
+                    .get(&primary)
+                    .and_then(|chest| chest.slot(usize::from(i)));
+            }
+            let secondary = secondary?;
+            containers
+                .chests
+                .get(&secondary)
+                .and_then(|chest| chest.slot(usize::from(i.saturating_sub(27))))
+        }
+        PlayerSlot::FurnaceInput => {
+            let (menu, containers) = (open_menu?, containers?);
+            let InventoryMenuKind::Furnace { pos } = menu else {
+                return None;
+            };
+            containers.furnaces.get(&pos).and_then(|f| f.slot(0))
+        }
+        PlayerSlot::FurnaceFuel => {
+            let (menu, containers) = (open_menu?, containers?);
+            let InventoryMenuKind::Furnace { pos } = menu else {
+                return None;
+            };
+            containers.furnaces.get(&pos).and_then(|f| f.slot(1))
+        }
+        PlayerSlot::FurnaceResult => {
+            let (menu, containers) = (open_menu?, containers?);
+            let InventoryMenuKind::Furnace { pos } = menu else {
+                return None;
+            };
+            containers.furnaces.get(&pos).and_then(|f| f.slot(2))
+        }
     }
 }
 
-fn set_slot(inv: &mut PlayerInventoryState, slot: PlayerSlot, stack: Option<ItemStack>) {
+fn set_slot(
+    inv: &mut PlayerInventoryState,
+    containers: Option<&mut ContainerRuntimeState>,
+    open_menu: Option<InventoryMenuKind>,
+    slot: PlayerSlot,
+    stack: Option<ItemStack>,
+) {
     match slot {
         PlayerSlot::Hotbar(i) => {
             if let Some(dst) = inv.hotbar.get_mut(usize::from(i)) {
@@ -602,28 +912,81 @@ fn set_slot(inv: &mut PlayerInventoryState, slot: PlayerSlot, stack: Option<Item
             }
         }
         PlayerSlot::CraftingTableResult => {}
+        PlayerSlot::Chest(i) => {
+            let (Some(containers), Some(InventoryMenuKind::Chest { primary, secondary })) =
+                (containers, open_menu)
+            else {
+                return;
+            };
+            if i < 27 {
+                containers
+                    .chests
+                    .entry(primary)
+                    .or_default()
+                    .set_slot(usize::from(i), stack);
+            } else if let Some(secondary) = secondary {
+                containers
+                    .chests
+                    .entry(secondary)
+                    .or_default()
+                    .set_slot(usize::from(i.saturating_sub(27)), stack);
+            }
+        }
+        PlayerSlot::FurnaceInput => {
+            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) = (containers, open_menu)
+            else {
+                return;
+            };
+            containers.furnaces.entry(pos).or_default().set_slot(0, stack);
+        }
+        PlayerSlot::FurnaceFuel => {
+            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) = (containers, open_menu)
+            else {
+                return;
+            };
+            containers.furnaces.entry(pos).or_default().set_slot(1, stack);
+        }
+        PlayerSlot::FurnaceResult => {
+            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) = (containers, open_menu)
+            else {
+                return;
+            };
+            containers.furnaces.entry(pos).or_default().set_slot(2, stack);
+        }
     }
 }
 
-fn slot_max_stack_size(slot: PlayerSlot) -> u8 {
+fn slot_max_stack_size(slot: PlayerSlot, open_menu: Option<InventoryMenuKind>) -> u8 {
     match slot {
         PlayerSlot::Armor(_) => 1,
         PlayerSlot::PlayerCraftResult | PlayerSlot::CraftingTableResult => 0,
+        PlayerSlot::FurnaceResult => 64,
         PlayerSlot::Hotbar(_)
         | PlayerSlot::Main(_)
         | PlayerSlot::PlayerCraftInput(_)
-        | PlayerSlot::CraftingTableInput(_) => 64,
+        | PlayerSlot::CraftingTableInput(_)
+        | PlayerSlot::Chest(_) => 64,
+        PlayerSlot::FurnaceInput | PlayerSlot::FurnaceFuel => {
+            if open_menu.is_some() {
+                64
+            } else {
+                0
+            }
+        }
     }
 }
 
 fn slot_accepts_item(slot: PlayerSlot, stack: ItemStack) -> bool {
     match slot {
         PlayerSlot::Armor(_) => stack.count >= 1,
-        PlayerSlot::PlayerCraftResult | PlayerSlot::CraftingTableResult => false,
+        PlayerSlot::PlayerCraftResult | PlayerSlot::CraftingTableResult | PlayerSlot::FurnaceResult => false,
         PlayerSlot::Hotbar(_)
         | PlayerSlot::Main(_)
         | PlayerSlot::PlayerCraftInput(_)
-        | PlayerSlot::CraftingTableInput(_) => stack.count >= 1,
+        | PlayerSlot::CraftingTableInput(_)
+        | PlayerSlot::Chest(_) => stack.count >= 1,
+        PlayerSlot::FurnaceInput => stack.count >= 1,
+        PlayerSlot::FurnaceFuel => alpha_fuel_time_for_item(stack.alpha_item_id()) > 0,
     }
 }
 
@@ -715,19 +1078,38 @@ pub fn gui_scale(screen_w: f32, screen_h: f32) -> f32 {
 }
 
 #[must_use]
-pub fn inventory_layout(screen_w: f32, screen_h: f32) -> InventoryScreenLayout {
+pub fn inventory_layout_for_menu(
+    screen_w: f32,
+    screen_h: f32,
+    menu: InventoryMenuKind,
+) -> InventoryScreenLayout {
     let scale = gui_scale(screen_w, screen_h);
     let gui_w = (screen_w / scale).floor();
     let gui_h = (screen_h / scale).floor();
+    let (panel_w, panel_h) = menu_panel_size(menu);
     InventoryScreenLayout {
         scale,
-        left: ((gui_w - INVENTORY_WIDTH) * 0.5).floor(),
-        top: ((gui_h - INVENTORY_HEIGHT) * 0.5).floor(),
+        left: ((gui_w - panel_w) * 0.5).floor(),
+        top: ((gui_h - panel_h) * 0.5).floor(),
     }
 }
 
 #[must_use]
-pub fn slot_gui_xy(_menu: InventoryMenuKind, slot: PlayerSlot) -> (f32, f32) {
+pub fn menu_panel_size(menu: InventoryMenuKind) -> (f32, f32) {
+    match menu {
+        InventoryMenuKind::Player | InventoryMenuKind::CraftingTable => {
+            (INVENTORY_WIDTH, INVENTORY_HEIGHT)
+        }
+        InventoryMenuKind::Chest { secondary, .. } => {
+            let rows = if secondary.is_some() { 6.0 } else { 3.0 };
+            (176.0, 114.0 + rows * 18.0)
+        }
+        InventoryMenuKind::Furnace { .. } => (176.0, 166.0),
+    }
+}
+
+#[must_use]
+pub fn slot_gui_xy(menu: InventoryMenuKind, slot: PlayerSlot) -> (f32, f32) {
     match slot {
         PlayerSlot::PlayerCraftResult => (144.0, 36.0),
         PlayerSlot::PlayerCraftInput(i) => {
@@ -743,14 +1125,39 @@ pub fn slot_gui_xy(_menu: InventoryMenuKind, slot: PlayerSlot) -> (f32, f32) {
             let col = idx % 3;
             (30.0 + col as f32 * 18.0, 17.0 + row as f32 * 18.0)
         }
+        PlayerSlot::Chest(i) => {
+            let idx = usize::from(i).min(53);
+            let row = idx / 9;
+            let col = idx % 9;
+            (8.0 + col as f32 * 18.0, 18.0 + row as f32 * 18.0)
+        }
+        PlayerSlot::FurnaceInput => (56.0, 17.0),
+        PlayerSlot::FurnaceFuel => (56.0, 53.0),
+        PlayerSlot::FurnaceResult => (116.0, 35.0),
         PlayerSlot::Armor(i) => (8.0, 8.0 + f32::from(i) * 18.0),
         PlayerSlot::Main(i) => {
             let idx = usize::from(i).min(MAIN_SLOT_COUNT - 1);
             let row = idx / 9;
             let col = idx % 9;
-            (8.0 + col as f32 * 18.0, 84.0 + row as f32 * 18.0)
+            let base_y = match menu {
+                InventoryMenuKind::Chest { secondary, .. } => {
+                    let rows = if secondary.is_some() { 6.0 } else { 3.0 };
+                    103.0 + (rows - 4.0) * 18.0
+                }
+                _ => 84.0,
+            };
+            (8.0 + col as f32 * 18.0, base_y + row as f32 * 18.0)
         }
-        PlayerSlot::Hotbar(i) => (8.0 + f32::from(i) * 18.0, 142.0),
+        PlayerSlot::Hotbar(i) => {
+            let y = match menu {
+                InventoryMenuKind::Chest { secondary, .. } => {
+                    let rows = if secondary.is_some() { 6.0 } else { 3.0 };
+                    161.0 + (rows - 4.0) * 18.0
+                }
+                _ => 142.0,
+            };
+            (8.0 + f32::from(i) * 18.0, y)
+        }
     }
 }
 
@@ -762,7 +1169,7 @@ pub fn hit_test_slot_for_menu(
     screen_h: f32,
     menu: InventoryMenuKind,
 ) -> Option<PlayerSlot> {
-    let layout = inventory_layout(screen_w, screen_h);
+    let layout = inventory_layout_for_menu(screen_w, screen_h, menu);
     let mx = mouse_x / layout.scale - layout.left;
     let my = mouse_y / layout.scale - layout.top;
     match menu {
@@ -796,7 +1203,26 @@ pub fn hit_test_slot_for_menu(
                 }
             }
         }
-        InventoryMenuKind::ChestStub | InventoryMenuKind::FurnaceStub => {}
+        InventoryMenuKind::Chest { secondary, .. } => {
+            let chest_rows = if secondary.is_some() { 6 } else { 3 };
+            for i in 0..(chest_rows * 9) {
+                let slot = PlayerSlot::Chest(i as u8);
+                if slot_contains(menu, slot, mx, my) {
+                    return Some(slot);
+                }
+            }
+        }
+        InventoryMenuKind::Furnace { .. } => {
+            for slot in [
+                PlayerSlot::FurnaceInput,
+                PlayerSlot::FurnaceFuel,
+                PlayerSlot::FurnaceResult,
+            ] {
+                if slot_contains(menu, slot, mx, my) {
+                    return Some(slot);
+                }
+            }
+        }
     }
     for i in 0..MAIN_SLOT_COUNT {
         let slot = PlayerSlot::Main(i as u8);
@@ -828,6 +1254,34 @@ fn table_crafting_grid(slots: [Option<ItemStack>; TABLE_CRAFT_INPUT_SLOT_COUNT])
         }
     }
     grid
+}
+
+#[must_use]
+pub fn alpha_furnace_result_for_input(input_id: u16) -> Option<u16> {
+    let out = match input_id {
+        15 => 265, // iron ore -> iron ingot
+        14 => 266, // gold ore -> gold ingot
+        56 => 264, // diamond ore -> diamond
+        12 => 20,  // sand -> glass block
+        319 => 320, // raw pork -> cooked pork
+        349 => 350, // raw fish -> cooked fish
+        4 => 1,    // cobblestone -> stone
+        337 => 336, // clay -> brick
+        _ => return None,
+    };
+    Some(out)
+}
+
+#[must_use]
+pub fn alpha_fuel_time_for_item(item_id: u16) -> i32 {
+    match item_id {
+        280 => 100,   // stick
+        263 => 1600,  // coal
+        327 => 20000, // lava bucket
+        // Alpha: any wooden block item (<256 and wood material) burns for 300.
+        5 | 17 | 25 | 47 | 53 | 54 | 58 | 63 | 64 | 65 | 68 | 72 | 84 | 85 | 86 | 91 => 300,
+        _ => 0,
+    }
 }
 
 #[must_use]
