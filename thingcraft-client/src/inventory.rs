@@ -379,7 +379,7 @@ impl PlayerInventoryState {
         main[2] = Some(ItemStack::tool(276)); // Diamond Sword
         main[3] = Some(ItemStack::tool(274)); // Stone Pickaxe
         main[4] = Some(ItemStack::tool(278)); // Diamond Pickaxe
-        // TODO(playtest-loadout): Remove these temporary parity-playtest blocks after manual QA.
+                                              // TODO(playtest-loadout): Remove these temporary parity-playtest blocks after manual QA.
         main[5] = Some(ItemStack::block(1, 64)); // Stone
         main[6] = Some(ItemStack::block(20, 64)); // Glass
         main[7] = Some(ItemStack::block(47, 64)); // Bookshelf

@@ -1,7 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -114,7 +111,6 @@ const RANDOM_TICKS_PER_CHUNK: usize = 80;
 const RANDOM_TICK_LCG_INCREMENT: i32 = 1_013_904_223;
 const DEBUG_SIM_SPEEDUP_MULTIPLIER: usize = 8;
 const DEBUG_SIM_SPEEDUP_TICK_CAP: usize = 256;
-const BENCH_MOVE_ASCEND_BLOCKS: f64 = 20.0;
 
 #[derive(Debug, Clone, Copy)]
 struct BlockInteractionRequest {
@@ -148,36 +144,6 @@ struct LoopReport {
     tps: f64,
     avg_frame_ms: f64,
     avg_tick_ms: f64,
-}
-
-#[derive(Debug, Clone)]
-struct BenchConfig {
-    enabled: bool,
-    still_secs: u32,
-    turn_secs: u32,
-    move_secs: u32,
-    turn_pixels_per_sec: f64,
-    output_path: PathBuf,
-}
-
-struct BenchRuntime {
-    config: BenchConfig,
-    start: Instant,
-    output: File,
-    last_phase: BenchPhase,
-    screenshot_run_dir: PathBuf,
-    screenshot_latest_dir: PathBuf,
-    captured_still: bool,
-    captured_turn: bool,
-    captured_move: bool,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum BenchPhase {
-    Still,
-    Turn,
-    Move,
-    Done,
 }
 
 #[derive(Debug, Default)]
@@ -386,139 +352,6 @@ impl LoopStats {
     }
 }
 
-impl BenchRuntime {
-    fn new(config: BenchConfig) -> Result<Self> {
-        let screenshot_run_dir = screenshot_run_dir_for_output(&config.output_path);
-        let screenshot_latest_dir = screenshot_latest_dir_for_output(&config.output_path);
-        if let Some(parent) = config.output_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-        let mut output = File::create(&config.output_path)?;
-        writeln!(
-            output,
-            "phase,elapsed_s,fps,tps,avg_frame_ms,avg_tick_ms,resident_chunks,ready_chunks,generating_chunks,meshing_chunks,evicting_chunks,dirty_chunks,visible_chunks"
-        )?;
-        Ok(Self {
-            config,
-            start: Instant::now(),
-            output,
-            last_phase: BenchPhase::Still,
-            screenshot_run_dir,
-            screenshot_latest_dir,
-            captured_still: false,
-            captured_turn: false,
-            captured_move: false,
-        })
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.start.elapsed()
-    }
-
-    fn phase(&self) -> BenchPhase {
-        let elapsed = self.elapsed().as_secs_f32();
-        let still_end = self.config.still_secs as f32;
-        let turn_end = still_end + self.config.turn_secs as f32;
-        let move_end = turn_end + self.config.move_secs as f32;
-        if elapsed < still_end {
-            BenchPhase::Still
-        } else if elapsed < turn_end {
-            BenchPhase::Turn
-        } else if elapsed < move_end {
-            BenchPhase::Move
-        } else {
-            BenchPhase::Done
-        }
-    }
-
-    fn phase_name(&self) -> &'static str {
-        match self.phase() {
-            BenchPhase::Still => "still",
-            BenchPhase::Turn => "turn",
-            BenchPhase::Move => "move",
-            BenchPhase::Done => "done",
-        }
-    }
-
-    fn apply_controls(&mut self, ecs_runtime: &mut EcsRuntime, frame_delta: Duration) {
-        let phase = self.phase();
-        if phase != self.last_phase {
-            if matches!(phase, BenchPhase::Move) {
-                ecs_runtime.offset_player_position(DVec3::new(0.0, BENCH_MOVE_ASCEND_BLOCKS, 0.0));
-                ecs_runtime.set_look_angles(0.0, 0.0);
-            }
-            self.last_phase = phase;
-        }
-
-        let move_forward = matches!(phase, BenchPhase::Move);
-        ecs_runtime.handle_key(KeyCode::KeyW, move_forward);
-        if matches!(phase, BenchPhase::Turn) {
-            let delta_x = self.config.turn_pixels_per_sec * frame_delta.as_secs_f64();
-            ecs_runtime.add_mouse_delta(delta_x, 0.0);
-        }
-    }
-
-    fn write_sample(
-        &mut self,
-        report: LoopReport,
-        residency: crate::streaming::ResidencyMetrics,
-        visible_chunks: usize,
-    ) -> Result<()> {
-        writeln!(
-            self.output,
-            "{},{:.3},{:.2},{:.2},{:.3},{:.3},{},{},{},{},{},{},{},",
-            self.phase_name(),
-            self.elapsed().as_secs_f64(),
-            report.fps,
-            report.tps,
-            report.avg_frame_ms,
-            report.avg_tick_ms,
-            residency.total,
-            residency.ready,
-            residency.generating,
-            residency.meshing,
-            residency.evicting,
-            residency.dirty_chunks,
-            visible_chunks
-        )?;
-        Ok(())
-    }
-
-    fn take_screenshot_request(&mut self) -> Option<Vec<PathBuf>> {
-        let elapsed_s = self.elapsed().as_secs_f32();
-        let still_trigger = bench_phase_capture_offset(self.config.still_secs);
-        let turn_trigger =
-            self.config.still_secs as f32 + bench_phase_capture_offset(self.config.turn_secs);
-        let move_trigger = self.config.still_secs as f32
-            + self.config.turn_secs as f32
-            + bench_phase_capture_offset(self.config.move_secs);
-
-        if !self.captured_still && elapsed_s >= still_trigger {
-            self.captured_still = true;
-            return Some(self.screenshot_paths_for_label("still"));
-        }
-        if !self.captured_turn && elapsed_s >= turn_trigger {
-            self.captured_turn = true;
-            return Some(self.screenshot_paths_for_label("turn"));
-        }
-        if !self.captured_move && elapsed_s >= move_trigger {
-            self.captured_move = true;
-            return Some(self.screenshot_paths_for_label("move"));
-        }
-        None
-    }
-
-    fn screenshot_paths_for_label(&self, label: &str) -> Vec<PathBuf> {
-        vec![
-            self.screenshot_run_dir.join(format!("{label}.png")),
-            self.screenshot_latest_dir
-                .join(format!("latest_{label}.png")),
-        ]
-    }
-}
-
 impl EditLatencyTracker {
     fn record_block_edit(&mut self, world_x: i32, world_z: i32) {
         let now = Instant::now();
@@ -651,8 +484,8 @@ pub fn run() -> Result<()> {
     let mut first_person_hand = FirstPersonHandState::default();
     let mut hud_dirty = true;
     let mut sim_ticks: u64 = 0;
-    let mut random_tick_lcg: i32 = (WORLD_SEED as u32 ^ 0x9E37_79B9) as i32;
-    let mut random_tick_rng = SmallRng::seed_from_u64(WORLD_SEED ^ 0xA11A_A11A_55AA_F00D);
+    let mut random_tick_lcg: i32 = (world_seed as u32 ^ 0x9E37_79B9) as i32;
+    let mut random_tick_rng = SmallRng::seed_from_u64(world_seed ^ 0xA11A_A11A_55AA_F00D);
     let mut sim_speedup_held = false;
     let mut last_fog_brightness = 1.0_f32;
     let mut fog_brightness = 1.0_f32;
@@ -1858,7 +1691,9 @@ fn raycast_current_mining_target(
     })
 }
 
+mod bench;
 mod block_interaction;
+use bench::*;
 use block_interaction::*;
 
 fn resolve_mining_tool(
@@ -2274,8 +2109,12 @@ fn alpha_can_place_block_at(
         PlacementRule::SugarCane => {
             can_sugar_cane_survive(chunk_streamer, place_x, place_y, place_z)
         }
-        PlacementRule::Cactus => can_cactus_survive(chunk_streamer, registry, place_x, place_y, place_z),
-        PlacementRule::SnowLayer => can_snow_layer_survive(chunk_streamer, registry, place_x, place_y, place_z),
+        PlacementRule::Cactus => {
+            can_cactus_survive(chunk_streamer, registry, place_x, place_y, place_z)
+        }
+        PlacementRule::SnowLayer => {
+            can_snow_layer_survive(chunk_streamer, registry, place_x, place_y, place_z)
+        }
     }
 }
 
@@ -3089,59 +2928,6 @@ fn resolve_fluid_tick_budget() -> usize {
 
 fn resolve_fancy_graphics() -> bool {
     parse_env_bool("THINGCRAFT_FANCY_GRAPHICS").unwrap_or(true)
-}
-
-fn resolve_bench_config() -> BenchConfig {
-    let enabled = parse_env_bool("THINGCRAFT_BENCH").unwrap_or(false);
-    let still_secs = parse_env_u32("THINGCRAFT_BENCH_STILL_SECS").unwrap_or(10);
-    let turn_secs = parse_env_u32("THINGCRAFT_BENCH_TURN_SECS").unwrap_or(10);
-    let move_secs = parse_env_u32("THINGCRAFT_BENCH_MOVE_SECS").unwrap_or(10);
-    let turn_pixels_per_sec = std::env::var("THINGCRAFT_BENCH_TURN_PX_PER_SEC")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(240.0);
-    let output_path = std::env::var("THINGCRAFT_BENCH_OUTPUT")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_bench_output_path);
-    BenchConfig {
-        enabled,
-        still_secs,
-        turn_secs,
-        move_secs,
-        turn_pixels_per_sec,
-        output_path,
-    }
-}
-
-fn default_bench_output_path() -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    PathBuf::from(format!("docs/reports/benchmarks/bench_{stamp}.csv"))
-}
-
-fn screenshot_latest_dir_for_output(output_path: &std::path::Path) -> PathBuf {
-    output_path
-        .parent()
-        .map_or_else(|| PathBuf::from("docs/reports/benchmarks"), PathBuf::from)
-}
-
-fn screenshot_run_dir_for_output(output_path: &std::path::Path) -> PathBuf {
-    let root = screenshot_latest_dir_for_output(output_path);
-    let stem = output_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("bench");
-    root.join(format!("{stem}_screens"))
-}
-
-fn bench_phase_capture_offset(duration_secs: u32) -> f32 {
-    if duration_secs <= 1 {
-        (duration_secs as f32) * 0.5
-    } else {
-        duration_secs as f32 - 1.0
-    }
 }
 
 fn parse_env_u32(key: &str) -> Option<u32> {
@@ -4474,12 +4260,12 @@ mod tests {
 
     use super::{
         aabb_touches_material, affected_chunks_for_block_edit, alpha_ambient_darkness,
-        alpha_apply_fog_brightness, block_drop_stack, alpha_block_mining_calc,
-        alpha_brightness_from_light_level, alpha_can_place_chest_at, can_place_plant_on,
-        alpha_chest_facing_from_solid_neighbors, alpha_fall_distance_and_damage,
-        alpha_fog_brightness_target, alpha_horizontal_face_from_look, alpha_opposite_face,
-        alpha_placement_metadata_from_look, alpha_star_brightness, alpha_sunrise_color,
-        alpha_time_of_day, block_behavior, break_block_with_drop,
+        alpha_apply_fog_brightness, alpha_block_mining_calc, alpha_brightness_from_light_level,
+        alpha_can_place_chest_at, alpha_chest_facing_from_solid_neighbors,
+        alpha_fall_distance_and_damage, alpha_fog_brightness_target,
+        alpha_horizontal_face_from_look, alpha_opposite_face, alpha_placement_metadata_from_look,
+        alpha_star_brightness, alpha_sunrise_color, alpha_time_of_day, block_behavior,
+        block_drop_stack, break_block_with_drop, can_place_plant_on,
         can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
         is_point_inside_inventory_panel, is_raycast_targetable_block, parse_env_bool,
         parse_env_u32, parse_seed_literal, placement_intersects_player, random_tick_lcg_next,
@@ -4489,8 +4275,7 @@ mod tests {
         FLOWING_WATER_BLOCK_ID, FURNACE_BLOCK_ID, GRASS_BLOCK_ID, ICE_BLOCK_ID,
         LIT_FURNACE_BLOCK_ID, LIT_PUMPKIN_BLOCK_ID, OAK_LEAVES_BLOCK_ID, OAK_LOG_BLOCK_ID,
         PUMPKIN_BLOCK_ID, RANDOM_TICKS_PER_CHUNK, RANDOM_TICK_CHUNK_RADIUS, SAND_BLOCK_ID,
-        SAPLING_BLOCK_ID, SNOW_LAYER_BLOCK_ID, STONE_BLOCK_ID, SUGAR_CANE_BLOCK_ID,
-        WATER_BLOCK_ID,
+        SAPLING_BLOCK_ID, SNOW_LAYER_BLOCK_ID, STONE_BLOCK_ID, SUGAR_CANE_BLOCK_ID, WATER_BLOCK_ID,
     };
     use crate::crafting::CraftingRegistry;
     use crate::ecs::EcsRuntime;
@@ -4769,8 +4554,7 @@ mod tests {
         let coal_ore = block_drop_stack(16, true, &registry, &mut rng).expect("coal drop");
         assert_eq!(coal_ore, ItemStack::item(263, 1));
 
-        let diamond_ore =
-            block_drop_stack(56, true, &registry, &mut rng).expect("diamond drop");
+        let diamond_ore = block_drop_stack(56, true, &registry, &mut rng).expect("diamond drop");
         assert_eq!(diamond_ore, ItemStack::item(264, 1));
 
         let cane = block_drop_stack(83, true, &registry, &mut rng).expect("reeds drop");
@@ -4801,8 +4585,7 @@ mod tests {
         let snow = block_drop_stack(80, true, &registry, &mut rng).expect("snow drop");
         assert_eq!(snow, ItemStack::item(332, 4));
 
-        let snow_layer =
-            block_drop_stack(78, true, &registry, &mut rng).expect("snow layer drop");
+        let snow_layer = block_drop_stack(78, true, &registry, &mut rng).expect("snow layer drop");
         assert_eq!(snow_layer, ItemStack::item(332, 1));
 
         let mut saw_flint = false;
@@ -4858,7 +4641,10 @@ mod tests {
             ICE_BLOCK_ID,
             &mut rng,
         ));
-        assert_eq!(streamer.block_at_world(8, 40, 8), Some(FLOWING_WATER_BLOCK_ID));
+        assert_eq!(
+            streamer.block_at_world(8, 40, 8),
+            Some(FLOWING_WATER_BLOCK_ID)
+        );
     }
 
     #[test]
@@ -4964,7 +4750,10 @@ mod tests {
                 break;
             }
         }
-        assert!(decayed, "leaf should decay after nearby log support is removed");
+        assert!(
+            decayed,
+            "leaf should decay after nearby log support is removed"
+        );
         assert_eq!(streamer.block_at_world(8, 70, 8), Some(AIR_BLOCK_ID));
     }
 
@@ -5005,7 +4794,10 @@ mod tests {
                 break;
             }
         }
-        assert!(decayed, "grass should eventually decay under opaque-above rule");
+        assert!(
+            decayed,
+            "grass should eventually decay under opaque-above rule"
+        );
         assert_eq!(streamer.block_at_world(8, 30, 8), Some(DIRT_BLOCK_ID));
     }
 
@@ -5176,7 +4968,10 @@ mod tests {
                 break;
             }
         }
-        assert!(advanced, "sapling metadata should advance under bright conditions");
+        assert!(
+            advanced,
+            "sapling metadata should advance under bright conditions"
+        );
     }
 
     #[test]
@@ -5597,5 +5392,3 @@ mod tests {
         assert!(touches);
     }
 }
-
-

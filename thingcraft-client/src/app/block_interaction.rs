@@ -73,10 +73,12 @@ pub(super) fn block_behavior(block_id: u8) -> BlockBehavior {
             drop_rule: DropRule::Block(DIRT_BLOCK_ID),
             ..DEFAULT_BLOCK_BEHAVIOR
         },
-        GLASS_BLOCK_ID | BOOKSHELF_BLOCK_ID | MOB_SPAWNER_BLOCK_ID | ICE_BLOCK_ID => BlockBehavior {
-            drop_rule: DropRule::None,
-            ..DEFAULT_BLOCK_BEHAVIOR
-        },
+        GLASS_BLOCK_ID | BOOKSHELF_BLOCK_ID | MOB_SPAWNER_BLOCK_ID | ICE_BLOCK_ID => {
+            BlockBehavior {
+                drop_rule: DropRule::None,
+                ..DEFAULT_BLOCK_BEHAVIOR
+            }
+        }
         COAL_ORE_BLOCK_ID => BlockBehavior {
             drop_rule: DropRule::Item {
                 item_id: COAL_ITEM_ID,
@@ -206,7 +208,12 @@ fn has_water_adjacent_to_ground(
     })
 }
 
-pub(super) fn can_sugar_cane_survive(chunk_streamer: &ChunkStreamer, x: i32, y: i32, z: i32) -> bool {
+pub(super) fn can_sugar_cane_survive(
+    chunk_streamer: &ChunkStreamer,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
     let Some(below) = y
         .checked_sub(1)
         .and_then(|by| chunk_streamer.block_at_world(x, by, z))
@@ -397,7 +404,9 @@ fn update_neighbor_log_proximity_if_matches(
     proximity: u8,
     updates_this_tick: &mut usize,
 ) {
-    if chunk_streamer.block_at_world(neighbor_x, neighbor_y, neighbor_z) != Some(OAK_LEAVES_BLOCK_ID) {
+    if chunk_streamer.block_at_world(neighbor_x, neighbor_y, neighbor_z)
+        != Some(OAK_LEAVES_BLOCK_ID)
+    {
         return;
     }
     let meta = chunk_streamer
@@ -454,7 +463,11 @@ fn update_leaves_log_proximity(
             return cur;
         }
         let meta = streamer.block_metadata_at_world(nx, ny, nz).unwrap_or(0);
-        if meta != 0 && meta > cur { meta } else { cur }
+        if meta != 0 && meta > cur {
+            meta
+        } else {
+            cur
+        }
     };
     proximity = sample_neighbor(x, y - 1, z, proximity, chunk_streamer);
     proximity = sample_neighbor(x, y, z - 1, proximity, chunk_streamer);
@@ -695,7 +708,14 @@ pub(super) fn tick_random_block_at(
             let metadata = chunk_streamer.block_metadata_at_world(x, y, z).unwrap_or(0);
             if metadata == 0 {
                 let mut updates_this_tick = 0_usize;
-                update_leaves_log_proximity(chunk_streamer, registry, x, y, z, &mut updates_this_tick)
+                update_leaves_log_proximity(
+                    chunk_streamer,
+                    registry,
+                    x,
+                    y,
+                    z,
+                    &mut updates_this_tick,
+                )
             } else if metadata == 1 {
                 break_block_with_drop(
                     ecs_runtime,
@@ -710,13 +730,24 @@ pub(super) fn tick_random_block_at(
                 )
             } else if rng.gen_range(0..10) == 0 {
                 let mut updates_this_tick = 0_usize;
-                update_leaves_log_proximity(chunk_streamer, registry, x, y, z, &mut updates_this_tick)
+                update_leaves_log_proximity(
+                    chunk_streamer,
+                    registry,
+                    x,
+                    y,
+                    z,
+                    &mut updates_this_tick,
+                )
             } else {
                 false
             }
         }
         SAPLING_BLOCK_ID => {
-            if chunk_streamer.raw_brightness_at_world(x, y + 1, z).unwrap_or(0) < 9 {
+            if chunk_streamer
+                .raw_brightness_at_world(x, y + 1, z)
+                .unwrap_or(0)
+                < 9
+            {
                 return false;
             }
             if rng.gen_range(0..5) != 0 {
@@ -757,13 +788,7 @@ pub(super) fn tick_random_block_at(
                     false
                 }
             } else {
-                chunk_streamer.set_block_with_metadata_at_world(
-                    x,
-                    y,
-                    z,
-                    CACTUS_BLOCK_ID,
-                    meta + 1,
-                )
+                chunk_streamer.set_block_with_metadata_at_world(x, y, z, CACTUS_BLOCK_ID, meta + 1)
             }
         }
         SUGAR_CANE_BLOCK_ID => {
@@ -1070,6 +1095,3 @@ pub(super) fn break_block_and_collect_drop(
     );
     Some(Some((drop_stack, spawn_pos)))
 }
-
-
-

@@ -1001,6 +1001,65 @@ impl ChunkStreamer {
         Some(block.max(sky))
     }
 
+    #[must_use]
+    pub fn raw_brightness_at_world(&self, world_x: i32, world_y: i32, world_z: i32) -> Option<u8> {
+        if world_y < 0 {
+            return Some(0);
+        }
+        if world_y >= CHUNK_HEIGHT as i32 {
+            return Some(15);
+        }
+
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
+        let slot = self.slots.get(&pos)?;
+        if slot.state == ChunkResidencyState::Evicting {
+            return None;
+        }
+
+        let chunk = slot.chunk.as_ref()?;
+        let sky = chunk.sky_light(local_x, world_y as u8, local_z);
+        let block = chunk.block_light(local_x, world_y as u8, local_z);
+        Some(block.max(sky))
+    }
+
+    #[must_use]
+    pub fn sky_light_at_world(&self, world_x: i32, world_y: i32, world_z: i32) -> Option<u8> {
+        if world_y < 0 {
+            return Some(0);
+        }
+        if world_y >= CHUNK_HEIGHT as i32 {
+            return Some(15);
+        }
+
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
+        let slot = self.slots.get(&pos)?;
+        if slot.state == ChunkResidencyState::Evicting {
+            return None;
+        }
+
+        let chunk = slot.chunk.as_ref()?;
+        Some(chunk.sky_light(local_x, world_y as u8, local_z))
+    }
+
+    #[must_use]
+    pub fn block_light_at_world(&self, world_x: i32, world_y: i32, world_z: i32) -> Option<u8> {
+        if world_y < 0 {
+            return Some(0);
+        }
+        if world_y >= CHUNK_HEIGHT as i32 {
+            return Some(0);
+        }
+
+        let (pos, local_x, local_z) = world_block_to_chunk_pos_and_local(world_x, world_z);
+        let slot = self.slots.get(&pos)?;
+        if slot.state == ChunkResidencyState::Evicting {
+            return None;
+        }
+
+        let chunk = slot.chunk.as_ref()?;
+        Some(chunk.block_light(local_x, world_y as u8, local_z))
+    }
+
     pub fn begin_sim_tick(&mut self, sim_tick: u64) {
         self.sim_tick = sim_tick;
     }

@@ -2990,7 +2990,13 @@ fn can_place_pumpkin_world(
     replaceable && registry.is_solid(world_block(chunks, x, y - 1, z))
 }
 
-fn try_place_clay_patch(chunks: &mut HashMap<ChunkPos, ChunkData>, rng: &mut i64, x: i32, y: i32, z: i32) {
+fn try_place_clay_patch(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    rng: &mut i64,
+    x: i32,
+    y: i32,
+    z: i32,
+) {
     let origin_id = world_block(chunks, x, y, z);
     if origin_id != WATER_ID && origin_id != FLOWING_WATER_ID {
         return;
