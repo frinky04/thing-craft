@@ -150,23 +150,6 @@ pub fn spawn_dropped_item_stack(
     );
 }
 
-/// Spawn a player-dropped item (Alpha `PlayerEntity.dropItem` path):
-/// 40-tick pickup delay and a forward throw impulse from yaw/pitch.
-pub fn spawn_player_dropped_item(
-    world: &mut World,
-    item: crate::inventory::ItemKey,
-    position: DVec3,
-    yaw_radians: f64,
-    pitch_radians: f64,
-) {
-    let stack = match item {
-        crate::inventory::ItemKey::Block(id) => crate::inventory::ItemStack::block(id, 1),
-        crate::inventory::ItemKey::Tool(id) => crate::inventory::ItemStack::tool(id),
-        crate::inventory::ItemKey::Item(id) => crate::inventory::ItemStack::item(id, 1),
-    };
-    spawn_player_dropped_item_stack(world, stack, position, yaw_radians, pitch_radians);
-}
-
 /// Spawn a player-dropped item (full ItemStack) with throw impulse from yaw/pitch.
 pub fn spawn_player_dropped_item_stack(
     world: &mut World,
@@ -1404,9 +1387,9 @@ mod tests {
     fn player_drop_uses_longer_pickup_delay() {
         let mut world = World::new();
         world.insert_resource(RenderAlpha(0.0));
-        spawn_player_dropped_item(
+        spawn_player_dropped_item_stack(
             &mut world,
-            crate::inventory::ItemKey::Block(1),
+            crate::inventory::ItemStack::block(1, 1),
             DVec3::ZERO,
             0.0,
             0.0,
@@ -1422,9 +1405,9 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(RenderAlpha(0.0));
         // yaw = +90deg should throw toward +X in ThingCraft camera convention.
-        spawn_player_dropped_item(
+        spawn_player_dropped_item_stack(
             &mut world,
-            crate::inventory::ItemKey::Block(1),
+            crate::inventory::ItemStack::block(1, 1),
             DVec3::ZERO,
             std::f64::consts::FRAC_PI_2,
             0.0,
@@ -1439,9 +1422,9 @@ mod tests {
     fn player_drop_throw_respects_pitch_sign() {
         let mut up_world = World::new();
         up_world.insert_resource(RenderAlpha(0.0));
-        spawn_player_dropped_item(
+        spawn_player_dropped_item_stack(
             &mut up_world,
-            crate::inventory::ItemKey::Block(1),
+            crate::inventory::ItemStack::block(1, 1),
             DVec3::ZERO,
             0.0,
             std::f64::consts::FRAC_PI_4,
@@ -1456,9 +1439,9 @@ mod tests {
 
         let mut down_world = World::new();
         down_world.insert_resource(RenderAlpha(0.0));
-        spawn_player_dropped_item(
+        spawn_player_dropped_item_stack(
             &mut down_world,
-            crate::inventory::ItemKey::Block(1),
+            crate::inventory::ItemStack::block(1, 1),
             DVec3::ZERO,
             0.0,
             -std::f64::consts::FRAC_PI_4,

@@ -2624,7 +2624,7 @@ impl ChunkStreamer {
             .block_at_world(cell.x, cell.y, cell.z)
             .unwrap_or(AIR_ID);
         if displaced != AIR_ID && kind == LiquidKind::Water {
-            if let Some(drop_block_id) = self.registry.dropped_item_block_id(displaced) {
+            if let Some(drop_block_id) = self.dropped_item_block_id(displaced) {
                 self.pending_fluid_item_drops.push((
                     drop_block_id,
                     [
