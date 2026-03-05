@@ -6,7 +6,7 @@
 - M1 complete: fixed simulation schedule separated from frame loop.
 - M2 complete: fly camera, interpolation, and screen-space strafe controls are functioning.
 - M3 complete: chunk residency manager tracks requested/generating/meshing/ready/evicting plus dirty/remesh propagation states around the camera.
-- M4 complete: deterministic biome/climate fields, surface terrain, cave carving (Alpha worm algorithm), ore vein placement (7 ore types), and dungeon stubs implemented.
+- M4 complete: deterministic biome/climate fields, surface terrain, cave carving (Alpha worm algorithm), ore vein placement (7 ore types), and Alpha-style dungeon room/chest placement implemented (loot + spawner block-entity payloads still stubbed).
 - M5 complete: chunk face-culling mesh extraction, worker-thread generation/meshing pipeline, incremental per-chunk GPU upload/apply path, terrain-atlas sampling, face-aware texturing for selected blocks (grass/log), biome-driven grass colormap tinting, directional face shading, corrected face winding, fixed-tick block interaction requests (raycast break/place + dirty remesh propagation), per-edit column height/light refresh, and renderer frustum culling are implemented.
 - M6 complete: async lighting worker lane plus Alpha-style rendered light integration are validated end-to-end (bounded dispatch, queue-based sky/block propagation, stale-result dropping, boundary-scoped neighbor invalidation, urgent edit relight/remesh lanes, neighbor-lighting-stable meshing, and brightness-table-based face shading from propagated light).
 - M7 in progress: Wave 1 includes hotbar-driven block placement (`1..9`), finite stack state for those slots (place consumes, break pickups refill matching slots), and torch placement wired through runtime relight/remesh propagation. Wave 2 adds oak tree generation (biome-density-driven), player physics (gravity, AABB collision, jumping, fly/walk toggle via `F`), and a basic HUD (crosshair + hotbar overlay). Wave 3 adds liquid rendering (semi-transparent water with alpha blending, opaque lava with correct atlas textures, split opaque/transparent meshing pipeline), foliage biome tinting (leaf blocks colored from Alpha `foliagecolor.png`), and birch/pine tree shape variants with biome-driven selection. Wave 4 adds fixed-tick day/night state (Alpha time curve + ambient darkness/fog) and budgeted liquid simulation (water/lava flow metadata, source/flowing transitions, downward+lateral spread, and lava-water obsidian/cobblestone reactions). Wave 5 adds entity framework and dropped item entities.
@@ -129,7 +129,7 @@ Generate Alpha-exact Overworld terrain and biome metadata.
 - Alpha-exact `PerlinSimplexNoise` biome fields (temperature/downfall/biome)
 - Alpha-exact 3D density terrain (7 `PerlinNoise` generators, 5x17x5 trilinear interpolation)
 - Top-down surface builder (bedrock, sand/gravel beaches, biome surface blocks)
-- Cave carving and core underground ore distribution and dungeon stubs
+- Cave carving and core underground ore distribution and dungeon generation
 
 ### Out of Scope
 - Decoration features (lakes, flowers, cacti, sugar cane, snow cover, pumpkins, reed)

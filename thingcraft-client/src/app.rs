@@ -60,6 +60,11 @@ const FLUID_URGENT_SLICE_DIVISOR: usize = 8;
 const DAY_TICKS: u64 = 24_000;
 const WORLD_SEED: u64 = 0xA126_0001;
 const FIRE_BLOCK_ID: u8 = 51;
+const CHEST_BLOCK_ID: u8 = 54;
+const FURNACE_BLOCK_ID: u8 = 61;
+const LIT_FURNACE_BLOCK_ID: u8 = 62;
+const PUMPKIN_BLOCK_ID: u8 = 86;
+const LIT_PUMPKIN_BLOCK_ID: u8 = 91;
 const BENCH_MOVE_ASCEND_BLOCKS: f64 = 20.0;
 
 #[derive(Debug, Clone, Copy)]
@@ -2069,6 +2074,148 @@ fn can_replace_block_for_placement(registry: &BlockRegistry, target_block_id: u8
         || registry.is_snow_layer(target_block_id)
 }
 
+fn alpha_is_chest_block(block_id: u8) -> bool {
+    block_id == CHEST_BLOCK_ID
+}
+
+fn alpha_is_double_chest_at<F>(x: i32, y: i32, z: i32, mut block_lookup: F) -> bool
+where
+    F: FnMut(i32, i32, i32) -> Option<u8>,
+{
+    if !block_lookup(x, y, z).is_some_and(alpha_is_chest_block) {
+        return false;
+    }
+    block_lookup(x - 1, y, z).is_some_and(alpha_is_chest_block)
+        || block_lookup(x + 1, y, z).is_some_and(alpha_is_chest_block)
+        || block_lookup(x, y, z - 1).is_some_and(alpha_is_chest_block)
+        || block_lookup(x, y, z + 1).is_some_and(alpha_is_chest_block)
+}
+
+fn alpha_can_place_chest_at<F>(x: i32, y: i32, z: i32, mut block_lookup: F) -> bool
+where
+    F: FnMut(i32, i32, i32) -> Option<u8> + Copy,
+{
+    let mut adjacent = 0_u8;
+    if block_lookup(x - 1, y, z).is_some_and(alpha_is_chest_block) {
+        adjacent += 1;
+    }
+    if block_lookup(x + 1, y, z).is_some_and(alpha_is_chest_block) {
+        adjacent += 1;
+    }
+    if block_lookup(x, y, z - 1).is_some_and(alpha_is_chest_block) {
+        adjacent += 1;
+    }
+    if block_lookup(x, y, z + 1).is_some_and(alpha_is_chest_block) {
+        adjacent += 1;
+    }
+    if adjacent > 1 {
+        return false;
+    }
+    if alpha_is_double_chest_at(x - 1, y, z, block_lookup)
+        || alpha_is_double_chest_at(x + 1, y, z, block_lookup)
+        || alpha_is_double_chest_at(x, y, z - 1, block_lookup)
+        || alpha_is_double_chest_at(x, y, z + 1, block_lookup)
+    {
+        return false;
+    }
+    true
+}
+
+fn alpha_horizontal_face_from_look(look_direction: DVec3) -> u8 {
+    let horizontal = DVec3::new(look_direction.x, 0.0, look_direction.z);
+    if horizontal.length_squared() <= f64::EPSILON {
+        return 3;
+    }
+    if horizontal.x.abs() > horizontal.z.abs() {
+        if horizontal.x > 0.0 {
+            5
+        } else {
+            4
+        }
+    } else if horizontal.z > 0.0 {
+        3
+    } else {
+        2
+    }
+}
+
+fn alpha_opposite_face(face: u8) -> u8 {
+    match face {
+        2 => 3,
+        3 => 2,
+        4 => 5,
+        5 => 4,
+        _ => face,
+    }
+}
+
+fn alpha_chest_facing_from_solid_neighbors(
+    north_solid: bool,
+    south_solid: bool,
+    west_solid: bool,
+    east_solid: bool,
+) -> u8 {
+    // Alpha ChestBlock.getSprite(WorldView,...): default single chest front is south (face 3),
+    // with overrides based on adjacent opaque blocks.
+    let mut front_face = 3_u8;
+    if north_solid && !south_solid {
+        front_face = 3;
+    }
+    if south_solid && !north_solid {
+        front_face = 2;
+    }
+    if west_solid && !east_solid {
+        front_face = 5;
+    }
+    if east_solid && !west_solid {
+        front_face = 4;
+    }
+    front_face
+}
+
+fn alpha_chest_placement_metadata_from_neighbors(
+    registry: &BlockRegistry,
+    chunk_streamer: &ChunkStreamer,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    let north = chunk_streamer
+        .block_at_world(x, y, z - 1)
+        .is_some_and(|id| registry.is_solid(id));
+    let south = chunk_streamer
+        .block_at_world(x, y, z + 1)
+        .is_some_and(|id| registry.is_solid(id));
+    let west = chunk_streamer
+        .block_at_world(x - 1, y, z)
+        .is_some_and(|id| registry.is_solid(id));
+    let east = chunk_streamer
+        .block_at_world(x + 1, y, z)
+        .is_some_and(|id| registry.is_solid(id));
+    alpha_chest_facing_from_solid_neighbors(north, south, west, east)
+}
+
+fn alpha_placement_metadata_from_look(block_id: u8, look_direction: DVec3) -> u8 {
+    match block_id {
+        FURNACE_BLOCK_ID | LIT_FURNACE_BLOCK_ID => {
+            // Alpha FurnaceBlock.onPlaced stores the front face in metadata (2..5).
+            alpha_opposite_face(alpha_horizontal_face_from_look(look_direction))
+        }
+        PUMPKIN_BLOCK_ID | LIT_PUMPKIN_BLOCK_ID => {
+            // Alpha PumpkinBlock.onPlaced stores 0..3 where:
+            // 0->north(2), 1->east(5), 2->south(3), 3->west(4).
+            match alpha_opposite_face(alpha_horizontal_face_from_look(look_direction)) {
+                2 => 0,
+                5 => 1,
+                3 => 2,
+                4 => 3,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
 fn process_block_interaction_requests(
     ecs_runtime: &mut EcsRuntime,
     registry: &BlockRegistry,
@@ -2147,12 +2294,37 @@ fn process_single_block_interaction_request(
         return;
     }
 
+    if block_id == CHEST_BLOCK_ID
+        && !alpha_can_place_chest_at(place_x, place_y, place_z, |qx, qy, qz| {
+            chunk_streamer.block_at_world(qx, qy, qz)
+        })
+    {
+        return;
+    }
+
     let place_target_block = chunk_streamer
         .block_at_world(place_x, place_y, place_z)
         .unwrap_or(AIR_BLOCK_ID);
+    let placement_metadata = if block_id == CHEST_BLOCK_ID {
+        alpha_chest_placement_metadata_from_neighbors(
+            registry,
+            chunk_streamer,
+            place_x,
+            place_y,
+            place_z,
+        )
+    } else {
+        alpha_placement_metadata_from_look(block_id, request.direction)
+    };
     if (place_target_block == AIR_BLOCK_ID
         || can_replace_block_for_placement(registry, place_target_block))
-        && chunk_streamer.set_block_at_world(place_x, place_y, place_z, block_id)
+        && chunk_streamer.set_block_with_metadata_at_world(
+            place_x,
+            place_y,
+            place_z,
+            block_id,
+            placement_metadata,
+        )
     {
         let _ = ecs_runtime
             .world_mut()
@@ -3729,12 +3901,15 @@ mod tests {
 
     use super::{
         affected_chunks_for_block_edit, alpha_ambient_darkness, alpha_apply_fog_brightness,
+        alpha_can_place_chest_at, alpha_chest_facing_from_solid_neighbors,
         alpha_block_mining_calc, alpha_brightness_from_light_level,
-        alpha_fog_brightness_target, alpha_star_brightness, alpha_sunrise_color,
-        alpha_time_of_day, has_target_directive, hotbar_slot_for_key,
-        can_replace_block_for_placement, is_raycast_targetable_block, parse_env_bool,
+        alpha_fog_brightness_target, alpha_horizontal_face_from_look,
+        alpha_opposite_face, alpha_placement_metadata_from_look, alpha_star_brightness,
+        alpha_sunrise_color, alpha_time_of_day, can_replace_block_for_placement,
+        has_target_directive, hotbar_slot_for_key, is_raycast_targetable_block, parse_env_bool,
         parse_env_u32, placement_intersects_player, raycast_first_solid_block,
-        resolve_axis, AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID,
+        resolve_axis, AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, FURNACE_BLOCK_ID,
+        CHEST_BLOCK_ID, LIT_FURNACE_BLOCK_ID, LIT_PUMPKIN_BLOCK_ID, PUMPKIN_BLOCK_ID,
     };
     use crate::ecs::EcsRuntime;
     use crate::gameplay::{
@@ -3955,6 +4130,92 @@ mod tests {
                 normal: [-1, 0, 0],
             })
         );
+    }
+
+    #[test]
+    fn alpha_face_mapping_from_look_direction_matches_cardinals() {
+        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, 1.0)), 3);
+        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(0.0, 0.0, -1.0)), 2);
+        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(1.0, 0.0, 0.0)), 5);
+        assert_eq!(alpha_horizontal_face_from_look(DVec3::new(-1.0, 0.0, 0.0)), 4);
+        assert_eq!(alpha_opposite_face(2), 3);
+        assert_eq!(alpha_opposite_face(5), 4);
+    }
+
+    #[test]
+    fn furnace_and_pumpkin_placement_metadata_faces_player() {
+        // Looking +Z: block front should be -Z (face 2)
+        let look_south = DVec3::new(0.0, 0.0, 1.0);
+        assert_eq!(
+            alpha_placement_metadata_from_look(FURNACE_BLOCK_ID, look_south),
+            2
+        );
+        assert_eq!(
+            alpha_placement_metadata_from_look(LIT_FURNACE_BLOCK_ID, look_south),
+            2
+        );
+        assert_eq!(
+            alpha_placement_metadata_from_look(PUMPKIN_BLOCK_ID, look_south),
+            0
+        );
+        assert_eq!(
+            alpha_placement_metadata_from_look(LIT_PUMPKIN_BLOCK_ID, look_south),
+            0
+        );
+    }
+
+    #[test]
+    fn chest_facing_defaults_to_neighbor_derived_rules() {
+        assert_eq!(
+            alpha_chest_facing_from_solid_neighbors(false, false, false, false),
+            3
+        );
+        assert_eq!(
+            alpha_chest_facing_from_solid_neighbors(true, false, false, false),
+            3
+        );
+        assert_eq!(
+            alpha_chest_facing_from_solid_neighbors(false, true, false, false),
+            2
+        );
+        assert_eq!(
+            alpha_chest_facing_from_solid_neighbors(false, false, true, false),
+            5
+        );
+        assert_eq!(
+            alpha_chest_facing_from_solid_neighbors(false, false, false, true),
+            4
+        );
+    }
+
+    #[test]
+    fn chest_placement_rejects_triple_chest_layout() {
+        let blocks = vec![
+            ((-1, 0, 0), CHEST_BLOCK_ID),
+            ((1, 0, 0), CHEST_BLOCK_ID),
+        ];
+        let lookup = |x: i32, y: i32, z: i32| {
+            blocks
+                .iter()
+                .find(|((bx, by, bz), _)| *bx == x && *by == y && *bz == z)
+                .map(|(_, id)| *id)
+        };
+        assert!(!alpha_can_place_chest_at(0, 0, 0, lookup));
+    }
+
+    #[test]
+    fn chest_placement_rejects_attaching_to_existing_double_chest() {
+        let blocks = vec![
+            ((0, 0, 0), CHEST_BLOCK_ID),
+            ((1, 0, 0), CHEST_BLOCK_ID),
+        ];
+        let lookup = |x: i32, y: i32, z: i32| {
+            blocks
+                .iter()
+                .find(|((bx, by, bz), _)| *bx == x && *by == y && *bz == z)
+                .map(|(_, id)| *id)
+        };
+        assert!(!alpha_can_place_chest_at(2, 0, 0, lookup));
     }
 
     #[test]

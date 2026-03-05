@@ -11,7 +11,7 @@ This document tracks Alpha 1.2.6 gameplay/content parity items.
 - [~] Terrain: Alpha-exact 3D density terrain generation is implemented (7 `PerlinNoise` generators with correct seeding order, 5x17x5 density grid with trilinear interpolation, climate-modulated scale/depth shaping, top-down `buildSurfaces` pass with bedrock/sand/gravel layers). Surface lake population is re-enabled; broader parity validation for all decoration feature rates/distribution is still pending.
 - [x] Caves: Standard cave tunnels only (no ravines).
 - [x] Underground Generation: Dirt, gravel, coal, iron, gold, diamond, and redstone veins.
-- [~] Structures: Dungeon rooms with mob spawner blocks placed (chest inventory and spawner entity config require M7 entity/inventory systems).
+- [~] Structures: Dungeon rooms now place with Alpha world-space rules (including chest blocks and spawner blocks). Chest loot contents and persisted spawner mob type remain pending block-entity/inventory wiring.
 
 ## Graphics and Lighting
 - [x] Lighting Engine: Async queue propagation and rendered-light sampling are integrated with boundary-aware neighbor relight/remesh invalidation and stale-result dropping.
