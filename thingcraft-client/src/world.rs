@@ -37,6 +37,11 @@ const OAK_LEAVES_ID: u8 = 18;
 const OBSIDIAN_ID: u8 = 49;
 const MOSSY_COBBLESTONE_ID: u8 = 48;
 const MOB_SPAWNER_ID: u8 = 52;
+const CHEST_ID: u8 = 54;
+const CRAFTING_TABLE_ID: u8 = 58;
+const FURNACE_ID: u8 = 61;
+const LIT_FURNACE_ID: u8 = 62;
+const LIT_PUMPKIN_ID: u8 = 91;
 const DIAMOND_ORE_ID: u8 = 56;
 const REDSTONE_ORE_ID: u8 = 73;
 pub(crate) const ICE_ID: u8 = 79;
@@ -116,6 +121,8 @@ pub struct BlockDef {
     pub blocks_movement: bool,
     pub has_collision: bool,
     pub can_ray_trace: bool,
+    pub face_occluder: bool,
+    pub face_sprites: Option<[u16; 6]>,
 }
 
 #[derive(Clone)]
@@ -375,7 +382,7 @@ impl BlockRegistry {
         );
         add(
             &mut by_id,
-            58,
+            CRAFTING_TABLE_ID,
             "crafting_table",
             43,
             MaterialKind::Wood,
@@ -622,6 +629,7 @@ impl BlockRegistry {
         }
 
         apply_alpha_block_property_overrides(&mut by_id);
+        apply_alpha_block_visual_overrides(&mut by_id);
 
         Self { by_id }
     }
@@ -649,7 +657,8 @@ impl BlockRegistry {
 
     #[must_use]
     pub fn material_of(&self, block_id: u8) -> MaterialKind {
-        self.get(block_id).map_or(MaterialKind::Air, |block| block.material)
+        self.get(block_id)
+            .map_or(MaterialKind::Air, |block| block.material)
     }
 
     #[must_use]
@@ -665,26 +674,88 @@ impl BlockRegistry {
 
     #[must_use]
     pub fn sprite_index_for_face(&self, block_id: u8, face_offset: [i32; 3]) -> u16 {
-        match (block_id, face_offset[1]) {
-            (GRASS_ID, 1) => 0,
-            (GRASS_ID, -1) => self.sprite_index_of(DIRT_ID),
-            (17, 1 | -1) => 21,
-            // Cactus: top=69, side=70, bottom=71
-            (CACTUS_ID, 1) => 69,
-            (CACTUS_ID, -1) => 71,
-            (CACTUS_ID, 0) => 70,
-            // Pumpkin: top=102, side=118
-            (PUMPKIN_ID, 1 | -1) => 102,
-            (PUMPKIN_ID, 0) => 118,
-            _ => {
-                let base = self.sprite_index_of(block_id);
-                // Liquid side faces use base+1 sprite (top/bottom use base)
-                if self.is_liquid(block_id) && face_offset[1] == 0 {
-                    base + 1
-                } else {
-                    base
-                }
+        if let Some(block) = self.get(block_id) {
+            if let Some(face_sprites) = block.face_sprites {
+                return face_sprites[face_index_from_offset(face_offset)];
             }
+        }
+
+        let base = self.sprite_index_of(block_id);
+        // Liquid side faces use base+1 sprite (top/bottom use base)
+        if self.is_liquid(block_id) && face_offset[1] == 0 {
+            base + 1
+        } else {
+            base
+        }
+    }
+
+    #[must_use]
+    pub fn sprite_index_for_face_with_metadata(
+        &self,
+        block_id: u8,
+        face_offset: [i32; 3],
+        metadata: u8,
+    ) -> u16 {
+        let face = alpha_face_code_from_offset(face_offset);
+        if block_id == FURNACE_ID || block_id == LIT_FURNACE_ID {
+            // Alpha FurnaceBlock.getSprite(WorldView,...):
+            // top/bottom -> stone; sides -> body; facing side -> front (lit/unlit variant).
+            if face == 0 || face == 1 {
+                return self.sprite_index_of(STONE_ID);
+            }
+            let front_face = if (2..=5).contains(&metadata) {
+                metadata
+            } else {
+                3
+            };
+            if face == front_face {
+                if block_id == LIT_FURNACE_ID {
+                    61
+                } else {
+                    44
+                }
+            } else {
+                45
+            }
+        } else if block_id == CHEST_ID {
+            // Metadata-driven chest facing (player-facing placement path in app.rs).
+            // 2..5 follows Alpha face codes; fallback keeps vanilla single-chest default (+Z).
+            if face == 0 || face == 1 {
+                return 25;
+            }
+            let front_face = if (2..=5).contains(&metadata) {
+                metadata
+            } else {
+                3
+            };
+            if face == front_face {
+                27
+            } else {
+                26
+            }
+        } else if block_id == PUMPKIN_ID || block_id == LIT_PUMPKIN_ID {
+            // Alpha PumpkinBlock.getSprite(int face, int metadata):
+            // top/bottom = top sprite, sides = side sprite except facing side is front.
+            if face == 0 || face == 1 {
+                return 102;
+            }
+            let front_face = match metadata & 3 {
+                0 => 2, // north (-Z)
+                1 => 5, // east (+X)
+                2 => 3, // south (+Z)
+                _ => 4, // west (-X)
+            };
+            if face == front_face {
+                if block_id == LIT_PUMPKIN_ID {
+                    120
+                } else {
+                    119
+                }
+            } else {
+                118
+            }
+        } else {
+            self.sprite_index_for_face(block_id, face_offset)
         }
     }
 
@@ -783,8 +854,7 @@ impl BlockRegistry {
 
     #[must_use]
     pub fn is_face_occluder(&self, block_id: u8) -> bool {
-        self.get(block_id)
-            .is_some_and(|block| block.solid && block.opacity == 255)
+        self.get(block_id).is_some_and(|block| block.face_occluder)
     }
 
     #[must_use]
@@ -833,6 +903,8 @@ fn add(
         blocks_movement,
         has_collision,
         can_ray_trace,
+        face_occluder: solid && opacity == 255,
+        face_sprites: None,
     });
 }
 
@@ -859,6 +931,30 @@ fn alpha_material_blocks_movement(material: MaterialKind) -> bool {
             | MaterialKind::Portal
             | MaterialKind::SnowLayer
     )
+}
+
+fn face_index_from_offset(face_offset: [i32; 3]) -> usize {
+    match face_offset {
+        [0, 1, 0] => 0,   // +Y (top)
+        [0, -1, 0] => 1,  // -Y (bottom)
+        [0, 0, -1] => 2,  // -Z (north)
+        [0, 0, 1] => 3,   // +Z (south)
+        [-1, 0, 0] => 4,  // -X (west)
+        [1, 0, 0] => 5,   // +X (east)
+        _ => panic!("invalid face offset: {:?}", face_offset),
+    }
+}
+
+fn alpha_face_code_from_offset(face_offset: [i32; 3]) -> u8 {
+    match face_offset {
+        [0, -1, 0] => 0,
+        [0, 1, 0] => 1,
+        [0, 0, -1] => 2,
+        [0, 0, 1] => 3,
+        [-1, 0, 0] => 4,
+        [1, 0, 0] => 5,
+        _ => panic!("invalid face offset: {:?}", face_offset),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -917,7 +1013,16 @@ fn apply_alpha_block_property_overrides(by_id: &mut [Option<BlockDef>; 256]) {
     set_alpha_block_properties(by_id, 52, 5.0, 5.0, false, true, true, true);
     set_alpha_block_properties(by_id, 54, 2.5, 2.5, false, true, true, true);
     set_alpha_block_properties(by_id, 56, 3.0, 3.0, false, true, true, true);
-    set_alpha_block_properties(by_id, 58, 2.5, 2.5, false, true, true, true);
+    set_alpha_block_properties(
+        by_id,
+        CRAFTING_TABLE_ID,
+        2.5,
+        2.5,
+        false,
+        true,
+        true,
+        true,
+    );
     set_alpha_block_properties(by_id, 61, 3.5, 3.5, false, true, true, true);
     set_alpha_block_properties(by_id, 62, 3.5, 3.5, false, true, true, true);
     set_alpha_block_properties(by_id, 63, 1.0, 1.0, false, true, false, true);
@@ -938,6 +1043,36 @@ fn apply_alpha_block_property_overrides(by_id: &mut [Option<BlockDef>; 256]) {
     set_alpha_block_properties(by_id, 89, 0.3, 0.3, false, true, true, true);
     set_alpha_block_properties(by_id, 90, -1.0, 0.0, false, false, false, true);
     set_alpha_block_properties(by_id, 91, 1.0, 1.0, true, true, true, true);
+}
+
+fn set_alpha_face_sprites(by_id: &mut [Option<BlockDef>; 256], id: u8, sprites: [u16; 6]) {
+    let block = by_id[usize::from(id)]
+        .as_mut()
+        .unwrap_or_else(|| panic!("missing alpha block id {id}"));
+    block.face_sprites = Some(sprites);
+}
+
+fn set_alpha_face_occluder(by_id: &mut [Option<BlockDef>; 256], id: u8, face_occluder: bool) {
+    let block = by_id[usize::from(id)]
+        .as_mut()
+        .unwrap_or_else(|| panic!("missing alpha block id {id}"));
+    block.face_occluder = face_occluder;
+}
+
+fn apply_alpha_block_visual_overrides(by_id: &mut [Option<BlockDef>; 256]) {
+    // Face order: [top, bottom, north(-Z), south(+Z), west(-X), east(+X)].
+    set_alpha_face_sprites(by_id, GRASS_ID, [0, 2, 3, 3, 3, 3]);
+    set_alpha_face_sprites(by_id, OAK_LOG_ID, [21, 21, 20, 20, 20, 20]);
+    set_alpha_face_sprites(by_id, CACTUS_ID, [69, 71, 70, 70, 70, 70]);
+    set_alpha_face_sprites(by_id, PUMPKIN_ID, [102, 102, 118, 119, 118, 118]);
+    set_alpha_face_sprites(by_id, LIT_PUMPKIN_ID, [102, 102, 118, 120, 118, 118]);
+    // Alpha ChestBlock.getSprite(int face): top/bottom 25, south/front 27, others 26.
+    set_alpha_face_sprites(by_id, CHEST_ID, [25, 25, 26, 27, 26, 26]);
+    // Alpha CraftingTableBlock.getSprite(int face): top 43, bottom planks(4),
+    // north/west 60, south/east 59.
+    set_alpha_face_sprites(by_id, CRAFTING_TABLE_ID, [43, 4, 60, 59, 60, 59]);
+    // Alpha MobSpawnerBlock.isSolid() == false: should not occlude neighbor faces.
+    set_alpha_face_occluder(by_id, MOB_SPAWNER_ID, false);
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1227,6 +1362,7 @@ impl OverworldChunkGenerator {
         };
         let source_max = ChunkPos { x: max_x, z: max_z };
         place_lakes(&mut chunks, self.seed, source_min, source_max);
+        place_dungeons(&mut chunks, self.seed, source_min, source_max);
         place_trees(
             &mut chunks,
             self.seed,
@@ -1665,7 +1801,6 @@ impl OverworldChunkGenerator {
         carve_caves(chunk, self.seed);
         place_clay_patches(chunk, self.seed);
         populate_ores(chunk, self.seed);
-        place_dungeon_stubs(chunk, self.seed);
         chunk.recalculate_height_map(registry);
         place_flowers(chunk, self.seed);
         place_mushrooms(chunk, self.seed);
@@ -2126,7 +2261,7 @@ fn place_vein(
 }
 
 // ---------------------------------------------------------------------------
-// Dungeon stubs  (translated from DungeonFeature.java / OverworldChunkGenerator.java)
+// Dungeon generation  (translated from DungeonFeature.java / OverworldChunkGenerator.java)
 // ---------------------------------------------------------------------------
 
 /// Alpha's `material.isSolid()` — air and liquids are non-solid.
@@ -2137,104 +2272,214 @@ fn is_solid_for_dungeon(block_id: u8) -> bool {
     )
 }
 
-fn place_dungeon_stubs(chunk: &mut ChunkData, world_seed: u64) {
-    let cx = chunk.pos.x;
-    let cz = chunk.pos.z;
+fn place_dungeons(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    world_seed: u64,
+    source_min: ChunkPos,
+    source_max: ChunkPos,
+) {
+    for source_z in source_min.z..=source_max.z {
+        for source_x in source_min.x..=source_max.x {
+            let mut rng = java_random_seed(alpha_chunk_seed(world_seed, source_x, source_z));
+            let base_x = source_x * CHUNK_WIDTH as i32 + 8;
+            let base_z = source_z * CHUNK_DEPTH as i32 + 8;
 
-    // SmallRng is fine — dungeon placement doesn't need Java-exact RNG sequences.
-    // XOR with a constant to decorrelate from ore placement (same base seed).
-    let mut rng =
-        SmallRng::seed_from_u64((alpha_chunk_seed(world_seed, cx, cz) ^ 0x5A5A_5A5A) as u64);
-
-    // 8 attempts per chunk (matching Alpha)
-    for _ in 0..8 {
-        let local_x = rng.gen_range(0..16_i32);
-        let y = rng.gen_range(1..CHUNK_HEIGHT as i32 - 4);
-        let local_z = rng.gen_range(0..16_i32);
-
-        let half_x: i32 = rng.gen_range(2..=4);
-        let half_z: i32 = rng.gen_range(2..=4);
-        let room_height = 3;
-
-        // Bounds check — room must fit within chunk
-        if local_x - half_x - 1 < 0
-            || local_x + half_x + 1 >= 16
-            || local_z - half_z - 1 < 0
-            || local_z + half_z + 1 >= 16
-            || y + room_height + 1 >= CHUNK_HEIGHT as i32
-        {
-            continue;
+            for _ in 0..8 {
+                let x = base_x + java_next_int(&mut rng, 16);
+                let y = java_next_int(&mut rng, CHUNK_HEIGHT as i32);
+                let z = base_z + java_next_int(&mut rng, 16);
+                try_place_dungeon(chunks, &mut rng, x, y, z);
+            }
         }
+    }
+}
 
-        // Validate: floor and ceiling are solid (Alpha rejects air and liquids)
-        let mut solid_envelope = true;
-        'envelope: for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
-            for vz in (local_z - half_z - 1)..=(local_z + half_z + 1) {
-                let floor_b = chunk.block(vx as u8, (y - 1) as u8, vz as u8);
-                let ceil_b = chunk.block(vx as u8, (y + room_height + 1) as u8, vz as u8);
-                if !is_solid_for_dungeon(floor_b) || !is_solid_for_dungeon(ceil_b) {
-                    solid_envelope = false;
-                    break 'envelope;
+fn try_place_dungeon(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    rng: &mut i64,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    let room_height = 3;
+    let half_x = java_next_int(rng, 2) + 2;
+    let half_z = java_next_int(rng, 2) + 2;
+    let mut openings = 0;
+
+    for m in (x - half_x - 1)..=(x + half_x + 1) {
+        for n in (y - 1)..=(y + room_height + 1) {
+            for q in (z - half_z - 1)..=(z + half_z + 1) {
+                let block = world_block(chunks, m, n, q);
+                if n == y - 1 && !is_solid_for_dungeon(block) {
+                    return false;
+                }
+                if n == y + room_height + 1 && !is_solid_for_dungeon(block) {
+                    return false;
+                }
+                let boundary = m == x - half_x - 1
+                    || m == x + half_x + 1
+                    || q == z - half_z - 1
+                    || q == z + half_z + 1;
+                if boundary
+                    && n == y
+                    && world_block(chunks, m, n, q) == AIR_ID
+                    && world_block(chunks, m, n + 1, q) == AIR_ID
+                {
+                    openings += 1;
                 }
             }
         }
-        if !solid_envelope {
-            continue;
-        }
+    }
 
-        // Count wall openings (adjacent air on walls at floor level)
-        let mut openings = 0;
-        for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
-            for vz in (local_z - half_z - 1)..=(local_z + half_z + 1) {
-                let on_wall = vx == local_x - half_x - 1
-                    || vx == local_x + half_x + 1
-                    || vz == local_z - half_z - 1
-                    || vz == local_z + half_z + 1;
-                if on_wall {
-                    let b = chunk.block(vx as u8, y as u8, vz as u8);
-                    let b_above = chunk.block(vx as u8, (y + 1) as u8, vz as u8);
-                    if b == AIR_ID && b_above == AIR_ID {
-                        openings += 1;
+    if !(1..=5).contains(&openings) {
+        return false;
+    }
+
+    for m in (x - half_x - 1)..=(x + half_x + 1) {
+        for o in ((y - 1)..=(y + room_height)).rev() {
+            for r in (z - half_z - 1)..=(z + half_z + 1) {
+                let on_boundary = m == x - half_x - 1
+                    || o == y - 1
+                    || r == z - half_z - 1
+                    || m == x + half_x + 1
+                    || o == y + room_height + 1
+                    || r == z + half_z + 1;
+                if on_boundary {
+                    if o >= 0 && !is_solid_for_dungeon(world_block(chunks, m, o - 1, r)) {
+                        set_world_block(chunks, m, o, r, AIR_ID);
+                        continue;
                     }
-                }
-            }
-        }
-        if !(1..=5).contains(&openings) {
-            continue;
-        }
-
-        // Carve the room and place walls
-        for vx in (local_x - half_x - 1)..=(local_x + half_x + 1) {
-            for vy in (y - 1)..=(y + room_height + 1) {
-                for vz in (local_z - half_z - 1)..=(local_z + half_z + 1) {
-                    let on_boundary = vx == local_x - half_x - 1
-                        || vx == local_x + half_x + 1
-                        || vy == y - 1
-                        || vy == y + room_height + 1
-                        || vz == local_z - half_z - 1
-                        || vz == local_z + half_z + 1;
-
-                    if on_boundary {
-                        // Walls/floor/ceiling: cobblestone or mossy (only replace solid blocks)
-                        let existing = chunk.block(vx as u8, vy as u8, vz as u8);
-                        if is_solid_for_dungeon(existing) {
-                            let wall_block = if vy == y - 1 && rng.gen_range(0..4) != 0 {
-                                MOSSY_COBBLESTONE_ID
-                            } else {
-                                COBBLESTONE_ID
-                            };
-                            chunk.set_block(vx as u8, vy as u8, vz as u8, wall_block);
-                        }
+                    if !is_solid_for_dungeon(world_block(chunks, m, o, r)) {
+                        continue;
+                    }
+                    let wall_id = if o == y - 1 && java_next_int(rng, 4) != 0 {
+                        MOSSY_COBBLESTONE_ID
                     } else {
-                        // Interior: clear to air
-                        chunk.set_block(vx as u8, vy as u8, vz as u8, AIR_ID);
-                    }
+                        COBBLESTONE_ID
+                    };
+                    set_world_block(chunks, m, o, r, wall_id);
+                    continue;
                 }
+                set_world_block(chunks, m, o, r, AIR_ID);
             }
         }
+    }
 
-        // Place mob spawner at center
-        chunk.set_block(local_x as u8, y as u8, local_z as u8, MOB_SPAWNER_ID);
+    for _ in 0..2 {
+        let mut chest_placed = false;
+        for _ in 0..3 {
+            let chest_x = x + java_next_int(rng, half_x * 2 + 1) - half_x;
+            let chest_z = z + java_next_int(rng, half_z * 2 + 1) - half_z;
+            if world_block(chunks, chest_x, y, chest_z) != AIR_ID {
+                continue;
+            }
+
+            let mut neighbor_count = 0;
+            if is_solid_for_dungeon(world_block(chunks, chest_x - 1, y, chest_z)) {
+                neighbor_count += 1;
+            }
+            if is_solid_for_dungeon(world_block(chunks, chest_x + 1, y, chest_z)) {
+                neighbor_count += 1;
+            }
+            if is_solid_for_dungeon(world_block(chunks, chest_x, y, chest_z - 1)) {
+                neighbor_count += 1;
+            }
+            if is_solid_for_dungeon(world_block(chunks, chest_x, y, chest_z + 1)) {
+                neighbor_count += 1;
+            }
+            if neighbor_count != 1 {
+                continue;
+            }
+
+            let north_solid = is_solid_for_dungeon(world_block(chunks, chest_x, y, chest_z - 1));
+            let south_solid = is_solid_for_dungeon(world_block(chunks, chest_x, y, chest_z + 1));
+            let west_solid = is_solid_for_dungeon(world_block(chunks, chest_x - 1, y, chest_z));
+            let east_solid = is_solid_for_dungeon(world_block(chunks, chest_x + 1, y, chest_z));
+            let mut chest_front_face = 3_u8;
+            if north_solid && !south_solid {
+                chest_front_face = 3;
+            }
+            if south_solid && !north_solid {
+                chest_front_face = 2;
+            }
+            if west_solid && !east_solid {
+                chest_front_face = 5;
+            }
+            if east_solid && !west_solid {
+                chest_front_face = 4;
+            }
+            set_world_block_with_metadata(chunks, chest_x, y, chest_z, CHEST_ID, chest_front_face);
+            // TODO(M7): Attach chest block-entity inventory and write real loot stacks.
+            for _ in 0..8 {
+                consume_dungeon_loot_roll(rng);
+            }
+            chest_placed = true;
+            break;
+        }
+        if !chest_placed {
+            continue;
+        }
+    }
+
+    set_world_block(chunks, x, y, z, MOB_SPAWNER_ID);
+    // TODO(M7): Persist spawner block-entity mob type ("Skeleton"/"Zombie"/"Spider").
+    let _spawner_type = pick_dungeon_spawner_type(rng);
+    true
+}
+
+fn consume_dungeon_loot_roll(rng: &mut i64) {
+    let roll = java_next_int(rng, 11);
+    let mut has_loot = false;
+    match roll {
+        0 => has_loot = true, // Saddle
+        1 => {
+            let _count = java_next_int(rng, 4) + 1; // Iron ingot count
+            has_loot = true;
+        }
+        2 => has_loot = true, // Bread
+        3 => {
+            let _count = java_next_int(rng, 4) + 1; // Wheat count
+            has_loot = true;
+        }
+        4 => {
+            let _count = java_next_int(rng, 4) + 1; // Gunpowder count
+            has_loot = true;
+        }
+        5 => {
+            let _count = java_next_int(rng, 4) + 1; // String count
+            has_loot = true;
+        }
+        6 => has_loot = true, // Bucket
+        7 => {
+            if java_next_int(rng, 100) == 0 {
+                has_loot = true; // Golden apple
+            }
+        }
+        8 => {
+            if java_next_int(rng, 2) == 0 {
+                let _count = java_next_int(rng, 4) + 1; // Redstone count
+                has_loot = true;
+            }
+        }
+        9 => {
+            if java_next_int(rng, 10) == 0 {
+                let _record_variant = java_next_int(rng, 2); // Record 13 or Cat
+                has_loot = true;
+            }
+        }
+        _ => {}
+    }
+    if has_loot {
+        let _slot = java_next_int(rng, 27); // Chest inventory slot index
+    }
+}
+
+fn pick_dungeon_spawner_type(rng: &mut i64) -> &'static str {
+    match java_next_int(rng, 4) {
+        0 => "Skeleton",
+        1 | 2 => "Zombie",
+        3 => "Spider",
+        _ => "",
     }
 }
 
@@ -2938,6 +3183,23 @@ fn set_world_block(
     }
 }
 
+fn set_world_block_with_metadata(
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    world_x: i32,
+    y: i32,
+    world_z: i32,
+    block_id: u8,
+    metadata: u8,
+) {
+    if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        return;
+    }
+    let (chunk_pos, local_x, local_z) = world_to_chunk_local(world_x, world_z);
+    if let Some(chunk) = chunks.get_mut(&chunk_pos) {
+        chunk.set_block_with_metadata(local_x, y as u8, local_z, block_id, metadata);
+    }
+}
+
 /// Find the y of the highest non-air block at this world column using the
 /// precomputed per-chunk height maps.
 fn find_surface_y_world(
@@ -3627,6 +3889,110 @@ mod tests {
     }
 
     #[test]
+    fn chest_uses_alpha_face_sprites() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert_eq!(registry.sprite_index_for_face(CHEST_ID, [0, 1, 0]), 25);
+        assert_eq!(registry.sprite_index_for_face(CHEST_ID, [0, -1, 0]), 25);
+        assert_eq!(registry.sprite_index_for_face(CHEST_ID, [0, 0, -1]), 26);
+        assert_eq!(registry.sprite_index_for_face(CHEST_ID, [0, 0, 1]), 27);
+        assert_eq!(registry.sprite_index_for_face(CHEST_ID, [-1, 0, 0]), 26);
+        assert_eq!(registry.sprite_index_for_face(CHEST_ID, [1, 0, 0]), 26);
+    }
+
+    #[test]
+    fn chest_uses_metadata_oriented_face_sprites() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        // Metadata 2 -> front north (-Z)
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(CHEST_ID, [0, 0, -1], 2),
+            27
+        );
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(CHEST_ID, [0, 0, 1], 2),
+            26
+        );
+    }
+
+    #[test]
+    fn crafting_table_uses_alpha_face_sprites() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert_eq!(registry.sprite_index_for_face(CRAFTING_TABLE_ID, [0, 1, 0]), 43);
+        assert_eq!(
+            registry.sprite_index_for_face(CRAFTING_TABLE_ID, [0, -1, 0]),
+            4
+        );
+        assert_eq!(
+            registry.sprite_index_for_face(CRAFTING_TABLE_ID, [0, 0, -1]),
+            60
+        );
+        assert_eq!(
+            registry.sprite_index_for_face(CRAFTING_TABLE_ID, [0, 0, 1]),
+            59
+        );
+        assert_eq!(
+            registry.sprite_index_for_face(CRAFTING_TABLE_ID, [-1, 0, 0]),
+            60
+        );
+        assert_eq!(
+            registry.sprite_index_for_face(CRAFTING_TABLE_ID, [1, 0, 0]),
+            59
+        );
+    }
+
+    #[test]
+    fn furnace_uses_metadata_oriented_face_sprites() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        // Metadata 5 -> front on +X.
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(FURNACE_ID, [1, 0, 0], 5),
+            44
+        );
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(FURNACE_ID, [0, 0, 1], 5),
+            45
+        );
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(FURNACE_ID, [0, 1, 0], 5),
+            1
+        );
+        // Lit furnace front uses sprite +16.
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(LIT_FURNACE_ID, [1, 0, 0], 5),
+            61
+        );
+    }
+
+    #[test]
+    fn pumpkin_uses_metadata_oriented_face_sprites() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        // Metadata 1 -> front on +X.
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(PUMPKIN_ID, [1, 0, 0], 1),
+            119
+        );
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(PUMPKIN_ID, [0, 0, 1], 1),
+            118
+        );
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(PUMPKIN_ID, [0, 1, 0], 1),
+            102
+        );
+        assert_eq!(
+            registry.sprite_index_for_face_with_metadata(LIT_PUMPKIN_ID, [1, 0, 0], 1),
+            120
+        );
+    }
+
+    #[test]
+    fn mob_spawner_is_non_occluding_but_collidable() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        assert!(!registry.is_face_occluder(MOB_SPAWNER_ID));
+        assert!(registry.blocks_movement(MOB_SPAWNER_ID));
+        assert!(registry.is_collidable(MOB_SPAWNER_ID));
+    }
+
+    #[test]
     fn grass_top_face_marks_biome_tint_usage() {
         let registry = BlockRegistry::alpha_1_2_6();
         assert_eq!(registry.face_tint_rgb(GRASS_ID, [0, 1, 0]), [0, 0, 0]);
@@ -3931,11 +4297,12 @@ mod tests {
     }
 
     #[test]
-    fn dungeon_stub_places_cobblestone() {
+    fn dungeons_place_walls_spawners_and_chests() {
         let registry = BlockRegistry::alpha_1_2_6();
         let gen = OverworldChunkGenerator::new(314159);
         let mut found_cobble = false;
         let mut found_spawner = false;
+        let mut found_chest = false;
         // Check a larger area since dungeons are rare
         'outer: for cx in -5..=5 {
             for cz in -5..=5 {
@@ -3950,7 +4317,10 @@ mod tests {
                             if b == MOB_SPAWNER_ID {
                                 found_spawner = true;
                             }
-                            if found_cobble && found_spawner {
+                            if b == CHEST_ID {
+                                found_chest = true;
+                            }
+                            if found_cobble && found_spawner && found_chest {
                                 break 'outer;
                             }
                         }
@@ -3960,11 +4330,15 @@ mod tests {
         }
         assert!(
             found_cobble,
-            "no cobblestone found — dungeon stubs not placing walls"
+            "no cobblestone found — dungeon generation not placing walls"
         );
         assert!(
             found_spawner,
-            "no mob spawner found — dungeon stubs not placing spawners"
+            "no mob spawner found — dungeon generation not placing spawners"
+        );
+        assert!(
+            found_chest,
+            "no chest found — dungeon generation not placing chest blocks"
         );
     }
 

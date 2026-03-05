@@ -1,9 +1,11 @@
 use crate::inventory::{
-    inventory_layout, slot_gui_xy, ItemKey, ItemStack, PlayerInventoryState, PlayerSlot,
-    ARMOR_SLOT_COUNT, MAIN_SLOT_COUNT,
+    alpha_item_sprite_index, hit_test_slot_for_menu, inventory_layout, slot_gui_xy,
+    InventoryMenuKind, ItemKey, ItemStack, PlayerInventoryState, PlayerSlot, ARMOR_SLOT_COUNT,
+    MAIN_SLOT_COUNT, PLAYER_CRAFT_INPUT_SLOT_COUNT, TABLE_CRAFT_INPUT_SLOT_COUNT,
 };
 use crate::tool::ToolRegistry;
 use crate::world::BlockRegistry;
+use std::sync::OnceLock;
 
 /// HUD overlay rendered in screen pixels. Shaders convert positions to NDC.
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -47,12 +49,24 @@ pub const HUD_TEX_INVENTORY: f32 = 3.0;
 pub const HUD_TEX_FONT: f32 = 4.0;
 pub const HUD_TEX_WATER_OVERLAY: f32 = 5.0;
 pub const HUD_TEX_ITEMS: f32 = 6.0;
+pub const HUD_TEX_CRAFTING: f32 = 7.0;
 
 #[derive(Debug, Clone, Copy)]
 pub enum HudSlotItem {
     Empty,
-    Block { block_id: u8, count: u8 },
-    Tool { sprite_index: u16, durability_frac: f32, count: u8 },
+    Block {
+        block_id: u8,
+        count: u8,
+    },
+    Tool {
+        sprite_index: u16,
+        durability_frac: f32,
+        count: u8,
+    },
+    Item {
+        sprite_index: u16,
+        count: u8,
+    },
 }
 
 #[must_use]
@@ -67,7 +81,10 @@ pub fn hud_slot_item_from_stack(
         return HudSlotItem::Empty;
     }
     match stack.item {
-        ItemKey::Block(id) => HudSlotItem::Block { block_id: id, count: stack.count },
+        ItemKey::Block(id) => HudSlotItem::Block {
+            block_id: id,
+            count: stack.count,
+        },
         ItemKey::Tool(id) => {
             if let Some(def) = tool_registry.get(id) {
                 let frac = if def.max_damage > 0 {
@@ -84,6 +101,14 @@ pub fn hud_slot_item_from_stack(
                 HudSlotItem::Empty
             }
         }
+        ItemKey::Item(id) => {
+            alpha_item_sprite_index(id).map_or(HudSlotItem::Empty, |sprite_index| {
+                HudSlotItem::Item {
+                    sprite_index,
+                    count: stack.count,
+                }
+            })
+        }
     }
 }
 
@@ -91,6 +116,8 @@ const TEX_SIZE_PX: f32 = 256.0;
 const FONT_TEX_SIZE_PX: f32 = 128.0;
 const FONT_GLYPH_PX: f32 = 8.0;
 const FONT_ADVANCE_PX: f32 = 6.0;
+// Matches Minecraft Alpha TextRenderer.allowedChars ordering.
+const FONT_ALLOWED_CHARS: &str = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_'abcdefghijklmnopqrstuvwxyz{|}~\u{2302}\u{00c7}\u{00fc}\u{00e9}\u{00e2}\u{00e4}\u{00e0}\u{00e5}\u{00e7}\u{00ea}\u{00eb}\u{00e8}\u{00ef}\u{00ee}\u{00ec}\u{00c4}\u{00c5}\u{00c9}\u{00e6}\u{00c6}\u{00f4}\u{00f6}\u{00f2}\u{00fb}\u{00f9}\u{00ff}\u{00d6}\u{00dc}\u{00f8}\u{00a3}\u{00d8}\u{00d7}\u{0192}\u{00e1}\u{00ed}\u{00f3}\u{00fa}\u{00f1}\u{00d1}\u{00aa}\u{00ba}\u{00bf}\u{00ae}\u{00ac}\u{00bd}\u{00bc}\u{00a1}\u{00ab}\u{00bb}";
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 #[derive(Debug, Clone, Copy)]
@@ -204,11 +231,24 @@ pub fn build_hud_vertices(
                     }
                 }
             }
-            HudSlotItem::Tool { sprite_index, durability_frac, count } => {
+            HudSlotItem::Tool {
+                sprite_index,
+                durability_frac,
+                count,
+            } => {
                 push_tool_sprite_vertices(&mut verts, item_x, item_y, sprite_index, scale);
                 if durability_frac < 1.0 {
                     push_durability_bar(&mut verts, item_x, item_y, durability_frac, scale);
                 }
+                if count > 1 {
+                    push_stack_count_text(&mut verts, item_x, item_y, count, scale);
+                }
+            }
+            HudSlotItem::Item {
+                sprite_index,
+                count,
+            } => {
+                push_tool_sprite_vertices(&mut verts, item_x, item_y, sprite_index, scale);
                 if count > 1 {
                     push_stack_count_text(&mut verts, item_x, item_y, count, scale);
                 }
@@ -424,6 +464,7 @@ pub fn build_inventory_vertices(
     screen_w: f32,
     screen_h: f32,
     inventory: &PlayerInventoryState,
+    menu: InventoryMenuKind,
     mouse_screen_pos: [f32; 2],
     registry: &BlockRegistry,
     tool_registry: &ToolRegistry,
@@ -442,7 +483,14 @@ pub fn build_inventory_vertices(
         [0.06, 0.06, 0.06, 0.60],
     );
 
-    // Inventory panel background (inventory.png).
+    let panel_texture = match menu {
+        InventoryMenuKind::CraftingTable => HUD_TEX_CRAFTING,
+        InventoryMenuKind::Player
+        | InventoryMenuKind::ChestStub
+        | InventoryMenuKind::FurnaceStub => HUD_TEX_INVENTORY,
+    };
+
+    // Menu panel background (inventory.png / crafting.png).
     push_textured_quad_gui(
         &mut verts,
         layout.left,
@@ -453,30 +501,90 @@ pub fn build_inventory_vertices(
         0.0,
         176.0,
         166.0,
-        HUD_TEX_INVENTORY,
+        panel_texture,
         layout.scale,
         WHITE,
     );
+    push_menu_labels(&mut verts, layout.left, layout.top, layout.scale, menu);
 
-    let hovered = crate::inventory::hit_test_slot(
+    let hovered = hit_test_slot_for_menu(
         mouse_screen_pos[0],
         mouse_screen_pos[1],
         screen_w,
         screen_h,
+        menu,
     );
 
-    for i in 0..ARMOR_SLOT_COUNT {
-        let slot = PlayerSlot::Armor(i as u8);
-        render_inventory_slot_item(
-            &mut verts,
-            layout.left,
-            layout.top,
-            layout.scale,
-            inventory,
-            slot,
-            registry,
-            tool_registry,
-        );
+    match menu {
+        InventoryMenuKind::Player => {
+            for i in 0..ARMOR_SLOT_COUNT {
+                let slot = PlayerSlot::Armor(i as u8);
+                render_inventory_slot_item(
+                    &mut verts,
+                    layout.left,
+                    layout.top,
+                    layout.scale,
+                    inventory,
+                    menu,
+                    slot,
+                    registry,
+                    tool_registry,
+                );
+            }
+            for i in 0..PLAYER_CRAFT_INPUT_SLOT_COUNT {
+                let slot = PlayerSlot::PlayerCraftInput(i as u8);
+                render_inventory_slot_item(
+                    &mut verts,
+                    layout.left,
+                    layout.top,
+                    layout.scale,
+                    inventory,
+                    menu,
+                    slot,
+                    registry,
+                    tool_registry,
+                );
+            }
+            render_inventory_slot_item(
+                &mut verts,
+                layout.left,
+                layout.top,
+                layout.scale,
+                inventory,
+                menu,
+                PlayerSlot::PlayerCraftResult,
+                registry,
+                tool_registry,
+            );
+        }
+        InventoryMenuKind::CraftingTable => {
+            for i in 0..TABLE_CRAFT_INPUT_SLOT_COUNT {
+                let slot = PlayerSlot::CraftingTableInput(i as u8);
+                render_inventory_slot_item(
+                    &mut verts,
+                    layout.left,
+                    layout.top,
+                    layout.scale,
+                    inventory,
+                    menu,
+                    slot,
+                    registry,
+                    tool_registry,
+                );
+            }
+            render_inventory_slot_item(
+                &mut verts,
+                layout.left,
+                layout.top,
+                layout.scale,
+                inventory,
+                menu,
+                PlayerSlot::CraftingTableResult,
+                registry,
+                tool_registry,
+            );
+        }
+        InventoryMenuKind::ChestStub | InventoryMenuKind::FurnaceStub => {}
     }
     for i in 0..MAIN_SLOT_COUNT {
         let slot = PlayerSlot::Main(i as u8);
@@ -486,6 +594,7 @@ pub fn build_inventory_vertices(
             layout.top,
             layout.scale,
             inventory,
+            menu,
             slot,
             registry,
             tool_registry,
@@ -499,6 +608,7 @@ pub fn build_inventory_vertices(
             layout.top,
             layout.scale,
             inventory,
+            menu,
             slot,
             registry,
             tool_registry,
@@ -506,7 +616,7 @@ pub fn build_inventory_vertices(
     }
 
     if let Some(hovered_slot) = hovered {
-        let (sx, sy) = slot_gui_xy(hovered_slot);
+        let (sx, sy) = slot_gui_xy(menu, hovered_slot);
         push_colored_quad_gui(
             &mut verts,
             layout.left + sx - 1.0,
@@ -522,11 +632,51 @@ pub fn build_inventory_vertices(
         let item_x = mouse_screen_pos[0] / layout.scale - 8.0;
         let item_y = mouse_screen_pos[1] / layout.scale - 8.0;
         push_item_key_vertices(
-            &mut verts, item_x, item_y, cursor_stack, registry, tool_registry, layout.scale,
+            &mut verts,
+            item_x,
+            item_y,
+            cursor_stack,
+            registry,
+            tool_registry,
+            layout.scale,
         );
     }
 
     verts
+}
+
+fn push_menu_labels(
+    verts: &mut Vec<HudVertex>,
+    panel_left: f32,
+    panel_top: f32,
+    scale: f32,
+    menu: InventoryMenuKind,
+) {
+    // Alpha screens render labels with color 0x404040.
+    let label_color = [64.0 / 255.0, 64.0 / 255.0, 64.0 / 255.0, 1.0];
+    match menu {
+        InventoryMenuKind::CraftingTable => {
+            push_ascii_text(
+                verts,
+                "Crafting",
+                panel_left + 28.0,
+                panel_top + 6.0,
+                scale,
+                label_color,
+            );
+            push_ascii_text(
+                verts,
+                "Inventory",
+                panel_left + 8.0,
+                panel_top + 72.0,
+                scale,
+                label_color,
+            );
+        }
+        InventoryMenuKind::Player
+        | InventoryMenuKind::ChestStub
+        | InventoryMenuKind::FurnaceStub => {}
+    }
 }
 
 fn render_inventory_slot_item(
@@ -535,6 +685,7 @@ fn render_inventory_slot_item(
     panel_top: f32,
     scale: f32,
     inventory: &PlayerInventoryState,
+    menu: InventoryMenuKind,
     slot: PlayerSlot,
     registry: &BlockRegistry,
     tool_registry: &ToolRegistry,
@@ -551,11 +702,23 @@ fn render_inventory_slot_item(
             .get(usize::from(i))
             .copied()
             .flatten(),
+        PlayerSlot::PlayerCraftInput(i) => inventory
+            .player_craft_input_stacks()
+            .get(usize::from(i))
+            .copied()
+            .flatten(),
+        PlayerSlot::PlayerCraftResult => inventory.player_craft_result(),
+        PlayerSlot::CraftingTableInput(i) => inventory
+            .table_craft_input_stacks()
+            .get(usize::from(i))
+            .copied()
+            .flatten(),
+        PlayerSlot::CraftingTableResult => inventory.table_craft_result(),
     };
     let Some(stack) = stack else {
         return;
     };
-    let (sx, sy) = slot_gui_xy(slot);
+    let (sx, sy) = slot_gui_xy(menu, slot);
     push_item_key_vertices(
         verts,
         panel_left + sx,
@@ -575,7 +738,11 @@ fn push_stack_count_text(
     scale: f32,
 ) {
     let text = count.to_string();
-    let width = text.chars().count() as f32 * FONT_ADVANCE_PX;
+    let width: f32 = text
+        .chars()
+        .filter_map(map_alpha_font_glyph)
+        .map(alpha_font_advance_px)
+        .sum();
     let x = item_x + 17.0 - width;
     let y = item_y + 9.0;
     push_ascii_text(verts, &text, x + 1.0, y + 1.0, scale, [0.0, 0.0, 0.0, 1.0]);
@@ -590,17 +757,18 @@ fn push_ascii_text(
     scale: f32,
     color: [f32; 4],
 ) {
-    for (i, ch) in text.chars().enumerate() {
-        let code = ch as u32;
-        if code > 255 {
+    let mut pen_x = x;
+    for ch in text.chars() {
+        let glyph_code = map_alpha_font_glyph(ch);
+        let Some(glyph_code) = glyph_code else {
             continue;
-        }
-        let glyph = code as f32;
+        };
+        let glyph = glyph_code as f32;
         let u = (glyph % 16.0) * FONT_GLYPH_PX;
         let v = (glyph / 16.0).floor() * FONT_GLYPH_PX;
         push_textured_quad_gui(
             verts,
-            x + i as f32 * FONT_ADVANCE_PX,
+            pen_x,
             y,
             FONT_GLYPH_PX,
             FONT_GLYPH_PX,
@@ -612,7 +780,60 @@ fn push_ascii_text(
             scale,
             color,
         );
+        pen_x += alpha_font_advance_px(glyph_code);
     }
+}
+
+fn map_alpha_font_glyph(ch: char) -> Option<u8> {
+    let glyph = FONT_ALLOWED_CHARS.chars().position(|c| c == ch)?;
+    Some((glyph as u8).saturating_add(32))
+}
+
+fn alpha_font_advance_px(glyph_code: u8) -> f32 {
+    alpha_font_character_widths()[usize::from(glyph_code)]
+}
+
+fn alpha_font_character_widths() -> &'static [f32; 256] {
+    static FONT_WIDTHS: OnceLock<[f32; 256]> = OnceLock::new();
+    FONT_WIDTHS.get_or_init(|| {
+        let mut widths = [FONT_ADVANCE_PX; 256];
+        let Ok(img) = image::load_from_memory(include_bytes!(
+            "../../resources/minecraft-a1.2.6-client/font/default.png"
+        )) else {
+            return widths;
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w < 128 || h < 128 {
+            return widths;
+        }
+
+        for k in 0..256usize {
+            let l = k % 16;
+            let n = k / 16;
+            let mut q = 7i32;
+            while q >= 0 {
+                let t = l * 8 + q as usize;
+                let mut empty_column = true;
+                for x in 0..8usize {
+                    let px = rgba.get_pixel(t as u32, (n * 8 + x) as u32);
+                    if px[2] > 0 {
+                        empty_column = false;
+                        break;
+                    }
+                }
+                if !empty_column {
+                    break;
+                }
+                q -= 1;
+            }
+            if k == 32 {
+                q = 2;
+            }
+            widths[k] = (q + 2) as f32;
+        }
+        widths
+    })
 }
 
 fn push_hotbar_item_vertices(
@@ -672,6 +893,11 @@ fn push_item_key_vertices(
                 }
             }
         }
+        ItemKey::Item(item_id) => {
+            if let Some(sprite_index) = alpha_item_sprite_index(item_id) {
+                push_tool_sprite_vertices(verts, x, y, sprite_index, scale);
+            }
+        }
     }
     if stack.count > 1 {
         push_stack_count_text(verts, x, y, stack.count, scale);
@@ -690,7 +916,18 @@ fn push_tool_sprite_vertices(
     let u = col as f32 * 16.0;
     let v = row as f32 * 16.0;
     push_textured_quad_gui(
-        verts, x, y, 16.0, 16.0, u, v, 16.0, 16.0, HUD_TEX_ITEMS, scale, WHITE,
+        verts,
+        x,
+        y,
+        16.0,
+        16.0,
+        u,
+        v,
+        16.0,
+        16.0,
+        HUD_TEX_ITEMS,
+        scale,
+        WHITE,
     );
 }
 
@@ -1015,7 +1252,10 @@ mod tests {
         let registry = BlockRegistry::alpha_1_2_6();
         let block_ids = [3_u8, 1, 4, 12, 13, 17, 5, 9, 50];
         let slot_items: [HudSlotItem; HOTBAR_SLOT_COUNT] =
-            std::array::from_fn(|i| HudSlotItem::Block { block_id: block_ids[i], count: 64 });
+            std::array::from_fn(|i| HudSlotItem::Block {
+                block_id: block_ids[i],
+                count: 64,
+            });
         let state = HudState {
             selected_slot: 0,
             slot_items,

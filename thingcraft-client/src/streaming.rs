@@ -1377,7 +1377,8 @@ impl ChunkStreamer {
         }
         if evicted {
             self.mesh_dirty = true;
-            self.render_updates.push(RenderMeshUpdate::RemoveChunk { pos });
+            self.render_updates
+                .push(RenderMeshUpdate::RemoveChunk { pos });
             self.mark_neighbors_for_remesh(pos);
         }
     }
@@ -4519,7 +4520,3 @@ mod tests {
         );
     }
 }
-
-
-
-
