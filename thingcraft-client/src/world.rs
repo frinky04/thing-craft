@@ -1345,7 +1345,10 @@ impl OverworldChunkGenerator {
             x: min_x - 1,
             z: min_z - 1,
         };
-        let source_max = ChunkPos { x: max_x, z: max_z };
+        let source_max = ChunkPos {
+            x: max_x + 1,
+            z: max_z + 1,
+        };
         populate_source_chunks_world_space(
             &mut chunks,
             self.seed,
@@ -5241,6 +5244,37 @@ mod tests {
                         chunk_a.block(x, y, z),
                         chunk_b.block(x, y, z),
                         "decoration non-determinism at ({x}, {y}, {z})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn radius_zero_matches_embedded_radius_one_for_center_chunk() {
+        let registry = BlockRegistry::alpha_1_2_6();
+        let generator = OverworldChunkGenerator::new(0xA126_0001);
+        let center = ChunkPos { x: 3, z: -2 };
+
+        let single = generator.generate_chunk(center, &registry);
+        let larger = generator.generate_region(center, 1, &registry);
+        let embedded = larger
+            .into_iter()
+            .find(|chunk| chunk.pos == center)
+            .expect("center chunk missing from radius=1 region");
+
+        for x in 0..CHUNK_WIDTH as u8 {
+            for z in 0..CHUNK_DEPTH as u8 {
+                assert_eq!(
+                    single.height_at(x, z),
+                    embedded.height_at(x, z),
+                    "height mismatch at ({x}, {z})"
+                );
+                for y in 0..CHUNK_HEIGHT as u8 {
+                    assert_eq!(
+                        single.block(x, y, z),
+                        embedded.block(x, y, z),
+                        "block mismatch at ({x}, {y}, {z})"
                     );
                 }
             }
