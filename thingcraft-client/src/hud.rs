@@ -1,7 +1,8 @@
 use crate::inventory::{
-    inventory_layout, slot_gui_xy, ItemKey, PlayerInventoryState, PlayerSlot, ARMOR_SLOT_COUNT,
-    MAIN_SLOT_COUNT,
+    inventory_layout, slot_gui_xy, ItemKey, ItemStack, PlayerInventoryState, PlayerSlot,
+    ARMOR_SLOT_COUNT, MAIN_SLOT_COUNT,
 };
+use crate::tool::ToolRegistry;
 use crate::world::BlockRegistry;
 
 /// HUD overlay rendered in screen pixels. Shaders convert positions to NDC.
@@ -45,6 +46,46 @@ const HUD_TEX_TERRAIN: f32 = 2.0;
 pub const HUD_TEX_INVENTORY: f32 = 3.0;
 pub const HUD_TEX_FONT: f32 = 4.0;
 pub const HUD_TEX_WATER_OVERLAY: f32 = 5.0;
+pub const HUD_TEX_ITEMS: f32 = 6.0;
+
+#[derive(Debug, Clone, Copy)]
+pub enum HudSlotItem {
+    Empty,
+    Block { block_id: u8, count: u8 },
+    Tool { sprite_index: u16, durability_frac: f32, count: u8 },
+}
+
+#[must_use]
+pub fn hud_slot_item_from_stack(
+    stack: Option<ItemStack>,
+    tool_registry: &ToolRegistry,
+) -> HudSlotItem {
+    let Some(stack) = stack else {
+        return HudSlotItem::Empty;
+    };
+    if stack.count == 0 {
+        return HudSlotItem::Empty;
+    }
+    match stack.item {
+        ItemKey::Block(id) => HudSlotItem::Block { block_id: id, count: stack.count },
+        ItemKey::Tool(id) => {
+            if let Some(def) = tool_registry.get(id) {
+                let frac = if def.max_damage > 0 {
+                    1.0 - (stack.metadata as f32 / def.max_damage as f32)
+                } else {
+                    1.0
+                };
+                HudSlotItem::Tool {
+                    sprite_index: def.sprite_index,
+                    durability_frac: frac.clamp(0.0, 1.0),
+                    count: stack.count,
+                }
+            } else {
+                HudSlotItem::Empty
+            }
+        }
+    }
+}
 
 const TEX_SIZE_PX: f32 = 256.0;
 const FONT_TEX_SIZE_PX: f32 = 128.0;
@@ -55,8 +96,7 @@ const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 #[derive(Debug, Clone, Copy)]
 pub struct HudState {
     pub selected_slot: usize,
-    pub slot_counts: [u8; HOTBAR_SLOT_COUNT],
-    pub slot_block_ids: [u8; HOTBAR_SLOT_COUNT],
+    pub slot_items: [HudSlotItem; HOTBAR_SLOT_COUNT],
     pub health: i32,
     pub prev_health: i32,
     pub invulnerable_timer: i32,
@@ -148,20 +188,31 @@ pub fn build_hud_vertices(
     );
 
     // Hotbar items (Alpha-like item rendering path: 3D mini block for solid cubes,
-    // flat sprite for cutout/liquid/non-solid blocks).
+    // flat sprite for cutout/liquid/non-solid blocks, tool sprites from items.png).
     for slot in 0..HOTBAR_SLOT_COUNT {
-        if state.slot_counts[slot] == 0 {
-            continue;
-        }
-        let block_id = state.slot_block_ids[slot];
-        if !registry.is_defined_block(block_id) {
-            continue;
-        }
         let item_x = center_x - 90.0 + slot as f32 * 20.0 + 2.0;
         let item_y = gui_h - 16.0 - 3.0;
-        push_hotbar_item_vertices(&mut verts, item_x, item_y, block_id, registry, scale);
-        if state.slot_counts[slot] > 1 {
-            push_stack_count_text(&mut verts, item_x, item_y, state.slot_counts[slot], scale);
+        match state.slot_items[slot] {
+            HudSlotItem::Empty => {}
+            HudSlotItem::Block { block_id, count } => {
+                if registry.is_defined_block(block_id) {
+                    push_hotbar_item_vertices(
+                        &mut verts, item_x, item_y, block_id, registry, scale,
+                    );
+                    if count > 1 {
+                        push_stack_count_text(&mut verts, item_x, item_y, count, scale);
+                    }
+                }
+            }
+            HudSlotItem::Tool { sprite_index, durability_frac, count } => {
+                push_tool_sprite_vertices(&mut verts, item_x, item_y, sprite_index, scale);
+                if durability_frac < 1.0 {
+                    push_durability_bar(&mut verts, item_x, item_y, durability_frac, scale);
+                }
+                if count > 1 {
+                    push_stack_count_text(&mut verts, item_x, item_y, count, scale);
+                }
+            }
         }
     }
 
@@ -375,6 +426,7 @@ pub fn build_inventory_vertices(
     inventory: &PlayerInventoryState,
     mouse_screen_pos: [f32; 2],
     registry: &BlockRegistry,
+    tool_registry: &ToolRegistry,
 ) -> Vec<HudVertex> {
     let mut verts = Vec::with_capacity(1024);
     let layout = inventory_layout(screen_w, screen_h);
@@ -423,6 +475,7 @@ pub fn build_inventory_vertices(
             inventory,
             slot,
             registry,
+            tool_registry,
         );
     }
     for i in 0..MAIN_SLOT_COUNT {
@@ -435,6 +488,7 @@ pub fn build_inventory_vertices(
             inventory,
             slot,
             registry,
+            tool_registry,
         );
     }
     for i in 0..HOTBAR_SLOT_COUNT {
@@ -447,6 +501,7 @@ pub fn build_inventory_vertices(
             inventory,
             slot,
             registry,
+            tool_registry,
         );
     }
 
@@ -466,11 +521,9 @@ pub fn build_inventory_vertices(
     if let Some(cursor_stack) = inventory.cursor {
         let item_x = mouse_screen_pos[0] / layout.scale - 8.0;
         let item_y = mouse_screen_pos[1] / layout.scale - 8.0;
-        let ItemKey::Block(block_id) = cursor_stack.item;
-        push_hotbar_item_vertices(&mut verts, item_x, item_y, block_id, registry, layout.scale);
-        if cursor_stack.count > 1 {
-            push_stack_count_text(&mut verts, item_x, item_y, cursor_stack.count, layout.scale);
-        }
+        push_item_key_vertices(
+            &mut verts, item_x, item_y, cursor_stack, registry, tool_registry, layout.scale,
+        );
     }
 
     verts
@@ -484,6 +537,7 @@ fn render_inventory_slot_item(
     inventory: &PlayerInventoryState,
     slot: PlayerSlot,
     registry: &BlockRegistry,
+    tool_registry: &ToolRegistry,
 ) {
     let stack = match slot {
         PlayerSlot::Hotbar(i) => inventory.hotbar_stack(usize::from(i)),
@@ -502,18 +556,15 @@ fn render_inventory_slot_item(
         return;
     };
     let (sx, sy) = slot_gui_xy(slot);
-    let ItemKey::Block(block_id) = stack.item;
-    push_hotbar_item_vertices(
+    push_item_key_vertices(
         verts,
         panel_left + sx,
         panel_top + sy,
-        block_id,
+        stack,
         registry,
+        tool_registry,
         scale,
     );
-    if stack.count > 1 {
-        push_stack_count_text(verts, panel_left + sx, panel_top + sy, stack.count, scale);
-    }
 }
 
 fn push_stack_count_text(
@@ -596,6 +647,71 @@ fn push_hotbar_item_vertices(
             WHITE,
         );
     }
+}
+
+fn push_item_key_vertices(
+    verts: &mut Vec<HudVertex>,
+    x: f32,
+    y: f32,
+    stack: ItemStack,
+    registry: &BlockRegistry,
+    tool_registry: &ToolRegistry,
+    scale: f32,
+) {
+    match stack.item {
+        ItemKey::Block(block_id) => {
+            push_hotbar_item_vertices(verts, x, y, block_id, registry, scale);
+        }
+        ItemKey::Tool(tool_id) => {
+            if let Some(def) = tool_registry.get(tool_id) {
+                push_tool_sprite_vertices(verts, x, y, def.sprite_index, scale);
+                if stack.metadata > 0 {
+                    let durability_frac =
+                        1.0 - (stack.metadata as f32 / def.max_damage as f32).clamp(0.0, 1.0);
+                    push_durability_bar(verts, x, y, durability_frac, scale);
+                }
+            }
+        }
+    }
+    if stack.count > 1 {
+        push_stack_count_text(verts, x, y, stack.count, scale);
+    }
+}
+
+fn push_tool_sprite_vertices(
+    verts: &mut Vec<HudVertex>,
+    x: f32,
+    y: f32,
+    sprite_index: u16,
+    scale: f32,
+) {
+    let col = sprite_index % 16;
+    let row = sprite_index / 16;
+    let u = col as f32 * 16.0;
+    let v = row as f32 * 16.0;
+    push_textured_quad_gui(
+        verts, x, y, 16.0, 16.0, u, v, 16.0, 16.0, HUD_TEX_ITEMS, scale, WHITE,
+    );
+}
+
+fn push_durability_bar(
+    verts: &mut Vec<HudVertex>,
+    item_x: f32,
+    item_y: f32,
+    durability_frac: f32,
+    scale: f32,
+) {
+    let bar_w = 13.0_f32;
+    let bar_h = 2.0_f32;
+    let bx = item_x + 2.0;
+    let by = item_y + 13.0;
+    // Black background.
+    push_colored_quad_gui(verts, bx, by, bar_w, bar_h, scale, [0.0, 0.0, 0.0, 1.0]);
+    // Colored fill: green (1.0) -> red (0.0).
+    let fill_w = (durability_frac * bar_w).round().max(1.0);
+    let r = (1.0 - durability_frac).clamp(0.0, 1.0);
+    let g = durability_frac.clamp(0.0, 1.0);
+    push_colored_quad_gui(verts, bx, by, fill_w, 1.0, scale, [r, g, 0.0, 1.0]);
 }
 
 fn push_alpha_item3d_block(
@@ -897,10 +1013,12 @@ mod tests {
     #[test]
     fn hud_emits_geometry_for_core_layers() {
         let registry = BlockRegistry::alpha_1_2_6();
+        let block_ids = [3_u8, 1, 4, 12, 13, 17, 5, 9, 50];
+        let slot_items: [HudSlotItem; HOTBAR_SLOT_COUNT] =
+            std::array::from_fn(|i| HudSlotItem::Block { block_id: block_ids[i], count: 64 });
         let state = HudState {
             selected_slot: 0,
-            slot_counts: [64; HOTBAR_SLOT_COUNT],
-            slot_block_ids: [3, 1, 4, 12, 13, 17, 5, 9, 50],
+            slot_items,
             health: 20,
             prev_health: 20,
             invulnerable_timer: 0,
@@ -933,8 +1051,7 @@ mod tests {
         let registry = BlockRegistry::alpha_1_2_6();
         let state = HudState {
             selected_slot: 0,
-            slot_counts: [0; HOTBAR_SLOT_COUNT],
-            slot_block_ids: [0; HOTBAR_SLOT_COUNT],
+            slot_items: [HudSlotItem::Empty; HOTBAR_SLOT_COUNT],
             health: 20,
             prev_health: 20,
             invulnerable_timer: 0,

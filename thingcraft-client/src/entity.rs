@@ -65,10 +65,7 @@ const SPRITE_HALF_SIZE: f32 = 0.125;
 /// Marker: this entity is a dropped item.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct DroppedItem {
-    pub block_id: u8,
-    /// Stack count (reserved for future item stacking/merging).
-    #[allow(dead_code)]
-    pub count: u8,
+    pub stack: crate::inventory::ItemStack,
 }
 
 /// Physics body for non-player entities (simpler than player PhysicsBody).
@@ -111,7 +108,7 @@ pub struct EntityRenderPos {
 /// Short-lived visual pickup effect that lerps item render to the player.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct EntityPickupFx {
-    pub block_id: u8,
+    pub item: crate::inventory::ItemKey,
     pub start_pos: DVec3,
     pub start_age_ticks: u32,
     pub bob_offset: f32,
@@ -124,15 +121,24 @@ pub struct EntityPickupFx {
 // Spawn
 // ---------------------------------------------------------------------------
 
-/// Spawn a dropped item entity at `position` with Alpha-faithful initial velocity.
+/// Spawn a dropped block item entity at `position` with Alpha-faithful initial velocity.
 pub fn spawn_dropped_item(world: &mut World, block_id: u8, position: DVec3) {
+    spawn_dropped_item_stack(world, crate::inventory::ItemStack::block(block_id, 1), position);
+}
+
+/// Spawn a dropped item entity (full ItemStack) with Alpha-faithful initial velocity.
+pub fn spawn_dropped_item_stack(
+    world: &mut World,
+    stack: crate::inventory::ItemStack,
+    position: DVec3,
+) {
     let mut rng = entity_rng();
     let vx = rng.gen_range(-ITEM_SPAWN_VH_RANGE..ITEM_SPAWN_VH_RANGE);
     let vz = rng.gen_range(-ITEM_SPAWN_VH_RANGE..ITEM_SPAWN_VH_RANGE);
     let bob = rng.gen_range(0.0..TAU) as f32;
     spawn_dropped_item_with(
         world,
-        block_id,
+        stack,
         position,
         DVec3::new(vx, ITEM_SPAWN_VY, vz),
         ITEM_PICKUP_DELAY_TICKS,
@@ -144,14 +150,27 @@ pub fn spawn_dropped_item(world: &mut World, block_id: u8, position: DVec3) {
 /// 40-tick pickup delay and a forward throw impulse from yaw/pitch.
 pub fn spawn_player_dropped_item(
     world: &mut World,
-    block_id: u8,
+    item: crate::inventory::ItemKey,
+    position: DVec3,
+    yaw_radians: f64,
+    pitch_radians: f64,
+) {
+    let stack = match item {
+        crate::inventory::ItemKey::Block(id) => crate::inventory::ItemStack::block(id, 1),
+        crate::inventory::ItemKey::Tool(id) => crate::inventory::ItemStack::tool(id),
+    };
+    spawn_player_dropped_item_stack(world, stack, position, yaw_radians, pitch_radians);
+}
+
+/// Spawn a player-dropped item (full ItemStack) with throw impulse from yaw/pitch.
+pub fn spawn_player_dropped_item_stack(
+    world: &mut World,
+    stack: crate::inventory::ItemStack,
     position: DVec3,
     yaw_radians: f64,
     pitch_radians: f64,
 ) {
     let mut rng = entity_rng();
-    // ThingCraft forward convention matches `direction_from_angles` in app.rs:
-    // x = sin(yaw) * cos(pitch), z = cos(yaw) * cos(pitch).
     let mut vx = yaw_radians.sin() * pitch_radians.cos() * ITEM_PLAYER_DROP_THROW_SPEED;
     let mut vz = yaw_radians.cos() * pitch_radians.cos() * ITEM_PLAYER_DROP_THROW_SPEED;
     let mut vy = pitch_radians.sin() * ITEM_PLAYER_DROP_THROW_SPEED + ITEM_PLAYER_DROP_Y_BIAS;
@@ -165,7 +184,7 @@ pub fn spawn_player_dropped_item(
 
     spawn_dropped_item_with(
         world,
-        block_id,
+        stack,
         position,
         DVec3::new(vx, vy, vz),
         ITEM_PLAYER_DROP_PICKUP_DELAY_TICKS,
@@ -175,14 +194,14 @@ pub fn spawn_player_dropped_item(
 
 fn spawn_dropped_item_with(
     world: &mut World,
-    block_id: u8,
+    stack: crate::inventory::ItemStack,
     position: DVec3,
     velocity: DVec3,
     pickup_delay_ticks: u32,
     bob_offset: f32,
 ) {
     world.spawn((
-        DroppedItem { block_id, count: 1 },
+        DroppedItem { stack },
         Transform64::new(position),
         EntityPhysics {
             width: ITEM_WIDTH,
@@ -464,111 +483,113 @@ pub fn tick_entity_physics(
 // ---------------------------------------------------------------------------
 
 /// Check AABB overlap between player and dropped items. Returns true if any pickup happened.
-pub fn check_item_pickup(world: &mut World, inventory: &mut PlayerInventoryState) -> bool {
-    // Read player position + physics.
-    let mut player_query =
-        world.query_filtered::<(&Transform64, &PhysicsBody, Option<&PlayerVitals>), With<Player>>();
-    let Some((player_t, player_p, player_vitals)) =
-        player_query.iter(world).next().map(|(t, p, v)| (*t, *p, v.copied()))
-    else {
-        return false;
-    };
-    if player_vitals.is_some_and(|v| v.health <= 0) {
-        return false;
-    }
+pub fn check_item_pickup(world: &mut World) -> bool {
+    world.resource_scope(|world, mut inventory: Mut<'_, PlayerInventoryState>| {
+        // Read player position + physics.
+        let mut player_query =
+            world.query_filtered::<(&Transform64, &PhysicsBody, Option<&PlayerVitals>), With<Player>>();
+        let Some((player_t, player_p, player_vitals)) =
+            player_query.iter(world).next().map(|(t, p, v)| (*t, *p, v.copied()))
+        else {
+            return false;
+        };
+        if player_vitals.is_some_and(|v| v.health <= 0) {
+            return false;
+        }
 
-    let p_half_w = player_p.width / 2.0;
-    let p_min = DVec3::new(
-        player_t.position.x - p_half_w,
-        player_t.position.y,
-        player_t.position.z - p_half_w,
-    );
-    let p_max = DVec3::new(
-        player_t.position.x + p_half_w,
-        player_t.position.y + player_p.height,
-        player_t.position.z + p_half_w,
-    );
-
-    let expanded_min = DVec3::new(
-        p_min.x - ITEM_PICKUP_RANGE_XZ,
-        p_min.y,
-        p_min.z - ITEM_PICKUP_RANGE_XZ,
-    );
-    let expanded_max = DVec3::new(
-        p_max.x + ITEM_PICKUP_RANGE_XZ,
-        p_max.y,
-        p_max.z + ITEM_PICKUP_RANGE_XZ,
-    );
-    // Collect pickup candidates.
-    let mut to_despawn: Vec<Entity> = Vec::new();
-    let mut to_spawn_fx: Vec<EntityPickupFx> = Vec::new();
-    let mut any_pickup = false;
-
-    let mut item_query = world.query::<(
-        Entity,
-        &DroppedItem,
-        &Transform64,
-        &PickupDelay,
-        &EntityPhysics,
-    )>();
-    let candidates: Vec<(Entity, u8, DVec3, f64, f64, u32, f32)> = item_query
-        .iter(world)
-        .filter(|(_, _, _, delay, _)| delay.ticks_remaining == 0)
-        .filter_map(|(e, item, t, _, phys)| {
-            let age = world.get::<EntityAge>(e)?;
-            let bob = world.get::<BobOffset>(e)?;
-            Some((
-                e,
-                item.block_id,
-                t.position,
-                phys.width,
-                phys.height,
-                age.age_ticks,
-                bob.0,
-            ))
-        })
-        .collect();
-
-    for (entity, block_id, item_pos, item_w, item_h, age_ticks, bob_offset) in candidates {
-        let i_half_w = item_w / 2.0;
-        let i_min = DVec3::new(item_pos.x - i_half_w, item_pos.y, item_pos.z - i_half_w);
-        let i_max = DVec3::new(
-            item_pos.x + i_half_w,
-            item_pos.y + item_h,
-            item_pos.z + i_half_w,
+        let p_half_w = player_p.width / 2.0;
+        let p_min = DVec3::new(
+            player_t.position.x - p_half_w,
+            player_t.position.y,
+            player_t.position.z - p_half_w,
+        );
+        let p_max = DVec3::new(
+            player_t.position.x + p_half_w,
+            player_t.position.y + player_p.height,
+            player_t.position.z + p_half_w,
         );
 
-        let inside_pickup_range = expanded_min.x < i_max.x
-            && expanded_max.x > i_min.x
-            && expanded_min.y < i_max.y
-            && expanded_max.y > i_min.y
-            && expanded_min.z < i_max.z
-            && expanded_max.z > i_min.z;
-        if !inside_pickup_range {
-            continue;
-        }
-        if inventory.try_add_block_pickup(block_id) {
-            to_despawn.push(entity);
-            to_spawn_fx.push(EntityPickupFx {
-                block_id,
-                start_pos: item_pos,
-                start_age_ticks: age_ticks,
-                bob_offset,
-                age_ticks: 0,
-                lifetime_ticks: ITEM_PICKUP_FX_LIFETIME_TICKS,
-                offset_y: player_p.eye_height as f32 + ITEM_PICKUP_FX_OFFSET_Y,
-            });
-            any_pickup = true;
-        }
-    }
+        let expanded_min = DVec3::new(
+            p_min.x - ITEM_PICKUP_RANGE_XZ,
+            p_min.y,
+            p_min.z - ITEM_PICKUP_RANGE_XZ,
+        );
+        let expanded_max = DVec3::new(
+            p_max.x + ITEM_PICKUP_RANGE_XZ,
+            p_max.y,
+            p_max.z + ITEM_PICKUP_RANGE_XZ,
+        );
+        // Collect pickup candidates.
+        let mut to_despawn: Vec<Entity> = Vec::new();
+        let mut to_spawn_fx: Vec<EntityPickupFx> = Vec::new();
+        let mut any_pickup = false;
 
-    for entity in to_despawn {
-        world.despawn(entity);
-    }
-    for fx in to_spawn_fx {
-        world.spawn(fx);
-    }
-    any_pickup
+        let mut item_query = world.query::<(
+            Entity,
+            &DroppedItem,
+            &Transform64,
+            &PickupDelay,
+            &EntityPhysics,
+        )>();
+        let candidates: Vec<(Entity, crate::inventory::ItemStack, DVec3, f64, f64, u32, f32)> = item_query
+            .iter(world)
+            .filter(|(_, _, _, delay, _)| delay.ticks_remaining == 0)
+            .filter_map(|(e, item, t, _, phys)| {
+                let age = world.get::<EntityAge>(e)?;
+                let bob = world.get::<BobOffset>(e)?;
+                Some((
+                    e,
+                    item.stack,
+                    t.position,
+                    phys.width,
+                    phys.height,
+                    age.age_ticks,
+                    bob.0,
+                ))
+            })
+            .collect();
+
+        for (entity, item_stack, item_pos, item_w, item_h, age_ticks, bob_offset) in candidates {
+            let i_half_w = item_w / 2.0;
+            let i_min = DVec3::new(item_pos.x - i_half_w, item_pos.y, item_pos.z - i_half_w);
+            let i_max = DVec3::new(
+                item_pos.x + i_half_w,
+                item_pos.y + item_h,
+                item_pos.z + i_half_w,
+            );
+
+            let inside_pickup_range = expanded_min.x < i_max.x
+                && expanded_max.x > i_min.x
+                && expanded_min.y < i_max.y
+                && expanded_max.y > i_min.y
+                && expanded_min.z < i_max.z
+                && expanded_max.z > i_min.z;
+            if !inside_pickup_range {
+                continue;
+            }
+            if inventory.try_add_stack(item_stack) {
+                to_despawn.push(entity);
+                to_spawn_fx.push(EntityPickupFx {
+                    item: item_stack.item,
+                    start_pos: item_pos,
+                    start_age_ticks: age_ticks,
+                    bob_offset,
+                    age_ticks: 0,
+                    lifetime_ticks: ITEM_PICKUP_FX_LIFETIME_TICKS,
+                    offset_y: player_p.eye_height as f32 + ITEM_PICKUP_FX_OFFSET_Y,
+                });
+                any_pickup = true;
+            }
+        }
+
+        for entity in to_despawn {
+            world.despawn(entity);
+        }
+        for fx in to_spawn_fx {
+            world.spawn(fx);
+        }
+        any_pickup
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -683,21 +704,32 @@ struct CubeFace {
     shade: f32,
 }
 
-/// Build a batched `ChunkMesh` for all dropped item entities.
+/// Two batched meshes: one for terrain-atlas entities (blocks) and one for
+/// items-atlas entities (tools). Each mesh uses a different texture binding.
+pub struct EntitySpriteMeshes {
+    pub terrain: ChunkMesh,
+    pub items: ChunkMesh,
+}
+
+/// Build batched `ChunkMesh`es for all dropped item entities.
 ///
 /// Solid blocks render as 3D mini-cubes (Alpha `renderAsItem` with 0.25 scale)
 /// rotated around Y by age. Non-solid items render as camera-facing billboard
-/// sprites. Lighting is sampled from the world at each entity's position.
+/// sprites. Tools render as billboard sprites using items.png atlas.
+/// Lighting is sampled from the world at each entity's position.
 pub fn build_entity_sprite_mesh(
     world: &mut World,
     camera_yaw: f32,
     registry: &BlockRegistry,
+    tool_registry: &crate::tool::ToolRegistry,
     chunk_streamer: &ChunkStreamer,
     ambient_darkness: u8,
     render_alpha: f32,
-) -> ChunkMesh {
+) -> EntitySpriteMeshes {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let mut items_vertices = Vec::new();
+    let mut items_indices = Vec::new();
     let player_interp_pos = world
         .query_filtered::<&Transform64, With<Player>>()
         .iter(world)
@@ -731,97 +763,117 @@ pub fn build_entity_sprite_mesh(
 
         let tint = [255_u8, 255, 255, 255];
 
-        if registry.is_solid(item.block_id) {
-            // 3D mini-block: Alpha rotates by (age + partial) / 20 * 57.2958 degrees.
-            let spin_rad = (age_f / 20.0 + bob.0) * (std::f32::consts::PI / 180.0) * 57.295_78;
-            let cos_r = spin_rad.cos();
-            let sin_r = spin_rad.sin();
+        // Determine block_id for rendering (tools render as billboard placeholder).
+        let block_id_opt = match item.stack.item {
+            crate::inventory::ItemKey::Block(id) => Some(id),
+            crate::inventory::ItemKey::Tool(_) => None,
+        };
 
-            for face in &CUBE_FACES {
-                let sprite = registry.sprite_index_for_face(item.block_id, face.face_offset);
-                let u0 = (sprite % 16) as f32 * ATLAS_TILE_UV;
-                let v0 = (sprite / 16) as f32 * ATLAS_TILE_UV;
-                let u1 = u0 + ATLAS_TILE_UV;
-                let v1 = v0 + ATLAS_TILE_UV;
+        if let Some(block_id) = block_id_opt {
+            if registry.is_solid(block_id) {
+                // 3D mini-block: Alpha rotates by (age + partial) / 20 * 57.2958 degrees.
+                let spin_rad =
+                    (age_f / 20.0 + bob.0) * (std::f32::consts::PI / 180.0) * 57.295_78;
+                let cos_r = spin_rad.cos();
+                let sin_r = spin_rad.sin();
 
-                let face_shade = (face.shade * 255.0) as u8;
-                let light = [light_sky, light_block, face_shade, 0];
+                for face in &CUBE_FACES {
+                    let sprite = registry.sprite_index_for_face(block_id, face.face_offset);
+                    let u0 = (sprite % 16) as f32 * ATLAS_TILE_UV;
+                    let v0 = (sprite / 16) as f32 * ATLAS_TILE_UV;
+                    let u1 = u0 + ATLAS_TILE_UV;
+                    let v1 = v0 + ATLAS_TILE_UV;
 
-                let base = vertices.len() as u32;
-                let uvs = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
+                    let face_shade = (face.shade * 255.0) as u8;
+                    let light = [light_sky, light_block, face_shade, 0];
 
-                for (i, vert) in face.verts.iter().enumerate() {
-                    // Scale then shift so bottom face sits at Y=0 (Alpha does
-                    // glTranslate(-0.5,-0.5,-0.5) then glScale(0.25) so the
-                    // cube occupies 0..0.25 in Y, not -0.125..+0.125).
-                    let sx = vert[0] * BLOCK_ITEM_SCALE;
-                    let sy = (vert[1] + 0.5) * BLOCK_ITEM_SCALE;
-                    let sz = vert[2] * BLOCK_ITEM_SCALE;
-                    let rx = sx * cos_r + sz * sin_r;
-                    let rz = -sx * sin_r + sz * cos_r;
+                    let base = vertices.len() as u32;
+                    let uvs = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
 
-                    vertices.push(MeshVertex {
-                        position: [cx + rx, cy + sy, cz + rz],
-                        uv: uvs[i],
-                        tint_rgba: tint,
-                        light_data: light,
-                    });
+                    for (i, vert) in face.verts.iter().enumerate() {
+                        let sx = vert[0] * BLOCK_ITEM_SCALE;
+                        let sy = (vert[1] + 0.5) * BLOCK_ITEM_SCALE;
+                        let sz = vert[2] * BLOCK_ITEM_SCALE;
+                        let rx = sx * cos_r + sz * sin_r;
+                        let rz = -sx * sin_r + sz * cos_r;
+
+                        vertices.push(MeshVertex {
+                            position: [cx + rx, cy + sy, cz + rz],
+                            uv: uvs[i],
+                            tint_rgba: tint,
+                            light_data: light,
+                        });
+                    }
+
+                    indices.push(base);
+                    indices.push(base + 1);
+                    indices.push(base + 2);
+                    indices.push(base);
+                    indices.push(base + 2);
+                    indices.push(base + 3);
                 }
-
-                indices.push(base);
-                indices.push(base + 1);
-                indices.push(base + 2);
-                indices.push(base);
-                indices.push(base + 2);
-                indices.push(base + 3);
+                continue;
             }
-        } else {
-            // Billboard sprite for non-solid items (torches, flowers, etc.).
+        }
+
+        {
+            // Billboard sprite for non-solid blocks and tools.
             let right_x = -camera_yaw.cos() * SPRITE_HALF_SIZE;
             let right_z = camera_yaw.sin() * SPRITE_HALF_SIZE;
 
-            let sprite_index = registry.sprite_index_of(item.block_id);
+            // Tools use items.png atlas; blocks use terrain.png atlas.
+            let (sprite_index, verts, idxs) = match item.stack.item {
+                crate::inventory::ItemKey::Block(id) => {
+                    (registry.sprite_index_of(id), &mut vertices, &mut indices)
+                }
+                crate::inventory::ItemKey::Tool(tool_id) => {
+                    let si = tool_registry
+                        .get(tool_id)
+                        .map_or(0, |def| def.sprite_index);
+                    (si, &mut items_vertices, &mut items_indices)
+                }
+            };
             let u0 = (sprite_index % 16) as f32 * ATLAS_TILE_UV;
             let v0 = (sprite_index / 16) as f32 * ATLAS_TILE_UV;
             let u1 = u0 + ATLAS_TILE_UV;
             let v1 = v0 + ATLAS_TILE_UV;
 
             let light = [light_sky, light_block, 255, 0];
-            let base_index = vertices.len() as u32;
+            let base_index = verts.len() as u32;
             let bot_y = cy;
             let top_y = cy + SPRITE_HALF_SIZE * 2.0;
 
-            vertices.push(MeshVertex {
+            verts.push(MeshVertex {
                 position: [cx - right_x, bot_y, cz - right_z],
                 uv: [u0, v1],
                 tint_rgba: tint,
                 light_data: light,
             });
-            vertices.push(MeshVertex {
+            verts.push(MeshVertex {
                 position: [cx + right_x, bot_y, cz + right_z],
                 uv: [u1, v1],
                 tint_rgba: tint,
                 light_data: light,
             });
-            vertices.push(MeshVertex {
+            verts.push(MeshVertex {
                 position: [cx + right_x, top_y, cz + right_z],
                 uv: [u1, v0],
                 tint_rgba: tint,
                 light_data: light,
             });
-            vertices.push(MeshVertex {
+            verts.push(MeshVertex {
                 position: [cx - right_x, top_y, cz - right_z],
                 uv: [u0, v0],
                 tint_rgba: tint,
                 light_data: light,
             });
 
-            indices.push(base_index);
-            indices.push(base_index + 1);
-            indices.push(base_index + 2);
-            indices.push(base_index);
-            indices.push(base_index + 2);
-            indices.push(base_index + 3);
+            idxs.push(base_index);
+            idxs.push(base_index + 1);
+            idxs.push(base_index + 2);
+            idxs.push(base_index);
+            idxs.push(base_index + 2);
+            idxs.push(base_index + 3);
         }
     }
 
@@ -846,23 +898,127 @@ pub fn build_entity_sprite_mesh(
                 max_age_ticks: ITEM_MAX_AGE_TICKS,
             };
             let bob = BobOffset(fx.bob_offset);
-            append_item_mesh(
-                &mut vertices,
-                &mut indices,
-                fx.block_id,
-                &render_pos,
-                &age,
-                &bob,
-                camera_yaw,
-                registry,
-                chunk_streamer,
-                ambient_darkness,
-                render_alpha,
-            );
+            match fx.item {
+                crate::inventory::ItemKey::Block(block_id) => {
+                    append_item_mesh(
+                        &mut vertices,
+                        &mut indices,
+                        block_id,
+                        &render_pos,
+                        &age,
+                        &bob,
+                        camera_yaw,
+                        registry,
+                        chunk_streamer,
+                        ambient_darkness,
+                        render_alpha,
+                    );
+                }
+                crate::inventory::ItemKey::Tool(tool_id) => {
+                    // Render tool pickup FX as billboard into items-atlas mesh.
+                    let sprite_index = tool_registry
+                        .get(tool_id)
+                        .map_or(0, |def| def.sprite_index);
+                    append_billboard_sprite(
+                        &mut items_vertices,
+                        &mut items_indices,
+                        &render_pos,
+                        &age,
+                        &bob,
+                        camera_yaw,
+                        sprite_index,
+                        chunk_streamer,
+                        ambient_darkness,
+                        render_alpha,
+                    );
+                }
+            }
         }
     }
 
-    ChunkMesh { vertices, indices }
+    EntitySpriteMeshes {
+        terrain: ChunkMesh { vertices, indices },
+        items: ChunkMesh {
+            vertices: items_vertices,
+            indices: items_indices,
+        },
+    }
+}
+
+/// Append a billboard sprite quad into vertex/index buffers (used for both
+/// terrain-atlas and items-atlas billboard sprites).
+#[allow(clippy::too_many_arguments)]
+fn append_billboard_sprite(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    render_pos: &EntityRenderPos,
+    age: &EntityAge,
+    bob: &BobOffset,
+    camera_yaw: f32,
+    sprite_index: u16,
+    chunk_streamer: &ChunkStreamer,
+    ambient_darkness: u8,
+    render_alpha: f32,
+) {
+    let age_f = age.age_ticks as f32 + render_alpha;
+    let bob_y = (age_f / 10.0 + bob.0).sin() * 0.1 + 0.1;
+
+    let cx = render_pos.position.x;
+    let cy = render_pos.position.y + bob_y;
+    let cz = render_pos.position.z;
+
+    let world_x = cx.floor() as i32;
+    let world_y = (render_pos.position.y as f64 + ITEM_HEIGHT * 0.66).floor() as i32;
+    let world_z = cz.floor() as i32;
+    let effective_light = chunk_streamer
+        .effective_light_at_world(world_x, world_y, world_z, ambient_darkness)
+        .unwrap_or(15_u8.saturating_sub(ambient_darkness.min(15)));
+
+    let right_x = -camera_yaw.cos() * SPRITE_HALF_SIZE;
+    let right_z = camera_yaw.sin() * SPRITE_HALF_SIZE;
+
+    let u0 = (sprite_index % 16) as f32 * ATLAS_TILE_UV;
+    let v0 = (sprite_index / 16) as f32 * ATLAS_TILE_UV;
+    let u1 = u0 + ATLAS_TILE_UV;
+    let v1 = v0 + ATLAS_TILE_UV;
+
+    let tint = [255_u8, 255, 255, 255];
+    let light = [effective_light, effective_light, 255, 0];
+    let base = vertices.len() as u32;
+    let bot_y = cy;
+    let top_y = cy + SPRITE_HALF_SIZE * 2.0;
+
+    vertices.push(MeshVertex {
+        position: [cx - right_x, bot_y, cz - right_z],
+        uv: [u0, v1],
+        tint_rgba: tint,
+        light_data: light,
+    });
+    vertices.push(MeshVertex {
+        position: [cx + right_x, bot_y, cz + right_z],
+        uv: [u1, v1],
+        tint_rgba: tint,
+        light_data: light,
+    });
+    vertices.push(MeshVertex {
+        position: [cx + right_x, top_y, cz + right_z],
+        uv: [u1, v0],
+        tint_rgba: tint,
+        light_data: light,
+    });
+    vertices.push(MeshVertex {
+        position: [cx - right_x, top_y, cz - right_z],
+        uv: [u0, v0],
+        tint_rgba: tint,
+        light_data: light,
+    });
+
+    indices.push(base);
+    indices.push(base + 1);
+    indices.push(base + 2);
+    indices.push(base);
+    indices.push(base + 2);
+    indices.push(base + 3);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1170,8 +1326,8 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let (item, transform, physics, age, delay, _bob, _rp) = results[0];
-        assert_eq!(item.block_id, 1);
-        assert_eq!(item.count, 1);
+        assert_eq!(item.stack.item, crate::inventory::ItemKey::Block(1));
+        assert_eq!(item.stack.count, 1);
         assert_eq!(transform.position, DVec3::new(5.0, 65.0, 5.0));
         assert!((physics.gravity - ITEM_GRAVITY).abs() < 1e-10);
         assert_eq!(age.age_ticks, 0);
@@ -1217,7 +1373,7 @@ mod tests {
     fn player_drop_uses_longer_pickup_delay() {
         let mut world = World::new();
         world.insert_resource(RenderAlpha(0.0));
-        spawn_player_dropped_item(&mut world, 1, DVec3::ZERO, 0.0, 0.0);
+        spawn_player_dropped_item(&mut world, crate::inventory::ItemKey::Block(1), DVec3::ZERO, 0.0, 0.0);
 
         let mut query = world.query::<&PickupDelay>();
         let delay = query.iter(&world).next().unwrap();
@@ -1231,7 +1387,7 @@ mod tests {
         // yaw = +90deg should throw toward +X in ThingCraft camera convention.
         spawn_player_dropped_item(
             &mut world,
-            1,
+            crate::inventory::ItemKey::Block(1),
             DVec3::ZERO,
             std::f64::consts::FRAC_PI_2,
             0.0,
@@ -1248,7 +1404,7 @@ mod tests {
         up_world.insert_resource(RenderAlpha(0.0));
         spawn_player_dropped_item(
             &mut up_world,
-            1,
+            crate::inventory::ItemKey::Block(1),
             DVec3::ZERO,
             0.0,
             std::f64::consts::FRAC_PI_4,
@@ -1259,7 +1415,7 @@ mod tests {
         down_world.insert_resource(RenderAlpha(0.0));
         spawn_player_dropped_item(
             &mut down_world,
-            1,
+            crate::inventory::ItemKey::Block(1),
             DVec3::ZERO,
             0.0,
             -std::f64::consts::FRAC_PI_4,
@@ -1293,11 +1449,12 @@ mod tests {
             BlockRegistry::alpha_1_2_6(),
             crate::streaming::ResidencyConfig::default(),
         );
-        let mesh = build_entity_sprite_mesh(&mut world, 0.0, &registry, &streamer, 0, 0.0);
+        let tool_reg = crate::tool::ToolRegistry::alpha_1_2_6();
+        let mesh = build_entity_sprite_mesh(&mut world, 0.0, &registry, &tool_reg, &streamer, 0, 0.0);
 
         // 6 faces * 4 verts = 24 per solid block, 6 faces * 6 indices = 36
-        assert_eq!(mesh.vertices.len(), 3 * 24);
-        assert_eq!(mesh.indices.len(), 3 * 36);
+        assert_eq!(mesh.terrain.vertices.len(), 3 * 24);
+        assert_eq!(mesh.terrain.indices.len(), 3 * 36);
     }
 
     #[test]
@@ -1316,11 +1473,12 @@ mod tests {
             BlockRegistry::alpha_1_2_6(),
             crate::streaming::ResidencyConfig::default(),
         );
-        let mesh = build_entity_sprite_mesh(&mut world, 0.0, &registry, &streamer, 0, 0.0);
+        let tool_reg = crate::tool::ToolRegistry::alpha_1_2_6();
+        let mesh = build_entity_sprite_mesh(&mut world, 0.0, &registry, &tool_reg, &streamer, 0, 0.0);
 
         // Billboard: 4 verts, 6 indices
-        assert_eq!(mesh.vertices.len(), 4);
-        assert_eq!(mesh.indices.len(), 6);
+        assert_eq!(mesh.terrain.vertices.len(), 4);
+        assert_eq!(mesh.terrain.indices.len(), 6);
     }
 
     #[test]
@@ -1337,7 +1495,8 @@ mod tests {
         let mut inventory = PlayerInventoryState::alpha_defaults();
         // Ensure stack is mergeable so pickup succeeds.
         let _ = inventory.apply(crate::inventory::InventoryCommand::SelectHotbar { index: 0 });
-        let picked = check_item_pickup(&mut world, &mut inventory);
+        world.insert_resource(inventory);
+        let picked = check_item_pickup(&mut world);
         assert!(picked);
         assert_eq!(world.query::<&DroppedItem>().iter(&world).count(), 0);
         assert_eq!(world.query::<&EntityPickupFx>().iter(&world).count(), 1);
@@ -1352,13 +1511,46 @@ mod tests {
         for mut delay in world.query::<&mut PickupDelay>().iter_mut(&mut world) {
             delay.ticks_remaining = 0;
         }
-        let mut inventory = PlayerInventoryState::alpha_defaults();
-        assert!(check_item_pickup(&mut world, &mut inventory));
+        world.insert_resource(PlayerInventoryState::alpha_defaults());
+        assert!(check_item_pickup(&mut world));
         assert_eq!(world.query::<&EntityPickupFx>().iter(&world).count(), 1);
 
         for _ in 0..ITEM_PICKUP_FX_LIFETIME_TICKS {
             tick_entity_ages(&mut world);
         }
         assert_eq!(world.query::<&EntityPickupFx>().iter(&world).count(), 0);
+    }
+
+    #[test]
+    fn drop_pickup_preserves_tool_metadata() {
+        let mut world = World::new();
+        world.insert_resource(RenderAlpha(0.0));
+        spawn_test_player(&mut world, DVec3::new(0.0, 64.0, 0.0));
+
+        let mut dropped = crate::inventory::ItemStack::tool(270);
+        dropped.metadata = 7;
+        spawn_player_dropped_item_stack(&mut world, dropped, DVec3::new(0.0, 64.2, 0.0), 0.0, 0.0);
+        for mut delay in world.query::<&mut PickupDelay>().iter_mut(&mut world) {
+            delay.ticks_remaining = 0;
+        }
+
+        world.insert_resource(PlayerInventoryState::alpha_defaults());
+        assert!(check_item_pickup(&mut world));
+
+        let inv = world.resource::<PlayerInventoryState>();
+        let found = inv
+            .hotbar_stack(0)
+            .into_iter()
+            .chain(inv.hotbar_stack(1))
+            .chain(inv.hotbar_stack(2))
+            .chain(inv.hotbar_stack(3))
+            .chain(inv.hotbar_stack(4))
+            .chain(inv.hotbar_stack(5))
+            .chain(inv.hotbar_stack(6))
+            .chain(inv.hotbar_stack(7))
+            .chain(inv.hotbar_stack(8))
+            .chain(inv.main_stacks().iter().copied().flatten())
+            .find(|s| s.item == crate::inventory::ItemKey::Tool(270) && s.metadata == 7);
+        assert!(found.is_some(), "picked tool metadata should be preserved");
     }
 }

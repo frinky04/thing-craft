@@ -98,12 +98,15 @@ pub struct Renderer<'w> {
     time_of_day: f32,
     mesh_buffer_pool: MeshBufferPool,
     entity_sprite_mesh: Option<SceneMeshGpu>,
+    entity_items_sprite_mesh: Option<SceneMeshGpu>,
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_bind_group: wgpu::BindGroup,
     entity_shadow_mesh: Option<SceneMeshGpu>,
     first_person_item_mesh: Option<SceneMeshGpu>,
     first_person_arm_mesh: Option<SceneMeshGpu>,
     first_person_skin_bind_group: wgpu::BindGroup,
+    items_atlas_bind_group: wgpu::BindGroup,
+    first_person_item_is_tool: bool,
 }
 
 struct SceneMeshGpu {
@@ -1037,6 +1040,36 @@ impl<'w> Renderer<'w> {
             "thingcraft-first-person-skin",
             wgpu::FilterMode::Nearest,
         );
+        let (_items_texture, items_view) = load_png_texture(
+            &device,
+            &queue,
+            Path::new("resources/minecraft-a1.2.6-client/gui/items.png"),
+            "thingcraft-items-texture",
+        );
+        let items_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("thingcraft-items-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let items_atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thingcraft-items-atlas-bind-group"),
+            layout: &terrain_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&items_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&items_sampler),
+                },
+            ],
+        });
         let cloud_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("thingcraft-cloud-bind-group-layout"),
@@ -1764,6 +1797,16 @@ impl<'w> Renderer<'w> {
                     wgpu::BindGroupLayoutEntry {
                         binding: 6,
                         visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -1966,6 +2009,7 @@ impl<'w> Renderer<'w> {
         let font_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let water_overlay_view =
             water_overlay_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Reuse the items_view loaded earlier for the scene pipeline — no need to load twice.
         let terrain_view = terrain_atlas
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1999,6 +2043,10 @@ impl<'w> Renderer<'w> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&items_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
                     resource: wgpu::BindingResource::Sampler(&hud_sampler),
                 },
             ],
@@ -2241,12 +2289,15 @@ impl<'w> Renderer<'w> {
             time_of_day: 0.0,
             mesh_buffer_pool: MeshBufferPool::default(),
             entity_sprite_mesh: None,
+            entity_items_sprite_mesh: None,
             shadow_pipeline,
             shadow_bind_group,
             entity_shadow_mesh: None,
             first_person_item_mesh: None,
             first_person_arm_mesh: None,
             first_person_skin_bind_group,
+            items_atlas_bind_group,
+            first_person_item_is_tool: false,
         })
     }
 
@@ -2351,8 +2402,10 @@ impl<'w> Renderer<'w> {
     }
 
     /// Upload entity sprite geometry for this frame (billboarded item quads).
-    pub fn update_entity_sprites(&mut self, mesh: &ChunkMesh) {
-        self.entity_sprite_mesh = self.upload_mesh(mesh, "thingcraft-entity-sprite");
+    /// `terrain_mesh` uses terrain.png, `items_mesh` uses items.png.
+    pub fn update_entity_sprites(&mut self, terrain_mesh: &ChunkMesh, items_mesh: &ChunkMesh) {
+        self.entity_sprite_mesh = self.upload_mesh(terrain_mesh, "thingcraft-entity-sprite");
+        self.entity_items_sprite_mesh = self.upload_mesh(items_mesh, "thingcraft-entity-items-sprite");
     }
 
     /// Upload entity shadow geometry for this frame (ground-projected discs).
@@ -2360,8 +2413,9 @@ impl<'w> Renderer<'w> {
         self.entity_shadow_mesh = self.upload_mesh(mesh, "thingcraft-entity-shadow");
     }
 
-    pub fn update_first_person_item_mesh(&mut self, mesh: &ChunkMesh) {
+    pub fn update_first_person_item_mesh(&mut self, mesh: &ChunkMesh, is_tool: bool) {
         self.first_person_item_mesh = self.upload_mesh(mesh, "thingcraft-first-person-item");
+        self.first_person_item_is_tool = is_tool;
     }
 
     pub fn update_first_person_arm_mesh(&mut self, mesh: &ChunkMesh) {
@@ -2976,6 +3030,18 @@ impl<'w> Renderer<'w> {
                 );
                 render_pass.draw_indexed(0..entity_mesh.index_count, 0, 0..1);
             }
+            // Entity sprites using items.png atlas (dropped tools).
+            if let Some(items_mesh) = &self.entity_items_sprite_mesh {
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.items_atlas_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, items_mesh.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    items_mesh.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..items_mesh.index_count, 0, 0..1);
+            }
 
             // Transparent pass: water and other translucent blocks (after opaque, before debug).
             if !self.chunk_transparent_meshes.is_empty() {
@@ -3074,7 +3140,11 @@ impl<'w> Renderer<'w> {
             fp_pass.set_pipeline(&self.first_person_pipeline);
             fp_pass.set_bind_group(0, &self.first_person_bind_group, &[]);
             if let Some(item_mesh) = &self.first_person_item_mesh {
-                fp_pass.set_bind_group(1, &self.terrain_atlas.bind_group, &[]);
+                if self.first_person_item_is_tool {
+                    fp_pass.set_bind_group(1, &self.items_atlas_bind_group, &[]);
+                } else {
+                    fp_pass.set_bind_group(1, &self.terrain_atlas.bind_group, &[]);
+                }
                 fp_pass.set_vertex_buffer(0, item_mesh.vertex_buffer.slice(..));
                 fp_pass
                     .set_index_buffer(item_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -3381,17 +3451,15 @@ fn create_texture_from_rgba(
     texture
 }
 
-fn create_texture_bind_group(
+fn load_png_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    layout: &wgpu::BindGroupLayout,
     path: &Path,
-    label_prefix: &str,
-    filter: wgpu::FilterMode,
-) -> wgpu::BindGroup {
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let (width, height, rgba) = load_png_rgba(path);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(&format!("{label_prefix}-texture")),
+        label: Some(label),
         size: wgpu::Extent3d {
             width,
             height,
@@ -3424,6 +3492,18 @@ fn create_texture_bind_group(
         },
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_texture_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    path: &Path,
+    label_prefix: &str,
+    filter: wgpu::FilterMode,
+) -> wgpu::BindGroup {
+    let (_texture, view) = load_png_texture(device, queue, path, &format!("{label_prefix}-texture"));
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some(&format!("{label_prefix}-sampler")),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -5174,7 +5254,8 @@ var<uniform> screen: HudScreen;
 @group(1) @binding(3) var hud_inventory_tex: texture_2d<f32>;
 @group(1) @binding(4) var hud_font_tex: texture_2d<f32>;
 @group(1) @binding(5) var hud_water_overlay_tex: texture_2d<f32>;
-@group(1) @binding(6) var hud_sampler: sampler;
+@group(1) @binding(6) var hud_items_tex: texture_2d<f32>;
+@group(1) @binding(7) var hud_sampler: sampler;
 
 struct VertexIn {
     @location(0) position: vec2<f32>,
@@ -5218,9 +5299,11 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         texel = textureSample(hud_inventory_tex, hud_sampler, input.uv);
     } else if (input.texture_kind >= 3.5 && input.texture_kind < 4.5) {
         texel = textureSample(hud_font_tex, hud_sampler, input.uv);
-    } else if (input.texture_kind >= 4.5) {
+    } else if (input.texture_kind >= 4.5 && input.texture_kind < 5.5) {
         // Alpha underwater overlay scrolls UV by yaw/pitch and repeats.
         texel = textureSample(hud_water_overlay_tex, hud_sampler, fract(input.uv));
+    } else if (input.texture_kind >= 5.5 && input.texture_kind < 6.5) {
+        texel = textureSample(hud_items_tex, hud_sampler, input.uv);
     }
     if (texel.a <= 0.01) {
         discard;
