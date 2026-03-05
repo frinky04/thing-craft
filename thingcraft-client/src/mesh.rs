@@ -8,6 +8,7 @@ use crate::world::{
 };
 
 const AIR_ID: u8 = 0;
+const CHEST_ID: u8 = 54;
 const LEAF_MARKER_BIT: u8 = 1 << 0;
 const GREEDY_TOP_TILE_BIT: u8 = 1 << 1;
 
@@ -190,6 +191,123 @@ fn compute_liquid_flow_angle(
         None
     } else {
         Some(flow_z.atan2(flow_x) - FRAC_PI_2)
+    }
+}
+
+fn alpha_face_code_from_offset(face_offset: [i32; 3]) -> u8 {
+    match face_offset {
+        [0, -1, 0] => 0,
+        [0, 1, 0] => 1,
+        [0, 0, -1] => 2,
+        [0, 0, 1] => 3,
+        [-1, 0, 0] => 4,
+        [1, 0, 0] => 5,
+        _ => 0,
+    }
+}
+
+fn chest_sprite_index_in_world(
+    x: i32,
+    y: i32,
+    z: i32,
+    face_offset: [i32; 3],
+    registry: &BlockRegistry,
+    block_lookup: &mut impl FnMut(i32, i32, i32) -> u8,
+) -> u16 {
+    let face = alpha_face_code_from_offset(face_offset);
+    let sprite = 26_i32;
+    if face == 0 || face == 1 {
+        return (sprite - 1) as u16;
+    }
+
+    let north = block_lookup(x, y, z - 1);
+    let south = block_lookup(x, y, z + 1);
+    let west = block_lookup(x - 1, y, z);
+    let east = block_lookup(x + 1, y, z);
+
+    if north == CHEST_ID || south == CHEST_ID {
+        if face == 2 || face == 3 {
+            return sprite as u16;
+        }
+        let mut m = 0_i32;
+        if north == CHEST_ID {
+            m = -1;
+        }
+        let p = block_lookup(x - 1, y, if north == CHEST_ID { z - 1 } else { z + 1 });
+        let r = block_lookup(x + 1, y, if north == CHEST_ID { z - 1 } else { z + 1 });
+        if face == 5 {
+            m = -1 - m;
+        }
+        let mut t = 5_i32;
+        if (registry.is_solid(west) || registry.is_solid(p))
+            && !registry.is_solid(east)
+            && !registry.is_solid(r)
+        {
+            t = 5;
+        }
+        if (registry.is_solid(east) || registry.is_solid(r))
+            && !registry.is_solid(west)
+            && !registry.is_solid(p)
+        {
+            t = 4;
+        }
+        return if i32::from(face) == t {
+            (sprite + 16 + m) as u16
+        } else {
+            (sprite + 32 + m) as u16
+        };
+    }
+
+    if west == CHEST_ID || east == CHEST_ID {
+        if face == 4 || face == 5 {
+            return sprite as u16;
+        }
+        let mut n = 0_i32;
+        if west == CHEST_ID {
+            n = -1;
+        }
+        let q = block_lookup(if west == CHEST_ID { x - 1 } else { x + 1 }, y, z - 1);
+        let s = block_lookup(if west == CHEST_ID { x - 1 } else { x + 1 }, y, z + 1);
+        if face == 2 {
+            n = -1 - n;
+        }
+        let mut u = 3_i32;
+        if (registry.is_solid(north) || registry.is_solid(q))
+            && !registry.is_solid(south)
+            && !registry.is_solid(s)
+        {
+            u = 3;
+        }
+        if (registry.is_solid(south) || registry.is_solid(s))
+            && !registry.is_solid(north)
+            && !registry.is_solid(q)
+        {
+            u = 2;
+        }
+        return if i32::from(face) == u {
+            (sprite + 16 + n) as u16
+        } else {
+            (sprite + 32 + n) as u16
+        };
+    }
+
+    let mut o = 3_i32;
+    if registry.is_solid(north) && !registry.is_solid(south) {
+        o = 3;
+    }
+    if registry.is_solid(south) && !registry.is_solid(north) {
+        o = 2;
+    }
+    if registry.is_solid(west) && !registry.is_solid(east) {
+        o = 5;
+    }
+    if registry.is_solid(east) && !registry.is_solid(west) {
+        o = 4;
+    }
+    if i32::from(face) == o {
+        (sprite + 1) as u16
+    } else {
+        sprite as u16
     }
 }
 
@@ -612,6 +730,7 @@ where
                 if block_id == AIR_ID || !registry.is_defined_block(block_id) {
                     continue;
                 }
+                let block_metadata = chunk.block_metadata(local_x as u8, y as u8, local_z as u8);
 
                 let is_liquid = registry.is_liquid(block_id);
 
@@ -705,8 +824,22 @@ where
                         // for both so the texture shows through faithfully.
                         let (tint, alpha) = ([255_u8, 255, 255], 255_u8);
 
-                        let mut sprite_index =
-                            registry.sprite_index_for_face(block_id, face.offset);
+                        let mut sprite_index = if block_id == CHEST_ID {
+                            chest_sprite_index_in_world(
+                                local_x,
+                                y,
+                                local_z,
+                                face.offset,
+                                registry,
+                                &mut neighbor_block_lookup,
+                            )
+                        } else {
+                            registry.sprite_index_for_face_with_metadata(
+                                block_id,
+                                face.offset,
+                                block_metadata,
+                            )
+                        };
                         // MC top-face path switches to the side sprite when flow exists.
                         if face.offset[1] > 0 && flow_angle.is_some() {
                             sprite_index = sprite_index.saturating_add(1);
@@ -799,9 +932,24 @@ where
                             let layer = (y - y_start) as usize;
                             if layer < greedy_top_faces.len() {
                                 let index = (local_z as usize * CHUNK_WIDTH) + local_x as usize;
+                                let top_sprite = if block_id == CHEST_ID {
+                                    chest_sprite_index_in_world(
+                                        local_x,
+                                        y,
+                                        local_z,
+                                        face.offset,
+                                        registry,
+                                        &mut neighbor_block_lookup,
+                                    )
+                                } else {
+                                    registry.sprite_index_for_face_with_metadata(
+                                        block_id,
+                                        face.offset,
+                                        block_metadata,
+                                    )
+                                };
                                 greedy_top_faces[layer][index] = Some(GreedyTopFaceCell {
-                                    sprite_index: registry
-                                        .sprite_index_for_face(block_id, face.offset),
+                                    sprite_index: top_sprite,
                                     tint_rgb: tint,
                                     neighbor_sky_light: face_sky,
                                     neighbor_block_light: face_block_light,
@@ -819,7 +967,22 @@ where
                                 local_z as f32 + chunk_origin_z,
                             ],
                             face,
-                            registry.sprite_index_for_face(block_id, face.offset),
+                            if block_id == CHEST_ID {
+                                chest_sprite_index_in_world(
+                                    local_x,
+                                    y,
+                                    local_z,
+                                    face.offset,
+                                    registry,
+                                    &mut neighbor_block_lookup,
+                                )
+                            } else {
+                                registry.sprite_index_for_face_with_metadata(
+                                    block_id,
+                                    face.offset,
+                                    block_metadata,
+                                )
+                            },
                             tint,
                             face_sky,
                             face_block_light,

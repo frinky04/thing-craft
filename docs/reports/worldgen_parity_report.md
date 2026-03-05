@@ -14,7 +14,7 @@
 - [ ] **Remove or gate Birch/Pine tree types behind a flag** — Birch and Pine trees do not exist in Alpha 1.2.6. All trees are either standard oak (`TreeFeature`) or large oak (`LargeOakTreeFeature`). These are custom additions.
 - [ ] **Implement forest noise for tree density** — `_forest_noise` is allocated (8 octaves) but unused. Alpha uses `(forestNoise.getValue(x*0.5, z*0.5) / 8.0 + random*4.0 + 4.0) / 3.0` per chunk, added to biome-specific offsets. ThingCraft uses a simplified static lookup per biome.
 - [ ] **Fix tree selection to be per-chunk, not per-tree** — In Alpha, the tree feature type (standard vs large oak) is selected ONCE per chunk and used for ALL trees in that chunk. ThingCraft selects tree type per individual tree based on biome.
-- [ ] **Complete dungeon internals** — `place_dungeon_stubs` only generates room geometry + spawner block. Missing: chest placement (up to 2 per room), loot table (saddle, iron, bread, wheat, gunpowder, string, bucket, golden apple, redstone, music disc), and spawner mob type selection (25% skeleton, 50% zombie, 25% spider).
+- [~] **Complete dungeon internals** — Dungeon rooms now place chest blocks (up to 2) and run Alpha loot/spawner RNG rolls, but chest inventory contents and persisted spawner mob type still require block-entity data wiring.
 - [ ] **Add Ice Desert biome** — Alpha has an `ICE_DESERT` biome (temperature < 0.5, low downfall) that uses SAND/SAND surface blocks and is snowy. The `BiomeKind` enum does not include this variant.
 
 ### Medium Priority (Affects feature distribution / statistical parity)
@@ -193,12 +193,12 @@ Both implementations use the multi-ellipsoid carving algorithm:
 | Wall validation (1-5 openings) | Yes | Yes | Yes |
 | Cobblestone/Mossy walls | Yes | Yes | Yes |
 | Mob spawner block | Yes | Yes | Yes |
-| Spawner mob type | Skeleton/Zombie/Spider | **Not set** | No |
-| Chests (up to 2) | Yes | **Missing** | No |
+| Spawner mob type | Skeleton/Zombie/Spider | RNG selected, **not persisted** | Partial |
+| Chests (up to 2) | Yes | Chest blocks placed, **loot stubbed** | Partial |
 | Loot table (11 items) | Yes | **Missing** | No |
 | Attempts per chunk | 8 | 8 | Yes |
 
-**Status: Structural shell only — internals incomplete**
+**Status: Room + chest placement complete; loot/spawner block-entity payloads still incomplete**
 
 ### 10. Decoration Features
 
@@ -267,7 +267,7 @@ This design is more modular but produces entirely different random sequences fro
 1. Caves (carve_caves)
 2. Clay patches
 3. Ores
-4. Dungeon stubs
+4. Dungeon generation
 5. Height map recalculation
 6. Flowers
 7. Mushrooms
