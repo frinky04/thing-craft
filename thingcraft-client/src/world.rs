@@ -357,7 +357,7 @@ impl BlockRegistry {
             65,
             MaterialKind::Metal,
             true,
-            255,
+            0,
             0,
         );
         add(
