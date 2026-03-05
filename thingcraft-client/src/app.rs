@@ -64,7 +64,7 @@ const FLUID_BUDGET_FRAME_PRESSURE_MS: f64 = 19.0;
 const FLUID_URGENT_SLICE_MIN: usize = 16;
 const FLUID_URGENT_SLICE_DIVISOR: usize = 8;
 const DAY_TICKS: u64 = 24_000;
-const WORLD_SEED: u64 = 0xA126_0001;
+const DEFAULT_WORLD_SEED: u64 = 0xA126_0001;
 const FIRE_BLOCK_ID: u8 = 51;
 const CHEST_BLOCK_ID: u8 = 54;
 const FURNACE_BLOCK_ID: u8 = 61;
@@ -529,6 +529,7 @@ impl EditLatencyTracker {
 
 pub fn run() -> Result<()> {
     let tracy_enabled = init_tracing();
+    let world_seed = resolve_world_seed();
 
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new()
@@ -570,7 +571,7 @@ pub fn run() -> Result<()> {
 
     let residency_config = resolve_residency_config();
     let mut chunk_streamer = ChunkStreamer::new(
-        WORLD_SEED,
+        world_seed,
         bootstrap_world.registry.clone(),
         residency_config,
     );
@@ -580,7 +581,7 @@ pub fn run() -> Result<()> {
     } else {
         None
     };
-    let biome_source = BiomeSource::new(WORLD_SEED);
+    let biome_source = BiomeSource::new(world_seed);
     let alpha_view_distance = alpha_view_distance_setting(residency_config.view_radius);
     let render_distance_blocks = alpha_render_distance_blocks(alpha_view_distance);
     let _ = chunk_streamer.update_target(ChunkPos { x: 0, z: 0 });
@@ -641,6 +642,7 @@ pub fn run() -> Result<()> {
         stream_gen_workers = residency_config.generation_workers,
         stream_light_workers = residency_config.lighting_workers,
         stream_mesh_workers = residency_config.meshing_workers,
+        world_seed,
         fluid_tick_budget = base_fluid_tick_budget,
         fluid_tick_budget_min = adaptive_fluid_budget.min(),
         fluid_tick_budget_max = adaptive_fluid_budget.max(),
@@ -2946,6 +2948,72 @@ fn has_target_directive(env_filter: &str, target: &str) -> bool {
     })
 }
 
+fn random_launch_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(DEFAULT_WORLD_SEED, |duration| duration.as_nanos() as u64)
+}
+
+fn parse_seed_literal(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("random") {
+        return Some(random_launch_seed());
+    }
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"));
+    if let Some(value) = hex {
+        return u64::from_str_radix(value, 16).ok();
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+fn parse_env_seed(key: &str) -> Option<u64> {
+    let raw = std::env::var(key).ok()?;
+    parse_seed_literal(&raw).or_else(|| {
+        warn!(
+            env = key,
+            value = %raw,
+            "invalid world seed env override; using default"
+        );
+        None
+    })
+}
+
+fn resolve_world_seed() -> u64 {
+    let mut seed = parse_env_seed("THINGCRAFT_WORLD_SEED").unwrap_or(DEFAULT_WORLD_SEED);
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--random-seed" {
+            seed = random_launch_seed();
+            continue;
+        }
+        if let Some(raw) = arg.strip_prefix("--seed=") {
+            if let Some(parsed) = parse_seed_literal(raw) {
+                seed = parsed;
+            } else {
+                warn!(value = %raw, "invalid --seed value; keeping previous seed");
+            }
+            continue;
+        }
+        if arg == "--seed" {
+            let Some(raw) = args.next() else {
+                warn!("--seed requires a value; keeping previous seed");
+                continue;
+            };
+            if let Some(parsed) = parse_seed_literal(&raw) {
+                seed = parsed;
+            } else {
+                warn!(value = %raw, "invalid --seed value; keeping previous seed");
+            }
+        }
+    }
+    seed
+}
+
 fn resolve_residency_config() -> ResidencyConfig {
     let mut config = ResidencyConfig::default();
     if let Some(parsed) = parse_env_u32("THINGCRAFT_VIEW_RADIUS") {
@@ -4372,9 +4440,9 @@ mod tests {
         alpha_star_brightness, alpha_sunrise_color, alpha_time_of_day,
         can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
         is_point_inside_inventory_panel, is_raycast_targetable_block, parse_env_bool,
-        parse_env_u32, placement_intersects_player, raycast_first_solid_block, resolve_axis,
-        AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, CHEST_BLOCK_ID, FURNACE_BLOCK_ID,
-        LIT_FURNACE_BLOCK_ID, LIT_PUMPKIN_BLOCK_ID, PUMPKIN_BLOCK_ID,
+        parse_env_u32, parse_seed_literal, placement_intersects_player, raycast_first_solid_block,
+        resolve_axis, AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, CHEST_BLOCK_ID,
+        FURNACE_BLOCK_ID, LIT_FURNACE_BLOCK_ID, LIT_PUMPKIN_BLOCK_ID, PUMPKIN_BLOCK_ID,
     };
     use crate::crafting::CraftingRegistry;
     use crate::ecs::EcsRuntime;
@@ -4414,6 +4482,13 @@ mod tests {
         std::env::set_var("THINGCRAFT_TEST_BOOL", "nope");
         assert_eq!(parse_env_bool("THINGCRAFT_TEST_BOOL"), None);
         std::env::remove_var("THINGCRAFT_TEST_BOOL");
+    }
+
+    #[test]
+    fn world_seed_literal_parser_supports_decimal_and_hex() {
+        assert_eq!(parse_seed_literal("42"), Some(42));
+        assert_eq!(parse_seed_literal("0xA1260001"), Some(0xA126_0001));
+        assert_eq!(parse_seed_literal("not-a-number"), None);
     }
 
     #[test]

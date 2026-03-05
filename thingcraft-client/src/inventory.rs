@@ -337,7 +337,14 @@ fn furnace_finish_cooking(furnace: &mut FurnaceInventory) {
 
     let mut new_input = input;
     new_input.count = new_input.count.saturating_sub(1);
-    furnace.set_slot(0, if new_input.count == 0 { None } else { Some(new_input) });
+    furnace.set_slot(
+        0,
+        if new_input.count == 0 {
+            None
+        } else {
+            Some(new_input)
+        },
+    );
 }
 
 #[derive(Resource, Debug, Clone, Eq, PartialEq)]
@@ -614,13 +621,7 @@ impl PlayerInventoryState {
                     }
                 }
                 (_, MouseButton::Left) | (_, MouseButton::Right) => {
-                    if apply_slot_click(
-                        self,
-                        containers.as_deref_mut(),
-                        open_menu,
-                        slot,
-                        button,
-                    ) {
+                    if apply_slot_click(self, containers.as_deref_mut(), open_menu, slot, button) {
                         result.changed = true;
                     }
                 }
@@ -757,7 +758,13 @@ fn apply_slot_click(
         if button != MouseButton::Left || cursor.count > slot_max {
             return false;
         }
-        set_slot(inv, containers.as_deref_mut(), open_menu, slot, Some(cursor));
+        set_slot(
+            inv,
+            containers.as_deref_mut(),
+            open_menu,
+            slot,
+            Some(cursor),
+        );
         inv.cursor = Some(slot_item);
         return true;
     }
@@ -933,25 +940,40 @@ fn set_slot(
             }
         }
         PlayerSlot::FurnaceInput => {
-            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) = (containers, open_menu)
+            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) =
+                (containers, open_menu)
             else {
                 return;
             };
-            containers.furnaces.entry(pos).or_default().set_slot(0, stack);
+            containers
+                .furnaces
+                .entry(pos)
+                .or_default()
+                .set_slot(0, stack);
         }
         PlayerSlot::FurnaceFuel => {
-            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) = (containers, open_menu)
+            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) =
+                (containers, open_menu)
             else {
                 return;
             };
-            containers.furnaces.entry(pos).or_default().set_slot(1, stack);
+            containers
+                .furnaces
+                .entry(pos)
+                .or_default()
+                .set_slot(1, stack);
         }
         PlayerSlot::FurnaceResult => {
-            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) = (containers, open_menu)
+            let (Some(containers), Some(InventoryMenuKind::Furnace { pos })) =
+                (containers, open_menu)
             else {
                 return;
             };
-            containers.furnaces.entry(pos).or_default().set_slot(2, stack);
+            containers
+                .furnaces
+                .entry(pos)
+                .or_default()
+                .set_slot(2, stack);
         }
     }
 }
@@ -979,7 +1001,9 @@ fn slot_max_stack_size(slot: PlayerSlot, open_menu: Option<InventoryMenuKind>) -
 fn slot_accepts_item(slot: PlayerSlot, stack: ItemStack) -> bool {
     match slot {
         PlayerSlot::Armor(_) => stack.count >= 1,
-        PlayerSlot::PlayerCraftResult | PlayerSlot::CraftingTableResult | PlayerSlot::FurnaceResult => false,
+        PlayerSlot::PlayerCraftResult
+        | PlayerSlot::CraftingTableResult
+        | PlayerSlot::FurnaceResult => false,
         PlayerSlot::Hotbar(_)
         | PlayerSlot::Main(_)
         | PlayerSlot::PlayerCraftInput(_)
@@ -1259,13 +1283,13 @@ fn table_crafting_grid(slots: [Option<ItemStack>; TABLE_CRAFT_INPUT_SLOT_COUNT])
 #[must_use]
 pub fn alpha_furnace_result_for_input(input_id: u16) -> Option<u16> {
     let out = match input_id {
-        15 => 265, // iron ore -> iron ingot
-        14 => 266, // gold ore -> gold ingot
-        56 => 264, // diamond ore -> diamond
-        12 => 20,  // sand -> glass block
+        15 => 265,  // iron ore -> iron ingot
+        14 => 266,  // gold ore -> gold ingot
+        56 => 264,  // diamond ore -> diamond
+        12 => 20,   // sand -> glass block
         319 => 320, // raw pork -> cooked pork
         349 => 350, // raw fish -> cooked fish
-        4 => 1,    // cobblestone -> stone
+        4 => 1,     // cobblestone -> stone
         337 => 336, // clay -> brick
         _ => return None,
     };
