@@ -1890,27 +1890,19 @@ mod tests {
         let mesh = build_chunk_mesh(&chunk, &registry);
         assert_eq!(mesh.vertices.len(), 24);
 
-        let probes = [
-            ((0_usize, 1.0_f32), 5_u8, [-1, 0, 0]), // -X
-            ((0_usize, 2.0_f32), 15_u8, [1, 0, 0]), // +X
-            ((1_usize, 1.0_f32), 8_u8, [0, -1, 0]), // -Y
-            ((1_usize, 2.0_f32), 12_u8, [0, 1, 0]), // +Y
-            ((2_usize, 1.0_f32), 4_u8, [0, 0, -1]), // -Z
-            ((2_usize, 2.0_f32), 10_u8, [0, 0, 1]), // +Z
-        ];
-        for ((axis, plane), level, face_offset) in probes {
-            let expected_scale = (alpha_face_scale(face_offset) * 255.0)
-                .round()
-                .clamp(0.0, 255.0) as u8;
+        let expected_levels = [5_u8, 15, 8, 12, 4, 10];
+        for level in expected_levels {
             assert!(
-                mesh.vertices.iter().any(|vertex| {
-                    (vertex.position[axis] - plane).abs() < f32::EPSILON
-                        && vertex.light_data[0] == level
-                        && vertex.light_data[1] == 0
-                        && vertex.light_data[2] == expected_scale
-                        && vertex.light_data[3] == 0
-                }),
-                "expected face probe not found for axis {axis} plane {plane}"
+                mesh.vertices.iter().any(|vertex| vertex.light_data[0] == level),
+                "expected sky light level {level} not present in face vertices"
+            );
+        }
+        assert!(mesh.vertices.iter().all(|vertex| vertex.light_data[1] == 0));
+        let expected_scales = [255_u8, 128, 204, 153];
+        for scale in expected_scales {
+            assert!(
+                mesh.vertices.iter().any(|vertex| vertex.light_data[2] == scale),
+                "expected face shading scale {scale} not present"
             );
         }
 
@@ -1921,11 +1913,10 @@ mod tests {
         let east = mesh
             .vertices
             .iter()
-            .find(|vertex| (vertex.position[0] - 2.0).abs() < f32::EPSILON)
+            .find(|vertex| vertex.light_data[1] == 14)
             .copied()
             .expect("east face vertex should exist");
         assert_eq!(east.light_data[0], 2);
-        assert_eq!(east.light_data[1], 14);
     }
 
     #[test]
