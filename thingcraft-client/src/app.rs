@@ -2358,6 +2358,7 @@ fn process_single_block_interaction_request(
             hit,
             target_block_id,
             block_id,
+            request.direction,
             edit_latency_tracker,
         ) {
             return None;
@@ -2385,6 +2386,7 @@ fn try_place_selected_block(
     hit: BlockRayHit,
     target_block_id: u8,
     block_id: u8,
+    look_direction: DVec3,
     edit_latency_tracker: &mut EditLatencyTracker,
 ) -> bool {
     let [x, y, z] = hit.block;
@@ -2411,7 +2413,7 @@ fn try_place_selected_block(
             chunk_streamer.block_at_world(qx, qy, qz)
         })
     {
-        return;
+        return false;
     }
 
     let place_target_block = chunk_streamer
@@ -2426,7 +2428,7 @@ fn try_place_selected_block(
             place_z,
         )
     } else {
-        alpha_placement_metadata_from_look(block_id, request.direction)
+        alpha_placement_metadata_from_look(block_id, look_direction)
     };
     if (place_target_block == AIR_BLOCK_ID
         || can_replace_block_for_placement(registry, place_target_block))
@@ -4069,7 +4071,7 @@ mod tests {
         alpha_fog_brightness_target, alpha_horizontal_face_from_look,
         alpha_opposite_face, alpha_placement_metadata_from_look, alpha_star_brightness,
         alpha_sunrise_color, alpha_time_of_day, can_replace_block_for_placement,
-        can_replace_block_for_placement, has_target_directive, hotbar_slot_for_key,
+        has_target_directive, hotbar_slot_for_key,
         is_point_inside_inventory_panel, is_raycast_targetable_block, parse_env_bool,
         parse_env_u32, placement_intersects_player, raycast_first_solid_block, resolve_axis,
         AdaptiveFluidBudget, BlockRayHit, AIR_BLOCK_ID, CHEST_BLOCK_ID, FURNACE_BLOCK_ID,
